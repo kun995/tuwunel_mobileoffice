@@ -15,6 +15,7 @@ use crate::Ruma;
 struct Claim {
 	/// Subject is the localpart of the User MXID
 	sub: String,
+	preferred_username: Option<String>,
 }
 
 pub(super) async fn handle_login(
@@ -45,7 +46,7 @@ pub(crate) fn validate_user(services: &Services, token: &str) -> Result<OwnedUse
 	}
 
 	let claim = validate(config, token)?;
-	let local = claim.sub.to_lowercase();
+	let local = claim.preferred_username.unwrap_or(claim.sub).to_lowercase();
 	let server = &services.server.name;
 	let user_id = UserId::parse_with_server_name(local, server).map_err(|e| {
 		err!(Request(InvalidUsername("JWT subject is not a valid user MXID: {e}")))
