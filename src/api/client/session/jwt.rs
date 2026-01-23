@@ -79,6 +79,8 @@ fn init_verifier(config: &JwtConfig) -> Result<DecodingKey> {
 
 		| "EDDSA" => DecodingKey::from_ed_pem(key.as_bytes())
 			.map_err(|e| err!(Config("jwt.key", "JWT key is not valid EDDSA PEM: {e}")))?,
+		| "RSA" => DecodingKey::from_rsa_pem(key.as_bytes())
+		.map_err(|e| err!(Config("jwt.key", "JWT key is not valid RSA PEM: {e}")))?,
 
 		| _ => return Err!(Config("jwt.format", "Key format {format:?} is not supported.")),
 	})
