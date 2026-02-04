@@ -93,7 +93,7 @@ pub struct Config {
 	///
 	/// To disable, set this to "" (an empty string).
 	///
-	/// default: "💕"
+	/// default: ""
 	#[serde(default = "default_new_user_displayname_suffix")]
 	pub new_user_displayname_suffix: String,
 
@@ -3130,7 +3130,8 @@ fn default_url_preview_max_spider_size() -> usize {
 	256_000 // 256KB
 }
 
-fn default_new_user_displayname_suffix() -> String { "💕".to_owned() }
+// fn default_new_user_displayname_suffix() -> String { "💕".to_owned() }
+fn default_new_user_displayname_suffix() -> String { String::new() }
 
 fn default_sentry_endpoint() -> Option<Url> {
 	let url = "https://8994b1762a6a95af9502a7900edabc4c@o4509498990067712.ingest.us.sentry.io/4509498993213440"
