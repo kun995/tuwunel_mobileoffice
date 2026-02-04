@@ -20,7 +20,7 @@ services:
     container_name: matrix-rtc-jwt
     environment:
       - LIVEKIT_JWT_PORT=8081
-      - LIVEKIT_URL=https://matrix-rtc.yourdomain.com/livekit/sfu
+      - LIVEKIT_URL=wss://matrix-rtc.yourdomain.com
       - LIVEKIT_KEY=mrtckey
       - LIVEKIT_SECRET=mrtcsecret
       - LIVEKIT_FULL_ACCESS_HOMESERVERS=yourdomain.com
@@ -62,14 +62,11 @@ keys:
 #### 3.1. .well-known served by Tuwunel
 ***Follow this step if your .well-known configuration is served by tuwunel. Otherwise follow Step 3.2***
 1. Open your tuwunel.toml file. e.g. `nano /etc/tuwunel/tuwunel.toml`.
-2. Find the line reading `#rtc_transports = []` and edit it to be:
+2. Find the line reading `#rtc_transports = []` and replace it with:
 ```toml
-rtc_transports = [
-  { 
-    type = "livekit", 
-    livekit_service_url = "https://matrix-rtc.yourdomain.com" 
-  }
-]
+[[global.well_known.rtc_transports]]
+type = "livekit"
+livekit_service_url = "https://matrix-rtc.yourdomain.com"
 ```
 3. Close the file.
 
@@ -170,7 +167,7 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
     # livekit
-    location /livekit/sfu/ {
+    location / {
        proxy_pass http://localhost:7880;
        proxy_http_version 1.1;
 
@@ -187,15 +184,87 @@ server {
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
     }
-
-    # Redirect root / at /livekit/sfu/
-    location = / {
-        return 301 /livekit/sfu/;
-    }
 }
 ```
 2. Restart Nginx.
 
+#### 5.3. Traefik
+1. Add your `matrix-rtc-jwt` `matrix-rtc-livekit` to your traefik's network
+```yaml
+services:
+  matrix-rtc-jwt:
+    # ...
+    networks:
+        - proxy # your traefik network name
+
+  matrix-rtc-livekit:
+    # ...
+    networks:
+        - proxy # your traefik network name
+
+networks:
+    proxy: # your traefik network name
+        external: true
+```
+2. Configure with either one of the methods below
+
+2.1 Labels
+```yaml
+services:
+  matrix-rtc-jwt:
+    # ...
+    labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.matrixrtcjwt.entrypoints=websecure"
+        - "traefik.http.routers.matrixrtcjwt.rule=Host(`matrix-rtc.yourdomain.com`) && PathPrefix(`/sfu/get`) || PathPrefix(`/healthz`)"
+        - "traefik.http.routers.matrixrtcjwt.tls=true"
+        - "traefik.http.routers.matrixrtcjwt.service=matrixrtcjwt"
+        - "traefik.http.services.matrixrtcjwt.loadbalancer.server.port=8081"
+        - "traefik.http.routers.matrixrtcjwt.tls.certresolver=yourcertresolver" # change to your cert resolver's name
+        - "traefik.docker.network=proxy" # your traefik network name
+
+  matrix-rtc-livekit:
+    # ...
+    labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.livekit.entrypoints=websecure"
+        - "traefik.http.routers.livekit.rule=Host(`matrix-rtc.yourdomain.com`)"
+        - "traefik.http.routers.livekit.tls=true"
+        - "traefik.http.routers.livekit.service=livekit"
+        - "traefik.http.services.livekit.loadbalancer.server.port=7880"
+        - "traefik.http.routers.livekit.tls.certresolver=yourcertresolver" # change to your cert resolver's name
+        - "traefik.docker.network=proxy" # your traefik network name
+```
+2.2 Config file
+```yaml
+http:
+    routers:
+        matrixrtcjwt:
+            entryPoints:
+                - "websecure"
+            rule: "Host(`matrix-rtc.yourdomain.com`) && PathPrefix(`/sfu/get`) || PathPrefix(`/healthz`)"
+            tls:
+                certResolver: "yourcertresolver" # change to your cert resolver's name
+            service: matrixrtcjwt
+        livekit:
+            entryPoints:
+                - "websecure"
+            rule: "Host(`matrix-rtc.yourdomain.com`)"
+            tls:
+                certResolver: "yourcertresolver" # change to your cert resolver's name
+            service: livekit
+    services:
+        matrixrtcjwt:
+            loadBalancer:
+                servers:
+                    - url: "http://matrix-rtc-jwt:8081"
+                passHostHeader: true
+        livekit:
+            loadBalancer:
+                servers:
+                    - url: "http://matrix-rtc-livekit:7880"
+                passHostHeader: true
+```
 ### 6. Start Docker Containers
 1. Ensure you are in your matrix-rtc directory. e.g. `cd /opt/matrix-rtc`.
 2. Start containers: `docker compose up -d`.
@@ -210,34 +279,20 @@ min-port=50201
 max-port=65535
 ```
 
-If you have Coturn configured, you can use it as a TURN server for Livekit to improve call reliability. Unfortunately, Livekit does not support using static-auth-secret to authenticate with TURN servers, and you cannot combine credential and auth-secret authentication. Luckily, it is possible to use multiple instances of `static-auth-secret` within you `turnserver.conf`, and you can generate a username and password from the secret as a workaround.
+If you have Coturn configured, you can use it as a TURN server for Livekit to improve call reliability. As Coturn allows multiple instances of `static-auth-secret`, it is suggested that the secret used for Livekit is different to that used for tuwunel.
 
-1. To create a credential for use with Livekit and Coturn, run the following command. AUTH_SECRET should be replaced with a 64 digit alphanumeric string. For more information on the command see [this post](https://wiki.lenuagemagique.com/doku.php?id=unable_to_use_lt-cred-mech_webrtc_and_static-auth-secret_restapi_at_the_same_time).
-```
-secret=AUTH_SECRET && \
-time=$(date +%s) && \
-expiry=8640000 && \
-username=$(( $time + $expiry )) && \
-echo username: $username && \
-echo password: $(echo -n $username | openssl dgst -binary -sha1 -hmac $secret | openssl base64)
-```
-This should produce output in the following format:
-```
-username: USERNAME
-password: PASSWORD
-```
-2. Add the following line to the end of your `turnserver.conf`. AUTH_SECRET is the same as that used in Step 1.
+1. Create a secret for Coturn. It is suggested that this should be a random 64 character alphanumeric string.
+2. Add the following line to the end of your `turnserver.conf`. `AUTH_SECRET` is the secret created in Step 1.
 ```
 static-auth-secret=AUTH_SECRET
 ```
-3. Add the following to the end of the `rtc` block in your `livekit.yaml`. USERNAME and PASSWORD should be replaced with the corresponding values in the output of Step 1. `turn.yourdomain.com` should be replaced with your actual turn domain.
+3. Add the following to the end of the `rtc` block in your `livekit.yaml`. `AUTH_SECRET` is the same as above. `turn.yourdomain.com` should be replaced with your actual TURN domain.
 ```
   turn_servers:
     - host: turn.yourdomain.com
       port: 5349
       protocol: tls
-      username: "USERNAME"
-      credential: "PASSWORD"
+      secret: "AUTH_SECRET"
 ```
 
 ### Using the Livekit Built In TURN Server

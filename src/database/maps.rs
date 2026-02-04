@@ -39,8 +39,8 @@ pub(super) static MAPS: &[Descriptor] = &[
 		cache_disp: CacheDisp::SharedWith("shorteventid_authchain"),
 		index_size: 512,
 		block_size: 4096,
-		key_size_hint: Some(8),
-		val_size_hint: Some(1024),
+		key_size_hint: Some(8), // intentionally match shorteventid_authchain
+		val_size_hint: Some(256),
 		..descriptor::RANDOM_CACHE
 	},
 	Descriptor {
@@ -62,6 +62,14 @@ pub(super) static MAPS: &[Descriptor] = &[
 	Descriptor {
 		name: "disabledroomids",
 		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "eventid_originalpdu",
+		key_size_hint: Some(48),
+		val_size_hint: Some(1520),
+		block_size: 2048,
+		index_size: 512,
+		..descriptor::RANDOM
 	},
 	Descriptor {
 		name: "eventid_outlierpdu",
@@ -166,6 +174,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 	Descriptor {
 		name: "referencedevents",
 		..descriptor::RANDOM
+	},
+	Descriptor {
+		name: "registrationtoken_info",
+		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
 		name: "roomid_knockedcount",
@@ -290,7 +302,7 @@ pub(super) static MAPS: &[Descriptor] = &[
 		name: "shorteventid_authchain",
 		cache_disp: CacheDisp::SharedWith("authchainkey_authchain"),
 		key_size_hint: Some(8),
-		val_size_hint: Some(1024),
+		val_size_hint: Some(256),
 		index_size: 512,
 		block_size: 4096,
 		..descriptor::SEQUENTIAL
@@ -341,6 +353,11 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "threadid_userids",
+		..descriptor::SEQUENTIAL_SMALL
+	},
+	Descriptor {
+		name: "timeredacted_eventid",
+		key_size_hint: Some(57),
 		..descriptor::SEQUENTIAL_SMALL
 	},
 	Descriptor {

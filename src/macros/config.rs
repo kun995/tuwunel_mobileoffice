@@ -17,7 +17,7 @@ const UNDOCUMENTED: &str = "# This item is undocumented. Please contribute docum
 
 const HIDDEN: &[&str] = &["default", "display"];
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 pub(super) fn example_generator(input: ItemStruct, args: &[Meta]) -> Result<TokenStream> {
 	let write = is_cargo_build() && !is_cargo_test();
 	let additional = generate_example(&input, args, write)?;
@@ -29,7 +29,6 @@ pub(super) fn example_generator(input: ItemStruct, args: &[Meta]) -> Result<Toke
 }
 
 #[allow(clippy::needless_pass_by_value)]
-#[allow(unused_variables)]
 fn generate_example(input: &ItemStruct, args: &[Meta], write: bool) -> Result<TokenStream2> {
 	let settings = get_simple_settings(args);
 
@@ -89,9 +88,9 @@ fn generate_example(input: &ItemStruct, args: &[Meta], write: bool) -> Result<To
 				continue;
 			}
 
-			let Some(type_name) = get_type_name(field) else {
+			if get_type_name(field).is_none() {
 				continue;
-			};
+			}
 
 			let doc = get_doc_comment(field)
 				.unwrap_or_else(|| undocumented.into())

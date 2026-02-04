@@ -1,6 +1,4 @@
-#![allow(clippy::wildcard_imports)]
-#![allow(clippy::enum_glob_use)]
-#![allow(clippy::too_many_arguments)]
+#![expect(clippy::too_many_arguments)]
 
 pub(crate) mod admin;
 pub(crate) mod context;
@@ -9,13 +7,13 @@ mod tests;
 pub(crate) mod utils;
 
 pub(crate) mod appservice;
-pub(crate) mod check;
 pub(crate) mod debug;
 pub(crate) mod federation;
 pub(crate) mod media;
 pub(crate) mod query;
 pub(crate) mod room;
 pub(crate) mod server;
+pub(crate) mod token;
 pub(crate) mod user;
 
 pub(crate) use tuwunel_macros::{admin_command, admin_command_dispatch};

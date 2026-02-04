@@ -68,9 +68,6 @@ on:
       complement_runner:
         type: string
         default: 'het'
-      complement_logs:
-        type: string
-        default: 'true'
       complement_verbose:
         type: string
         default: 'false'
@@ -230,7 +227,6 @@ jobs:
           {"cargo_profile": "release-native", "sys_target": "x86_64-v4-linux-gnu"},
           {"rust_target": "aarch64-unknown-linux-gnu", "feat_set": "none"},
           {"rust_target": "aarch64-unknown-linux-gnu", "feat_set": "default"},
-          {"rust_target": "aarch64-unknown-linux-gnu", "feat_set": "logging"},
           {"rust_target": "aarch64-unknown-linux-gnu", "sys_target": "x86_64-v1-linux-gnu"},
           {"rust_target": "aarch64-unknown-linux-gnu", "sys_target": "x86_64-v2-linux-gnu"},
           {"rust_target": "aarch64-unknown-linux-gnu", "sys_target": "x86_64-v3-linux-gnu"},
@@ -429,8 +425,8 @@ jobs:
         name: complement_results-${{matrix.feat_set}}-${{matrix.sys_name}}-${{matrix.sys_target}}.jsonl
         path: ./tests/complement/results.jsonl
 
-    - if: inputs.complement_logs || (failure() && steps.execute.outcome == 'failure')
-      name: Upload Failure Output
+    - if: success() || (failure() && steps.execute.outcome == 'failure')
+      name: Upload Log Output
       id: upload-output
       uses: actions/upload-artifact@v4
       with:

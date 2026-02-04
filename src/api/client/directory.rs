@@ -1,3 +1,5 @@
+use std::cmp;
+
 use axum::extract::State;
 use axum_client_ip::InsecureClientIp;
 use futures::{
@@ -17,19 +19,15 @@ use ruma::{
 		federation,
 	},
 	directory::{Filter, PublicRoomsChunk, RoomNetwork, RoomTypeFilter},
-	events::{
-		StateEventType,
-		room::join_rules::{JoinRule, RoomJoinRulesEventContent},
-	},
+	events::StateEventType,
 	uint,
 };
 use tuwunel_core::{
-	Err, Result, err, info, is_true,
+	Err, Result, err, info,
 	matrix::Event,
 	utils::{
 		TryFutureExtExt,
 		math::Expected,
-		result::FlatOk,
 		stream::{IterStream, ReadyExt, WidebandExt},
 	},
 };
@@ -332,7 +330,7 @@ pub(crate) async fn get_public_rooms_filtered_helper(
 		.collect()
 		.await;
 
-	all_rooms.sort_by(|l, r| r.num_joined_members.cmp(&l.num_joined_members));
+	all_rooms.sort_by_key(|r| cmp::Reverse(r.num_joined_members));
 
 	let total_room_count_estimate = UInt::try_from(all_rooms.len())
 		.unwrap_or_else(|_| uint!(0))
@@ -429,17 +427,19 @@ async fn public_rooms_chunk(services: &Services, room_id: OwnedRoomId) -> Public
 
 	let join_rule = services
 		.state_accessor
-		.room_state_get_content(&room_id, &StateEventType::RoomJoinRules, "")
-		.map_ok(|c: RoomJoinRulesEventContent| match c.join_rule {
-			| JoinRule::Public => "public".into(),
-			| JoinRule::Knock => "knock".into(),
-			| JoinRule::KnockRestricted(_) => "knock_restricted".into(),
-			| _ => "invite".into(),
-		});
+		.get_join_rules(&room_id)
+		.map(|join_rule| join_rule.kind());
 
 	let guest_can_join = services.state_accessor.guest_can_join(&room_id);
 
-	let num_joined_members = services.state_cache.room_joined_count(&room_id);
+	let num_joined_members = services
+		.state_cache
+		.room_joined_count(&room_id)
+		.map(|x| {
+			x.ok()
+				.and_then(|x| x.try_into().ok())
+				.unwrap_or_else(|| uint!(0))
+		});
 
 	let (
 		(avatar_url, canonical_alias, guest_can_join, join_rule, name),
@@ -455,13 +455,9 @@ async fn public_rooms_chunk(services: &Services, room_id: OwnedRoomId) -> Public
 		avatar_url: avatar_url.flatten(),
 		canonical_alias,
 		guest_can_join,
-		join_rule: join_rule.unwrap_or_default(),
+		join_rule,
 		name,
-		num_joined_members: num_joined_members
-			.map(TryInto::try_into)
-			.map(Result::ok)
-			.flat_ok()
-			.unwrap_or_else(|| uint!(0)),
+		num_joined_members,
 		room_id,
 		room_type,
 		topic,
@@ -474,18 +470,17 @@ fn check_server_banned(services: &Services, server: Option<&ServerName>) -> Resu
 		return Ok(());
 	};
 
-	let conditions = [
-		services
-			.config
-			.forbidden_remote_room_directory_server_names
-			.is_match(server.host()),
-		services
+	let host = server.host();
+
+	if services
+		.config
+		.forbidden_remote_room_directory_server_names
+		.is_match(host)
+		|| services
 			.config
 			.forbidden_remote_server_names
-			.is_match(server.host()),
-	];
-
-	if conditions.iter().any(is_true!()) {
+			.is_match(host)
+	{
 		return Err!(Request(Forbidden("Server is banned on this homeserver.")));
 	}
 

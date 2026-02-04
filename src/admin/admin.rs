@@ -2,10 +2,16 @@ use clap::Parser;
 use tuwunel_core::Result;
 
 use crate::{
-	appservice, appservice::AppserviceCommand, check, check::CheckCommand, context::Context,
-	debug, debug::DebugCommand, federation, federation::FederationCommand, media,
-	media::MediaCommand, query, query::QueryCommand, room, room::RoomCommand, server,
-	server::ServerCommand, user, user::UserCommand,
+	appservice::{self, AppserviceCommand},
+	context::Context,
+	debug::{self, DebugCommand},
+	federation::{self, FederationCommand},
+	media::{self, MediaCommand},
+	query::{self, QueryCommand},
+	room::{self, RoomCommand},
+	server::{self, ServerCommand},
+	token::{self, TokenCommand},
+	user::{self, UserCommand},
 };
 
 #[derive(Debug, Parser)]
@@ -36,16 +42,16 @@ pub(super) enum AdminCommand {
 	Media(MediaCommand),
 
 	#[command(subcommand)]
-	/// - Commands for checking integrity
-	Check(CheckCommand),
-
-	#[command(subcommand)]
 	/// - Commands for debugging things
 	Debug(DebugCommand),
 
 	#[command(subcommand)]
 	/// - Low-level queries for database getters and iterators
 	Query(QueryCommand),
+
+	#[command(subcommand)]
+	/// - Commands for managing registration tokens
+	Token(TokenCommand),
 }
 
 #[tracing::instrument(skip_all, name = "command")]
@@ -61,6 +67,6 @@ pub(super) async fn process(command: AdminCommand, context: &Context<'_>) -> Res
 		| Server(command) => server::process(command, context).await,
 		| Debug(command) => debug::process(command, context).await,
 		| Query(command) => query::process(command, context).await,
-		| Check(command) => check::process(command, context).await,
+		| Token(command) => token::process(command, context).await,
 	}
 }

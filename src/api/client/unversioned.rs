@@ -39,6 +39,8 @@ pub(crate) async fn get_supported_versions_route(
 			"v1.5".to_owned(),
 			"v1.10".to_owned(), // relations recursion
 			"v1.11".to_owned(), // authenticated media
+			"v1.12".to_owned(), // m.tz
+			"v1.15".to_owned(), // custom profile fields
 		],
 		unstable_features: BTreeMap::from_iter([
 			("org.matrix.e2e_cross_signing".to_owned(), true),
@@ -57,6 +59,7 @@ pub(crate) async fn get_supported_versions_route(
 			("us.cloke.msc4175".to_owned(), true), /* Profile field for user time zone (https://github.com/matrix-org/matrix-spec-proposals/pull/4175) */
 			("org.matrix.msc4180".to_owned(), true), /* stable flag for 3916 (https://github.com/matrix-org/matrix-spec-proposals/pull/4180) */
 			("org.matrix.simplified_msc3575".to_owned(), true), /* Simplified Sliding sync (https://github.com/matrix-org/matrix-spec-proposals/pull/4186) */
+			("fi.mau.msc2815".to_owned(), true), /* Allow room moderators to view redacted event content (https://github.com/matrix-org/matrix-spec-proposals/pull/2815) */
 		]),
 	};
 

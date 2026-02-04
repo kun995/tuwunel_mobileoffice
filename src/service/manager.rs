@@ -106,7 +106,7 @@ impl Manager {
 		}
 	}
 
-	#[allow(clippy::unused_self)]
+	#[expect(clippy::unused_self)]
 	fn handle_finished(
 		&self,
 		_workers: &mut WorkersLocked<'_>,

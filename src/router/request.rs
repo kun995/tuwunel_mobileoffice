@@ -73,7 +73,7 @@ pub(crate) async fn handle(
 	skip_all,
 	ret(level = "trace"),
 )]
-#[allow(unused_variables)]
+#[cfg_attr(not(debug_assertions), expect(unused_variables))]
 async fn execute(
 	// we made a safety contract that Services will not go out of scope
 	// during the request; this ensures a reference is accounted for at

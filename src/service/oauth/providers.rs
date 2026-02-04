@@ -8,11 +8,15 @@ use url::Url;
 
 use crate::SelfServices;
 
+/// Discovered providers
 #[derive(Default)]
 pub struct Providers {
 	services: SelfServices,
-	providers: RwLock<BTreeMap<String, Provider>>,
+	providers: RwLock<BTreeMap<ProviderId, Provider>>,
 }
+
+/// Identity Provider ID
+pub type ProviderId = String;
 
 #[implement(Providers)]
 pub(super) fn build(args: &crate::Args<'_>) -> Self {
@@ -56,7 +60,7 @@ pub fn get_config(&self, id: &str) -> Result<Provider> {
 	let providers = &self.services.config.identity_provider;
 
 	if let Some(provider) = providers
-		.iter()
+		.values()
 		.find(|config| config.id() == id)
 		.cloned()
 	{
@@ -64,11 +68,11 @@ pub fn get_config(&self, id: &str) -> Result<Provider> {
 	}
 
 	if let Some(provider) = providers
-		.iter()
+		.values()
 		.find(|config| config.brand == id.to_lowercase())
 		.filter(|_| {
 			providers
-				.iter()
+				.values()
 				.filter(|config| config.brand == id.to_lowercase())
 				.count()
 				.eq(&1)

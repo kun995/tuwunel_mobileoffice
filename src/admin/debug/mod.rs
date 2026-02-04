@@ -250,9 +250,13 @@ pub(super) enum DebugCommand {
 	/// - Synchronize database with primary (secondary only)
 	ResyncDatabase,
 
+	/// - Retrieves the saved original PDU before it has been redacted
+	GetRetainedPdu {
+		event_id: OwnedEventId,
+	},
+
 	/// - Developer test stubs
 	#[command(subcommand)]
-	#[allow(non_snake_case)]
 	#[clap(hide(true))]
 	Tester(TesterCommand),
 }

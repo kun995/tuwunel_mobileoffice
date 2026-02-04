@@ -2,6 +2,7 @@ use std::env::consts::OS;
 
 use either::Either;
 use figment::Figment;
+use itertools::Itertools;
 
 use super::{DEPRECATED_KEYS, IdentityProvider};
 use crate::{Config, Err, Result, Server, debug, debug_info, debug_warn, error, warn};
@@ -22,7 +23,6 @@ pub fn reload(old: &Config, new: &Config) -> Result {
 	Ok(())
 }
 
-#[allow(clippy::cognitive_complexity)]
 pub fn check(config: &Config) -> Result {
 	if cfg!(debug_assertions) {
 		warn!("Note: tuwunel was built without optimisations (i.e. debug build)");
@@ -36,7 +36,7 @@ pub fn check(config: &Config) -> Result {
 	}
 
 	warn_deprecated(config);
-	warn_unknown_key(config);
+	warn_unknown_key(config)?;
 
 	if config.sentry && config.sentry_endpoint.is_none() {
 		return Err!(Config(
@@ -129,7 +129,11 @@ pub fn check(config: &Config) -> Result {
 		));
 	}
 
-	if config.emergency_password == Some(String::from("F670$2CP@Hw8mG7RY1$%!#Ic7YA")) {
+	if config
+		.emergency_password
+		.as_ref()
+		.is_some_and(|emergency_password| emergency_password == "F670$2CP@Hw8mG7RY1$%!#Ic7YA")
+	{
 		return Err!(Config(
 			"emergency_password",
 			"The public example emergency password is being used, this is insecure. Please \
@@ -137,7 +141,11 @@ pub fn check(config: &Config) -> Result {
 		));
 	}
 
-	if config.emergency_password == Some(String::new()) {
+	if config
+		.emergency_password
+		.as_ref()
+		.is_some_and(String::is_empty)
+	{
 		return Err!(Config(
 			"emergency_password",
 			"Emergency password was set to an empty string, this is not valid. Unset \
@@ -146,7 +154,11 @@ pub fn check(config: &Config) -> Result {
 	}
 
 	// check if the user specified a registration token as `""`
-	if config.registration_token == Some(String::new()) {
+	if config
+		.registration_token
+		.as_ref()
+		.is_some_and(String::is_empty)
+	{
 		return Err!(Config(
 			"registration_token",
 			"Registration token was specified but is empty (\"\")"
@@ -288,7 +300,24 @@ pub fn check(config: &Config) -> Result {
 		));
 	}
 
-	for (i, provider) in config.identity_provider.iter().enumerate() {
+	for a in config.identity_provider.values() {
+		let count = config
+			.identity_provider
+			.values()
+			.filter(|b| a.id().eq(b.id()))
+			.count();
+
+		debug_assert_ne!(count, 0, "expected at least one identity_provider");
+		if count > 1 {
+			return Err!(Config(
+				"client_id",
+				"Duplicate identity_provider with client_id {}",
+				a.client_id
+			));
+		}
+	}
+
+	for (i, provider) in &config.identity_provider {
 		if provider.client_secret.is_some() {
 			continue;
 		}
@@ -317,32 +346,18 @@ pub fn check(config: &Config) -> Result {
 		}
 	}
 
-	if config
-		.identity_provider
-		.iter()
-		.filter(|idp| idp.default)
-		.count()
-		.gt(&1)
-	{
-		return Err!(Config(
-			"identity_provider.default",
-			"More than one identity_provider is configured with `default = true`. Only one can \
-			 be set to default.",
-		));
-	}
-
 	if !config.sso_custom_providers_page
 		&& config.identity_provider.len() > 1
 		&& config
 			.identity_provider
-			.iter()
+			.values()
 			.filter(|idp| idp.default)
 			.count()
 			.eq(&0)
 	{
 		let default = config
 			.identity_provider
-			.iter()
+			.values()
 			.next()
 			.map(IdentityProvider::id)
 			.expect("Check at least one provider is configured to reach here");
@@ -361,34 +376,47 @@ pub fn check(config: &Config) -> Result {
 /// deprecated key specified
 fn warn_deprecated(config: &Config) {
 	debug!("Checking for deprecated config keys");
-	let mut was_deprecated = false;
-	for key in config
+	let found_deprecated_keys = config
 		.catchall
 		.keys()
 		.filter(|key| DEPRECATED_KEYS.iter().any(|s| s == key))
-	{
-		warn!("Config parameter \"{}\" is deprecated, ignoring.", key);
-		was_deprecated = true;
-	}
+		.inspect(|key| warn!("Config parameter \"{key}\" is deprecated, ignoring."))
+		.next()
+		.is_some();
 
-	if was_deprecated {
+	if found_deprecated_keys {
 		warn!(
-			"Read tuwunel config documentation at https://tuwunel.chat/configuration.html and \
+			"Deprecated config keys were found. Read tuwunel config documentation at https://tuwunel.chat/configuration.html and \
 			 check your configuration if any new configuration parameters should be adjusted"
 		);
 	}
 }
 
-/// iterates over all the catchall keys (unknown config options) and warns
-/// if there are any.
-fn warn_unknown_key(config: &Config) {
+/// iterates over all the catchall keys (unknown config options) and warns or
+/// errors if there are any.
+fn warn_unknown_key(config: &Config) -> Result {
 	debug!("Checking for unknown config keys");
-	for key in config
+	let unknown_keys = config
 		.catchall
 		.keys()
-		.filter(|key| "config".to_owned().ne(key.to_owned()) /* "config" is expected */)
-	{
-		warn!("Config parameter \"{}\" is unknown to tuwunel, ignoring.", key);
+		.filter_map(|key| {
+			if key == "config" {
+				None
+			} else {
+				if config.error_on_unknown_config_opts {
+					error!("Config parameter \"{key}\" is unknown to tuwunel");
+				} else {
+					warn!("Config parameter \"{key}\" is unknown to tuwunel, ignoring.");
+				}
+				Some(key.as_str())
+			}
+		})
+		.collect_vec();
+
+	if !unknown_keys.is_empty() && config.error_on_unknown_config_opts {
+		Err!("Unknown config options were found: {unknown_keys:?}")
+	} else {
+		Ok(())
 	}
 }
 

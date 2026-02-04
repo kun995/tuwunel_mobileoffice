@@ -28,8 +28,8 @@ keywords = [
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/matrix-construct/tuwunel"
-rust-version = "1.89.0"
-version = "1.4.9"
+rust-version = "1.91.1"
+version = "1.5.0"
 
 [workspace.metadata.crane]
 name = "tuwunel"
@@ -327,7 +327,7 @@ default-features = false
 
 [workspace.dependencies.ruma]
 git = "https://github.com/matrix-construct/ruma"
-rev = "ff66bdd9975152f0382d753120dddddf3577ad51"
+rev = "069b3f6ee7499cdac84175946aeb9443d2578363"
 features = [
     "__compat",
     "appservice-api-c",
@@ -342,6 +342,7 @@ features = [
     "ring-compat",
     "unstable-msc2448",
     "unstable-msc2666",
+    "unstable-msc2815",
     "unstable-msc2867",
     "unstable-msc2870",
     "unstable-msc3026",
@@ -938,7 +939,6 @@ perf = { level = "warn", priority = -1 }
 ###################
 #restriction = "warn"
 
-#allow_attributes = "warn"                                           # UNSTABLE
 arithmetic_side_effects = "warn"
 as_conversions = "warn"
 as_underscore = "warn"

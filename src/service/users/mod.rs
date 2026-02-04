@@ -17,7 +17,7 @@ use tuwunel_core::{
 	Err, Result, debug_warn, err, is_equal_to,
 	pdu::PduBuilder,
 	trace,
-	utils::{self, ReadyExt, result::LogErr, stream::TryIgnore},
+	utils::{self, ReadyExt, stream::TryIgnore},
 	warn,
 };
 use tuwunel_database::{Deserialized, Json, Map};
@@ -133,14 +133,10 @@ impl Service {
 	/// Deactivate account
 	pub async fn deactivate_account(&self, user_id: &UserId) -> Result {
 		// Revoke any SSO authorizations
-		if let Ok((provider, session)) = self.services.oauth.get_user(user_id).await {
-			self.services
-				.oauth
-				.revoke_token((&provider, &session))
-				.await
-				.log_err()
-				.ok();
-		}
+		self.services
+			.oauth
+			.revoke_user_tokens(user_id)
+			.await;
 
 		// Remove all associated devices
 		self.all_device_ids(user_id)
@@ -186,16 +182,6 @@ impl Service {
 	/// Returns the number of users registered on this server.
 	#[inline]
 	pub async fn count(&self) -> usize { self.db.userid_password.count().await }
-
-	/// Returns an iterator over all users on this homeserver (offered for
-	/// compatibility)
-	#[allow(
-		clippy::iter_without_into_iter,
-		clippy::iter_not_returning_iterator
-	)]
-	pub fn iter(&self) -> impl Stream<Item = OwnedUserId> + Send + '_ {
-		self.stream().map(ToOwned::to_owned)
-	}
 
 	/// Returns an iterator over all users on this homeserver.
 	pub fn stream(&self) -> impl Stream<Item = &UserId> + Send {
@@ -393,13 +379,13 @@ impl Service {
 	}
 
 	#[cfg(not(feature = "ldap"))]
-	#[allow(clippy::unused_async)]
+	#[expect(clippy::unused_async)]
 	pub async fn search_ldap(&self, _user_id: &UserId) -> Result<Vec<(String, bool)>> {
 		Err!(FeatureDisabled("ldap"))
 	}
 
 	#[cfg(not(feature = "ldap"))]
-	#[allow(clippy::unused_async)]
+	#[expect(clippy::unused_async)]
 	pub async fn auth_ldap(&self, _user_dn: &str, _password: &str) -> Result {
 		Err!(FeatureDisabled("ldap"))
 	}
