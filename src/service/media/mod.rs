@@ -3,6 +3,7 @@ mod data;
 pub(super) mod migrations;
 mod preview;
 mod remote;
+pub mod storage;
 mod tests;
 mod thumbnail;
 use std::{path::PathBuf, sync::Arc, time::SystemTime};
@@ -10,10 +11,8 @@ use std::{path::PathBuf, sync::Arc, time::SystemTime};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use ruma::{Mxc, OwnedMxcUri, UserId, http_headers::ContentDisposition};
-use tokio::{
-	fs,
-	io::{AsyncReadExt, AsyncWriteExt, BufReader},
-};
+use tokio::fs;
+use tokio::sync::OnceCell;
 use tuwunel_core::{
 	Err, Result, debug, debug_error, debug_info, debug_warn, err, error, trace,
 	utils::{self, MutexMap},
@@ -33,6 +32,7 @@ pub struct FileMeta {
 pub struct Service {
 	url_preview_mutex: MutexMap<String, ()>,
 	pub(super) db: Data,
+	storage: Arc<OnceCell<Arc<dyn storage::MediaStorage>>>,
 	services: Arc<crate::services::OnceServices>,
 }
 
@@ -51,11 +51,18 @@ impl crate::Service for Service {
 		Ok(Arc::new(Self {
 			url_preview_mutex: MutexMap::new(),
 			db: Data::new(args.db),
+			storage: Arc::new(OnceCell::new()),
 			services: args.services.clone(),
 		}))
 	}
 
 	async fn worker(self: Arc<Self>) -> Result {
+		// Initialize storage (lazy init)
+		let storage = Self::build_storage(&self.services.server.config).await?;
+		self.storage
+			.set(storage)
+			.map_err(|_| err!(Config("media_storage", "Storage already initialized")))?;
+
 		self.create_media_dir().await?;
 
 		Ok(())
@@ -65,6 +72,65 @@ impl crate::Service for Service {
 }
 
 impl Service {
+	/// Build storage backend based on configuration
+	async fn build_storage(config: &tuwunel_core::config::Config) -> Result<Arc<dyn storage::MediaStorage>> {
+		use tuwunel_core::config::StorageStrategy;
+
+		let media_path = config.database_path.join("media");
+
+		match config.media_storage.strategy {
+			StorageStrategy::Filesystem => {
+				debug!("Initializing Filesystem storage");
+				Ok(Arc::new(storage::filesystem::FilesystemStorage::new(
+					media_path,
+				)?))
+			},
+
+			#[cfg(feature = "s3_storage")]
+			StorageStrategy::S3 => {
+				debug!("Initializing S3 storage");
+				let s3_config = config
+					.media_storage
+					.s3
+					.as_ref()
+					.ok_or_else(|| err!(Config("media_storage.s3", "S3 configuration required for S3 storage strategy")))?;
+				let s3 = storage::s3::S3Storage::new(s3_config).await?;
+				Ok(Arc::new(s3) as Arc<dyn storage::MediaStorage>)
+			},
+
+			#[cfg(feature = "s3_storage")]
+			StorageStrategy::HybridS3Primary => {
+				debug!("Initializing Hybrid S3 Primary storage");
+				let fs = Arc::new(storage::filesystem::FilesystemStorage::new(media_path)?);
+				let s3_config = config
+					.media_storage
+					.s3
+					.as_ref()
+					.ok_or_else(|| err!(Config("media_storage.s3", "S3 configuration required for Hybrid S3 Primary strategy")))?;
+				let s3 = Arc::new(storage::s3::S3Storage::new(s3_config).await?) as Arc<dyn storage::MediaStorage>;
+
+				Ok(Arc::new(storage::hybrid::HybridStorage::new(
+					s3, // primary
+					fs, // secondary (cache)
+					config.media_storage.hybrid.clone(),
+				)))
+			},
+
+			#[cfg(not(feature = "s3_storage"))]
+			_ => Err(err!(Config(
+				"S3 storage strategy requires compilation with --features s3_storage"
+			))),
+		}
+	}
+
+	/// Get storage backend (panics if not initialized)
+	#[inline]
+	fn get_storage(&self) -> &Arc<dyn storage::MediaStorage> {
+		self.storage
+			.get()
+			.expect("Storage not initialized - this is a bug")
+	}
+
 	/// Uploads a file.
 	pub async fn create(
 		&self,
@@ -83,9 +149,8 @@ impl Service {
 			content_type,
 		)?;
 
-		//TODO: Dangling metadata in database if creation fails
-		let mut f = self.create_media_file(&key).await?;
-		f.write_all(file).await?;
+		// Use storage trait to save file
+		self.get_storage().create(&key, file).await?;
 
 		Ok(())
 	}
@@ -96,10 +161,10 @@ impl Service {
 			| Ok(keys) => {
 				for key in keys {
 					trace!(?mxc, "MXC Key: {key:?}");
-					debug_info!(?mxc, "Deleting from filesystem");
+					debug_info!(?mxc, "Deleting from storage");
 
-					if let Err(e) = self.remove_media_file(&key).await {
-						debug_error!(?mxc, "Failed to remove media file: {e}");
+					if let Err(e) = self.get_storage().delete(&key).await {
+						debug_error!(?mxc, "Failed to delete from storage: {e}");
 					}
 
 					debug_info!(?mxc, "Deleting from database");
@@ -152,17 +217,15 @@ impl Service {
 			.await
 		{
 			| Ok(Metadata { content_disposition, content_type, key }) => {
-				let mut content = Vec::with_capacity(8192);
-				let path = self.get_media_file(&key);
-				BufReader::new(fs::File::open(path).await?)
-					.read_to_end(&mut content)
-					.await?;
-
-				Ok(Some(FileMeta {
-					content: Some(content),
-					content_type,
-					content_disposition,
-				}))
+				// Use storage trait to read file
+				match self.get_storage().read(&key).await? {
+					Some(bytes) => Ok(Some(FileMeta {
+						content: Some(bytes.to_vec()),
+						content_type,
+						content_disposition,
+					})),
+					None => Ok(None),
+				}
 			},
 			| _ => Ok(None),
 		}

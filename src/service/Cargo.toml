@@ -66,6 +66,11 @@ lz4_compression = [
 media_thumbnail = [
 	"dep:image",
 ]
+s3_storage = [
+	"dep:aws-config",
+	"dep:aws-sdk-s3",
+	"dep:aws-smithy-async",
+]
 release_max_log_level = [
 	"tuwunel-core/release_max_log_level",
 	"tuwunel-database/release_max_log_level",
@@ -86,6 +91,12 @@ zstd_compression = [
 
 [dependencies]
 async-trait.workspace = true
+aws-config.workspace = true
+aws-config.optional = true
+aws-sdk-s3.workspace = true
+aws-sdk-s3.optional = true
+aws-smithy-async.workspace = true
+aws-smithy-async.optional = true
 base64.workspace = true
 bytes.workspace = true
 const-str.workspace = true

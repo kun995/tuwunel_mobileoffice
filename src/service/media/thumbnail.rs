@@ -8,10 +8,6 @@
 use std::{cmp, num::Saturating as Sat};
 
 use ruma::{Mxc, UInt, UserId, http_headers::ContentDisposition, media::Method};
-use tokio::{
-	fs,
-	io::{AsyncReadExt, AsyncWriteExt},
-};
 use tuwunel_core::{Result, checked, err, implement};
 
 use super::{FileMeta, data::Metadata};
@@ -39,9 +35,8 @@ impl super::Service {
 			self.db
 				.create_file_metadata(mxc, user, dim, content_disposition, content_type)?;
 
-		//TODO: Dangling metadata in database if creation fails
-		let mut f = self.create_media_file(&key).await?;
-		f.write_all(file).await?;
+		// Use storage trait to save thumbnail
+		self.get_storage().create(&key, file).await?;
 
 		Ok(())
 	}
@@ -84,14 +79,11 @@ impl super::Service {
 #[implement(super::Service)]
 #[tracing::instrument(name = "saved", level = "debug", skip(self, data))]
 async fn get_thumbnail_saved(&self, data: Metadata) -> Result<Option<FileMeta>> {
-	let mut content = Vec::new();
-	let path = self.get_media_file(&data.key);
-	fs::File::open(path)
-		.await?
-		.read_to_end(&mut content)
-		.await?;
-
-	Ok(Some(into_filemeta(data, content)))
+	// Use storage trait to read thumbnail
+	match self.get_storage().read(&data.key).await? {
+		Some(bytes) => Ok(Some(into_filemeta(data, bytes.to_vec()))),
+		None => Ok(None),
+	}
 }
 
 /// Generate a thumbnail
@@ -104,12 +96,11 @@ async fn get_thumbnail_generate(
 	dim: &Dim,
 	data: Metadata,
 ) -> Result<Option<FileMeta>> {
-	let mut content = Vec::new();
-	let path = self.get_media_file(&data.key);
-	fs::File::open(path)
-		.await?
-		.read_to_end(&mut content)
-		.await?;
+	// Use storage trait to read original file
+	let content = match self.get_storage().read(&data.key).await? {
+		Some(bytes) => bytes.to_vec(),
+		None => return Ok(None),
+	};
 
 	let Ok(image) = image::load_from_memory(&content) else {
 		// Couldn't parse file to generate thumbnail, send original
@@ -136,8 +127,8 @@ async fn get_thumbnail_generate(
 		data.content_type.as_deref(),
 	)?;
 
-	let mut f = self.create_media_file(&thumbnail_key).await?;
-	f.write_all(&thumbnail_bytes).await?;
+	// Use storage trait to save generated thumbnail
+	self.get_storage().create(&thumbnail_key, &thumbnail_bytes).await?;
 
 	Ok(Some(into_filemeta(data, thumbnail_bytes)))
 }

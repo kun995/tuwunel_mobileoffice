@@ -1,5 +1,6 @@
 pub mod check;
 pub mod manager;
+pub mod media_storage;
 pub mod proxy;
 
 use std::{
@@ -25,6 +26,9 @@ use tuwunel_macros::config_example_generator;
 use url::Url;
 
 use self::proxy::ProxyConfig;
+pub use self::media_storage::{
+	FilesystemStorageConfig, HybridStrategyConfig, MediaStorageConfig, S3StorageConfig, StorageStrategy,
+};
 pub use self::{check::check, manager::Manager};
 use crate::{
 	Err, Result, err,
@@ -1595,6 +1599,15 @@ pub struct Config {
 	/// sadness.
 	#[serde(default)]
 	pub prune_missing_media: bool,
+
+	/// Media storage configuration for S3/MinIO support.
+	///
+	/// Configure storage backend for media files. Supports filesystem (default),
+	/// S3, or hybrid modes.
+	///
+	/// default: filesystem only
+	#[serde(default)]
+	pub media_storage: MediaStorageConfig,
 
 	/// Vector list of regex patterns of server names that tuwunel will refuse
 	/// to download remote media from.

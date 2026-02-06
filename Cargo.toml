@@ -50,6 +50,20 @@ features = [
 version = "0.7"
 features = ["serde"]
 
+[workspace.dependencies.aws-config]
+version = "1.5"
+default-features = false
+features = ["rustls"]
+
+[workspace.dependencies.aws-sdk-s3]
+version = "1.63"
+default-features = false
+features = ["rustls"]
+
+[workspace.dependencies.aws-smithy-async]
+version = "1"
+features = ["rt-tokio"]
+
 [workspace.dependencies.async-channel]
 version = "2.3.1"
 
