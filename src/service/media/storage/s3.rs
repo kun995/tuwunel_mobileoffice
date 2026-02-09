@@ -101,10 +101,13 @@ impl S3Storage {
 			encode_key(key)
 		};
 		
-		match &self.prefix {
+		let final_key = match &self.prefix {
 			Some(prefix) => format!("{}/{}", prefix, s3_key),
 			None => s3_key,
-		}
+		};
+
+		// Remove leading slash if present (S3 best practice)
+		final_key.trim_start_matches('/').to_string()
 	}
 
 
@@ -123,7 +126,24 @@ impl MediaStorage for S3Storage {
 			.body(ByteStream::from(Bytes::copy_from_slice(data)))
 			.send()
 			.await
-			.map_err(|e| err!(Database(error!("S3 put_object failed: {}", e))))?;
+			.map_err(|e| {
+				use aws_sdk_s3::error::SdkError;
+				let error_details = match &e {
+					SdkError::ServiceError(se) => {
+						format!("HTTP {}: {:?}", se.raw().status(), se.err())
+					},
+					SdkError::ConstructionFailure(cf) => format!("Construction: {:?}", cf),
+					SdkError::TimeoutError(_) => "Timeout".to_string(),
+					SdkError::DispatchFailure(df) => format!("Dispatch: {:?}", df),
+					_ => format!("{:?}", e),
+				};
+				err!(Database(error!(
+					"S3 put_object failed: bucket={}, key={}, details={}",
+					self.bucket,
+					s3_key,
+					error_details
+				)))
+			})?;
 
 		Ok(())
 	}

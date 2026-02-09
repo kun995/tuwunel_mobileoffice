@@ -133,6 +133,41 @@ pub struct HybridStrategyConfig {
 	/// default: true
 	#[serde(default = "default_true")]
 	pub async_secondary_write: bool,
+
+	/// Cache TTL in seconds (0 = no expiration)
+	///
+	/// Files older than this will be automatically deleted from cache.
+	/// Set to 0 to disable TTL-based expiration.
+	///
+	/// default: 86400 (24 hours)
+	#[serde(default = "default_cache_ttl")]
+	pub cache_ttl_seconds: u64,
+
+	/// Max cache size in MB (0 = unlimited)
+	///
+	/// When cache exceeds this size, oldest files will be evicted (LRU).
+	/// Set to 0 to disable size-based eviction.
+	///
+	/// default: 10240 (10 GB)
+	#[serde(default = "default_max_cache_size")]
+	pub max_cache_size_mb: u64,
+
+	/// Enable background cleanup task
+	///
+	/// When enabled, a background task will periodically clean up expired
+	/// and oversized cache files.
+	///
+	/// default: true
+	#[serde(default = "default_true")]
+	pub enable_cleanup_task: bool,
+
+	/// Cleanup interval in seconds
+	///
+	/// How often the background cleanup task runs.
+	///
+	/// default: 3600 (1 hour)
+	#[serde(default = "default_cleanup_interval")]
+	pub cleanup_interval_seconds: u64,
 }
 
 impl Default for HybridStrategyConfig {
@@ -142,12 +177,28 @@ impl Default for HybridStrategyConfig {
 			read_fallback: true,
 			cache_on_read: true,
 			async_secondary_write: true,
+			cache_ttl_seconds: default_cache_ttl(),
+			max_cache_size_mb: default_max_cache_size(),
+			enable_cleanup_task: true,
+			cleanup_interval_seconds: default_cleanup_interval(),
 		}
 	}
 }
 
 const fn default_true() -> bool {
 	true
+}
+
+const fn default_cache_ttl() -> u64 {
+	86400 // 24 hours
+}
+
+const fn default_max_cache_size() -> u64 {
+	10240 // 10 GB
+}
+
+const fn default_cleanup_interval() -> u64 {
+	3600 // 1 hour
 }
 
 fn default_storage_strategy() -> StorageStrategy {

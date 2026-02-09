@@ -3,14 +3,14 @@
 /// Combines two storage backends (primary and secondary) with configurable behavior.
 
 #[cfg(feature = "s3_storage")]
-use std::sync::Arc;
+use std::{sync::Arc, time::{Duration, SystemTime}};
 
 #[cfg(feature = "s3_storage")]
 use async_trait::async_trait;
 #[cfg(feature = "s3_storage")]
 use bytes::Bytes;
 #[cfg(feature = "s3_storage")]
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 #[cfg(feature = "s3_storage")]
 use super::{MediaStorage, StorageMetadata};
@@ -39,6 +39,28 @@ impl HybridStorage {
 			secondary,
 			config,
 		}
+	}
+
+	/// Check if cached file has expired based on TTL
+	async fn is_cache_expired(&self, key: &[u8]) -> Result<bool> {
+		// If TTL is 0, cache never expires
+		if self.config.cache_ttl_seconds == 0 {
+			return Ok(false);
+		}
+
+		// Get metadata from secondary storage
+		if let Some(meta) = self.secondary.metadata(key).await? {
+			let now = SystemTime::now();
+			let age = now.duration_since(meta.modified).unwrap_or(Duration::ZERO);
+			let ttl = Duration::from_secs(self.config.cache_ttl_seconds);
+
+			if age > ttl {
+				info!("Cache expired: age={:?}, ttl={:?}", age, ttl);
+				return Ok(true);
+			}
+		}
+
+		Ok(false)
 	}
 }
 
@@ -74,18 +96,26 @@ impl MediaStorage for HybridStorage {
 		// Try reading from secondary (cache) first
 		match self.secondary.read(key).await? {
 			Some(data) => {
-				debug!("Cache hit for media key");
-				return Ok(Some(data));
+				// Check if cache has expired
+				if self.is_cache_expired(key).await? {
+					info!("Cache expired, deleting and fetching from primary");
+					// Delete expired cache (don't fail if deletion fails)
+					let _ = self.secondary.delete(key).await;
+					// Continue to fetch from primary
+				} else {
+					info!("Cache hit for media key");
+					return Ok(Some(data));
+				}
 			},
 			None => {
-				debug!("Cache miss for media key");
+				info!("Cache miss for media key");
 			},
 		}
 
 		// Cache miss - read from primary if fallback is enabled
 		if self.config.read_fallback {
 			if let Some(data) = self.primary.read(key).await? {
-				debug!("Read from primary storage");
+				info!("Read from primary storage");
 
 				// Cache the data to secondary if enabled
 				if self.config.cache_on_read {
@@ -96,7 +126,7 @@ impl MediaStorage for HybridStorage {
 						if let Err(e) = secondary.create(&key, &data_clone).await {
 							warn!("Failed to cache data to secondary storage: {}", e);
 						} else {
-							debug!("Cached data to secondary storage");
+							info!("Cached data to secondary storage");
 						}
 					});
 				}
