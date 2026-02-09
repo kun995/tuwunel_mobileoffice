@@ -769,6 +769,19 @@ pub struct Config {
 	#[serde(default = "default_default_room_version")]
 	pub default_room_version: RoomVersionId,
 
+	/// Default member limit for newly created rooms.
+	///
+	/// Set to 0 for unlimited (no limit will be set).
+	/// When set to a value > 0, all new rooms will automatically have the
+	/// `im.tuwunel.room.member_limit` state event set with this value.
+	///
+	/// This limit can be manually changed per-room after creation using the
+	/// state event API.
+	///
+	/// default: 0 (unlimited)
+	#[serde(default)]
+	pub default_room_member_limit: u64,
+
 	// external structure; separate section
 	#[serde(default)]
 	pub well_known: WellKnownConfig,
