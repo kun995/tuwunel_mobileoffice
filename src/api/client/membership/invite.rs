@@ -24,6 +24,30 @@ pub(crate) async fn invite_user_route(
 
 	banned_room_check(&services, sender_user, room_id, None, client).await?;
 
+	// Check room member limit (count invited + joined)
+	if let Ok(joined_count) = services.state_cache.room_joined_count(room_id).await {
+		if let Ok(invited_count) = services.state_cache.room_invited_count(room_id).await {
+			// Try to get member limit from room state
+			if let Ok(limit_data) = services
+				.state_accessor
+				.room_state_get(room_id, &"im.tuwunel.room.member_limit".into(), "")
+				.await
+			{
+				// Parse the limit from state event content
+				if let Ok(limit_event) = serde_json::from_str::<serde_json::Value>(limit_data.content.get()) {
+					if let Some(limit) = limit_event.get("limit").and_then(|v| v.as_u64()) {
+						let total = joined_count + invited_count;
+						if total >= limit {
+							return Err!(Request(Forbidden(
+								"Room has reached maximum member limit (including pending invites)"
+							)));
+						}
+					}
+				}
+			}
+		}
+	}
+
 	let invite_user::v3::InvitationRecipient::UserId { user_id } = &body.recipient else {
 		return Err!(Request(ThreepidDenied("Third party identifiers are not implemented")));
 	};
@@ -45,7 +69,7 @@ pub(crate) async fn invite_user_route(
 
 	// TODO: this should be in the service, but moving it from here would
 	// trigger the recipient_ignored_by_sender check before the banned check,
-	// revealing the ignore state to the sending user if the recipient is banned
+	// revealing the ignore state to the sending user
 	if let Ok(target_user_membership) = services
 		.state_accessor
 		.get_member(room_id, user_id)

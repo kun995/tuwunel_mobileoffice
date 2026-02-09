@@ -361,6 +361,27 @@ pub(crate) async fn create_room_route(
 			.await?;
 	}
 
+	// 7.5 Default member limit (if configured)
+	if services.config.default_room_member_limit > 0 {
+		services
+			.timeline
+			.build_and_append_pdu(
+				PduBuilder {
+					event_type: TimelineEventType::from("im.tuwunel.room.member_limit"),
+					content: to_raw_value(&json!({
+						"limit": services.config.default_room_member_limit
+					}))?,
+					state_key: Some(StateKey::new()),
+					..Default::default()
+				},
+				sender_user,
+				&room_id,
+				&state_lock,
+			)
+			.boxed()
+			.await?;
+	}
+
 	drop(next_count);
 	drop(state_lock);
 

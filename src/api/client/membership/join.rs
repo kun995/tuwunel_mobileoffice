@@ -5,7 +5,7 @@ use ruma::{
 	RoomId,
 	api::client::membership::{join_room_by_id, join_room_by_id_or_alias},
 };
-use tuwunel_core::{Result, warn};
+use tuwunel_core::{Err, Result, warn};
 
 use super::banned_room_check;
 use crate::Ruma;
@@ -29,6 +29,27 @@ pub(crate) async fn join_room_by_id_route(
 	let room_id: &RoomId = &body.room_id;
 
 	banned_room_check(&services, sender_user, room_id, None, client).await?;
+
+	// Check room member limit
+	if let Ok(current_count) = services.state_cache.room_joined_count(room_id).await {
+		// Try to get member limit from room state
+		if let Ok(limit_data) = services
+			.state_accessor
+			.room_state_get(room_id, &"im.tuwunel.room.member_limit".into(), "")
+			.await
+		{
+			// Parse the limit from state event content
+			if let Ok(limit_event) = serde_json::from_str::<serde_json::Value>(limit_data.content.get()) {
+				if let Some(limit) = limit_event.get("limit").and_then(|v| v.as_u64()) {
+					if current_count >= limit {
+						return Err!(Request(Forbidden(
+							"Room has reached maximum member limit"
+						)));
+					}
+				}
+			}
+		}
+	}
 
 	let state_lock = services.state.mutex.lock(room_id).await;
 
@@ -87,6 +108,27 @@ pub(crate) async fn join_room_by_id_or_alias_route(
 
 	banned_room_check(&services, sender_user, &room_id, Some(&body.room_id_or_alias), client)
 		.await?;
+
+	// Check room member limit
+	if let Ok(current_count) = services.state_cache.room_joined_count(&room_id).await {
+		// Try to get member limit from room state
+		if let Ok(limit_data) = services
+			.state_accessor
+			.room_state_get(&room_id, &"im.tuwunel.room.member_limit".into(), "")
+			.await
+		{
+			// Parse the limit from state event content
+			if let Ok(limit_event) = serde_json::from_str::<serde_json::Value>(limit_data.content.get()) {
+				if let Some(limit) = limit_event.get("limit").and_then(|v| v.as_u64()) {
+					if current_count >= limit {
+						return Err!(Request(Forbidden(
+							"Room has reached maximum member limit"
+						)));
+					}
+				}
+			}
+		}
+	}
 
 	let state_lock = services.state.mutex.lock(&room_id).await;
 
