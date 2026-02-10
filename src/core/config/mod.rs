@@ -782,6 +782,19 @@ pub struct Config {
 	#[serde(default)]
 	pub default_room_member_limit: u64,
 
+	/// Automatically accept and join rooms when invited.
+	///
+	/// When enabled, users will automatically join any room they are invited to,
+	/// similar to how 1-1 direct messages work. This bypasses the need for users
+	/// to manually accept invitations.
+	///
+	/// This is particularly useful when using the create_room API with invites,
+	/// as invited users will immediately join the room without additional steps.
+	///
+	/// default: false
+	#[serde(default)]
+	pub auto_accept_invites: bool,
+
 	// external structure; separate section
 	#[serde(default)]
 	pub well_known: WellKnownConfig,

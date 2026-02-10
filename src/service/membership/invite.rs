@@ -201,6 +201,44 @@ async fn local_invite(
 		)
 		.await?;
 
+	// Auto-join if configured
+	if self.services.server.config.auto_accept_invites {
+		use tuwunel_core::info;
+		
+		info!(
+			"Auto-accept invites enabled: automatically joining {user_id} to room {room_id} \
+			 (invited by {sender_user})"
+		);
+		
+		match self
+			.join(
+				user_id,           // sender_user: &UserId
+				room_id,           // room_id: &RoomId
+				None,              // orig_room_id: Option<&RoomOrAliasId>
+				None,              // reason: Option<String>
+				&[],               // servers: &[OwnedServerName]
+				false,             // is_appservice: bool
+				&state_lock,       // state_lock: &RoomMutexGuard
+			)
+			.boxed()
+			.await
+		{
+			Ok(()) => {
+				info!(
+					"Successfully auto-joined {user_id} to room {room_id} after invite from {sender_user}"
+				);
+			},
+			Err(e) => {
+				use tuwunel_core::warn;
+				warn!(
+					"Failed to auto-join {user_id} to room {room_id} after invite: {e}. \
+					 User will need to manually accept the invite."
+				);
+				// Don't return error - the invite was still created successfully
+			},
+		}
+	}
+
 	drop(state_lock);
 
 	Ok(())
