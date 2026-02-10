@@ -38,10 +38,15 @@ pub(crate) async fn invite_user_route(
 					if let Some(limit) = limit_event.get("limit").and_then(|v| v.as_u64()) {
 						let total = joined_count + invited_count;
 						if total >= limit {
-							return Err!(Request(Forbidden(
-								"Room has reached maximum member limit (including pending invites)"
-							)));
-						}
+						use ruma::api::client::error::ErrorKind;
+					return Err(tuwunel_core::Error::Request(
+						ErrorKind::LimitExceeded {
+							retry_after: None,
+						},
+						"Room has reached maximum member limit (including pending invites)".into(),
+						http::StatusCode::BAD_REQUEST,
+					));
+					}
 					}
 				}
 			}
