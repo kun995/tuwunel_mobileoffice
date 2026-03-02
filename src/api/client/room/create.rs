@@ -23,6 +23,7 @@ use ruma::{
 			power_levels::RoomPowerLevelsEventContent,
 			topic::{RoomTopicEventContent, TopicContentBlock},
 		},
+		space::child::SpaceChildEventContent,
 	},
 	int,
 	room_version_rules::{RoomIdFormatVersion, RoomVersionRules},
@@ -443,6 +444,98 @@ pub(crate) async fn create_room_route(
 	}
 
 	info!("{sender_user} created a room with room ID {room_id}");
+
+	// Handle workspaceId: link room to Matrix Space
+	let workspace_id = body
+		.json_body
+		.as_ref()
+		.and_then(|v| v.as_object())
+		.and_then(|obj| obj.get("workspace_id"))
+		.and_then(|v| v.as_str())
+		.map(ToOwned::to_owned);
+
+	if let Some(ref wid) = workspace_id {
+		// Check if this is a Space (workspace container)
+		let is_space = body
+			.json_body
+			.as_ref()
+			.and_then(|v| v.as_object())
+			.and_then(|obj| obj.get("creation_content"))
+			.and_then(|v| v.as_object())
+			.and_then(|obj| obj.get("type"))
+			.and_then(|v| v.as_str())
+			== Some("m.space");
+
+		if is_space {
+			// Case 1: Tạo Space/workspace → lưu mapping workspaceId → spaceRoomId
+			// Đây là thao tác atomic với RocksDB, luôn thành công trừ khi disk lỗi.
+			services.workspace.set_space_room_id(wid, &room_id);
+			info!("Workspace {wid:?} mapped to Space room {room_id}");
+		} else {
+			// Case 2: Tạo room thường trong workspace
+			// Bước A: Ghi vào RocksDB index (source of truth, reliable)
+			services.workspace.set_workspace_id(&room_id, wid);
+			info!("Room {room_id} linked to workspace {wid:?} in DB index");
+
+			// Bước A2: Ghi workspace_id vào room state event để sync tự deliver đến client.
+			// Client đọc event type "im.tuwunel.workspace" → biết room thuộc workspace nào,
+			// không cần API call thêm.
+			let room_lock = services.state.mutex.lock(&room_id).await;
+			if let Err(e) = services
+				.timeline
+				.build_and_append_pdu(
+					PduBuilder {
+						event_type: TimelineEventType::from("im.tuwunel.workspace"),
+						content: to_raw_value(&json!({ "id": wid }))?,
+						state_key: Some(StateKey::new()),
+						..Default::default()
+					},
+					sender_user,
+					&room_id,
+					&room_lock,
+				)
+				.boxed()
+				.await
+			{
+				warn!(%e, %room_id, workspace_id = %wid, "Failed to write im.tuwunel.workspace state event (non-fatal)");
+			}
+			drop(room_lock);
+
+			// Bước B: Gửi m.space.child event vào Space (best-effort, Matrix spec compliance)
+			// Nếu lỗi → chỉ warn, không ảnh hưởng tính đúng đắn vì filter dùng RocksDB index.
+			if let Ok(space_room_id) = services.workspace.get_space_room_id(wid).await {
+				let server_name = services.globals.server_name().to_owned();
+				let space_lock = services.state.mutex.lock(&space_room_id).await;
+				let child_content = SpaceChildEventContent {
+					via: vec![server_name],
+					suggested: false,
+					order: None,
+				};
+				if let Err(e) = services
+					.timeline
+					.build_and_append_pdu(
+						PduBuilder {
+							event_type: TimelineEventType::SpaceChild,
+							content: to_raw_value(&child_content)?,
+							state_key: Some(room_id.as_str().into()),
+							..Default::default()
+						},
+						sender_user,
+						&space_room_id,
+						&space_lock,
+					)
+					.boxed()
+					.await
+				{
+					// Best-effort: room đã được ghi vào RocksDB index rồi,
+					// filter vẫn hoạt động đúng. Space child chỉ phục vụ Matrix clients khác.
+					warn!(%e, %room_id, %space_room_id, "Failed to send m.space.child event (best-effort); workspace DB index is intact");
+				}
+			} else {
+				warn!(%room_id, workspace_id = %wid, "workspace_id provided but no Space room found for this workspace; skipping m.space.child");
+			}
+		}
+	}
 
 	Ok(create_room::v3::Response::new(room_id))
 }

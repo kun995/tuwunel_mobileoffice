@@ -380,6 +380,18 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM
 	},
 	Descriptor {
+		name: "workspaceid_spaceroomid",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "roomid_workspaceid",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "workspaceid_roomids",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
 		name: "url_previews",
 		..descriptor::RANDOM
 	},

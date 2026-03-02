@@ -27,23 +27,55 @@ pub(crate) use self::{
 	members::{get_member_events_route, joined_members_route},
 	unban::unban_user_route,
 };
-use crate::Ruma;
+use crate::{Ruma, RumaResponse};
 
-/// # `POST /_matrix/client/r0/joined_rooms`
+
+
+/// # `GET /_matrix/client/v3/joined_rooms`
 ///
-/// Lists all rooms the user has joined.
+/// Lists all rooms the user has joined, with optional workspace_id filter.
 pub(crate) async fn joined_rooms_route(
 	State(services): State<crate::State>,
+	uri: axum::http::Uri,
 	body: Ruma<joined_rooms::v3::Request>,
-) -> Result<joined_rooms::v3::Response> {
-	Ok(joined_rooms::v3::Response {
-		joined_rooms: services
+) -> Result<RumaResponse<joined_rooms::v3::Response>> {
+	use tuwunel_core::utils::stream::BroadbandExt;
+
+	let sender_user = body.sender_user();
+
+	// Parse optional workspace_id from query string (?workspace_id=xxx)
+	let workspace_id: Option<String> = uri
+		.query()
+		.and_then(|q| {
+			q.split('&')
+				.find(|p| p.starts_with("workspace_id="))
+				.map(|p| p.trim_start_matches("workspace_id=").to_owned())
+		});
+
+	let joined_rooms = if let Some(ref wid) = workspace_id {
+		// Source of truth: RocksDB index (reliable, không phụ thuộc m.space.child event)
+		services
+			.workspace
+			.rooms_by_workspace(wid)
+			.broad_filter_map(async |room_id| {
+				services
+					.state_cache
+					.is_joined(sender_user, &room_id)
+					.await
+					.then_some(room_id)
+			})
+			.collect()
+			.await
+	} else {
+		services
 			.state_cache
-			.rooms_joined(body.sender_user())
+			.rooms_joined(sender_user)
 			.map(ToOwned::to_owned)
 			.collect()
-			.await,
-	})
+			.await
+	};
+
+	Ok(RumaResponse(joined_rooms::v3::Response { joined_rooms }))
 }
 
 /// Checks if the room is banned in any way possible and the sender user is not

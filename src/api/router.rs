@@ -110,7 +110,14 @@ pub fn build(router: Router<State>, server: &Server) -> Router<State> {
 		.ruma_route(&client::knock_room_route)
 		.ruma_route(&client::leave_room_route)
 		.ruma_route(&client::forget_room_route)
-		.ruma_route(&client::joined_rooms_route)
+		.route(
+			"/_matrix/client/r0/joined_rooms",
+			get(client::joined_rooms_route),
+		)
+		.route(
+			"/_matrix/client/v3/joined_rooms",
+			get(client::joined_rooms_route),
+		)
 		.ruma_route(&client::kick_user_route)
 		.ruma_route(&client::ban_user_route)
 		.ruma_route(&client::unban_user_route)

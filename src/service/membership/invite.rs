@@ -201,31 +201,38 @@ async fn local_invite(
 		)
 		.await?;
 
-	// Auto-join if configured
+	// Release lock before auto-join — join() acquires its own state_lock internally.
+	// Holding it here would cause a deadlock.
+	drop(state_lock);
+
+	// Auto-join if configured.
+	// We already dropped state_lock above — acquire a fresh one for join().
 	if self.services.server.config.auto_accept_invites {
 		use tuwunel_core::info;
-		
+
 		info!(
 			"Auto-accept invites enabled: automatically joining {user_id} to room {room_id} \
 			 (invited by {sender_user})"
 		);
-		
+
+		let join_lock = self.services.state.mutex.lock(room_id).await;
 		match self
 			.join(
-				user_id,           // sender_user: &UserId
-				room_id,           // room_id: &RoomId
-				None,              // orig_room_id: Option<&RoomOrAliasId>
-				None,              // reason: Option<String>
-				&[],               // servers: &[OwnedServerName]
-				false,             // is_appservice: bool
-				&state_lock,       // state_lock: &RoomMutexGuard
+				user_id, // the invited user becomes the joiner
+				room_id,
+				None,       // orig_room_id
+				None,       // reason
+				&[],        // servers — local user, no federation needed
+				false,      // is_appservice
+				&join_lock,
 			)
 			.boxed()
 			.await
 		{
 			Ok(()) => {
 				info!(
-					"Successfully auto-joined {user_id} to room {room_id} after invite from {sender_user}"
+					"Successfully auto-joined {user_id} to room {room_id} after invite from \
+					 {sender_user}"
 				);
 			},
 			Err(e) => {
@@ -234,12 +241,10 @@ async fn local_invite(
 					"Failed to auto-join {user_id} to room {room_id} after invite: {e}. \
 					 User will need to manually accept the invite."
 				);
-				// Don't return error - the invite was still created successfully
+				// Invite was created successfully — don't propagate error
 			},
 		}
 	}
-
-	drop(state_lock);
 
 	Ok(())
 }

@@ -95,7 +95,8 @@ impl Service {
 					.as_ref()
 					.ok_or_else(|| err!(Config("media_storage.s3", "S3 configuration required for S3 storage strategy")))?;
 				let s3 = storage::s3::S3Storage::new(s3_config).await?;
-				Ok(Arc::new(s3) as Arc<dyn storage::MediaStorage>)
+				let s3: Arc<dyn storage::MediaStorage> = Arc::new(s3);
+				Ok(s3)
 			},
 
 			#[cfg(feature = "s3_storage")]
@@ -107,7 +108,7 @@ impl Service {
 					.s3
 					.as_ref()
 					.ok_or_else(|| err!(Config("media_storage.s3", "S3 configuration required for Hybrid S3 Primary strategy")))?;
-				let s3 = Arc::new(storage::s3::S3Storage::new(s3_config).await?) as Arc<dyn storage::MediaStorage>;
+				let s3: Arc<dyn storage::MediaStorage> = Arc::new(storage::s3::S3Storage::new(s3_config).await?);
 
 				Ok(Arc::new(storage::hybrid::HybridStorage::new(
 					s3, // primary

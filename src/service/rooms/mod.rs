@@ -18,3 +18,4 @@ pub mod state_compressor;
 pub mod threads;
 pub mod timeline;
 pub mod typing;
+pub mod workspace;
