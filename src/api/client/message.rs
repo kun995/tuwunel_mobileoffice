@@ -274,6 +274,26 @@ where
 			.users
 			.user_is_ignored(event.sender(), user_id)
 			.await
+		|| services
+			.deleted_events
+			.is_deleted(user_id, event.event_id())
+			.await
+}
+
+#[inline]
+pub(crate) async fn deleted_filter(
+	services: &Services,
+	item: PdusIterItem,
+	user_id: &UserId,
+) -> Option<PdusIterItem> {
+	let (_, ref pdu) = item;
+
+	services
+		.deleted_events
+		.is_deleted(user_id, pdu.event_id())
+		.await
+		.eq(&false)
+		.then_some(item)
 }
 
 #[inline]

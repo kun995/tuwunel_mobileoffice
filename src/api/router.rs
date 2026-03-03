@@ -10,7 +10,7 @@ use std::str::FromStr;
 use axum::{
 	Router,
 	response::{IntoResponse, Redirect},
-	routing::{any, get, post},
+	routing::{any, delete, get, post},
 };
 use http::{Uri, uri};
 use tuwunel_core::{Server, err};
@@ -203,7 +203,16 @@ pub fn build(router: Router<State>, server: &Server) -> Router<State> {
 		.ruma_route(&client::well_known_client)
 		.route("/_tuwunel/server_version", get(client::tuwunel_server_version))
 		.ruma_route(&client::room_initial_sync_route)
-		.route("/client/server.json", get(client::syncv3_client_server_json));
+		.route("/client/server.json", get(client::syncv3_client_server_json))
+		// Custom per-user event deletion (org.tuwunel unstable)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/events/{event_id}",
+			delete(client::delete_event_route),
+		)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/delete_events",
+			post(client::delete_events_route),
+		);
 
 	// SS endpoint not related to federation
 	router = router.ruma_route(&server::get_openid_userinfo_route);
