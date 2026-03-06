@@ -6,7 +6,7 @@ use ruma::api::{
 	IncomingResponse, MatrixVersion, OutgoingRequest, SendAccessToken, SupportedVersions,
 };
 use tuwunel_core::{
-	Err, Result, debug_warn, err, implement, trace, utils::string_from_bytes, warn,
+	Err, Result, debug, debug_warn, err, implement, trace, utils::string_from_bytes, warn,
 };
 
 #[implement(super::Service)]
@@ -34,7 +34,22 @@ where
 		.map(BytesMut::freeze);
 
 	let reqwest_request = reqwest::Request::try_from(http_request)?;
-	if let Some(url_host) = reqwest_request.url().host_str() {
+
+	// Capture request info for error logging before consuming the request
+	let req_method = reqwest_request.method().clone();
+	let req_url = reqwest_request.url().clone();
+	let req_headers = reqwest_request.headers().clone();
+	let req_body_str = reqwest_request
+		.body()
+		.and_then(|b| b.as_bytes())
+		.map(|b| String::from_utf8_lossy(b).into_owned())
+		.unwrap_or_default();
+
+	debug!("Push gateway request URL: {} {}", req_method, req_url);
+	debug!("Push gateway request headers: {:#?}", req_headers);
+	debug!("Push gateway request body: {}", req_body_str);
+
+	if let Some(url_host) = req_url.host_str() {
 		trace!("Checking request URL for IP");
 		if let Ok(ip) = IPAddress::parse(url_host)
 			&& !self.services.client.valid_cidr_range(&ip)
@@ -77,11 +92,21 @@ where
 			let body = response.bytes().await?; // TODO: handle timeout
 
 			if !status.is_success() {
-				debug_warn!("Push gateway response body: {:?}", string_from_bytes(&body));
-				return Err!(BadServerResponse(warn!(
+				warn!(
+					"Push gateway {dest} returned unsuccessful HTTP response: {status} | body: {}",
+					string_from_bytes(&body).unwrap_or_else(|_| String::from("<non-utf8 body>"))
+				);
+				warn!(
+					"Push gateway request details: method={req_method} url={req_url} | request body: {req_body_str}"
+				);
+				return Err!(BadServerResponse(
 					"Push gateway {dest} returned unsuccessful HTTP response: {status}"
-				)));
+				));
 			}
+
+				warn!(
+				"Push gateway {dest} returned successful HTTP response: {status} | request body: {req_body_str}"
+			);
 
 			let response = T::IncomingResponse::try_from_http_response(
 				http_response_builder

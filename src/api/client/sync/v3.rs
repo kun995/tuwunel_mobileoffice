@@ -3,7 +3,7 @@ use std::{
 	time::Duration,
 };
 
-use axum::extract::State;
+use axum::{extract::State, http::Uri};
 use futures::{
 	FutureExt, StreamExt, TryFutureExt,
 	future::{join, join3, join4, join5},
@@ -126,8 +126,16 @@ type PresenceUpdates = HashMap<OwnedUserId, PresenceEventContent>;
 )]
 pub(crate) async fn sync_events_route(
 	State(services): State<crate::State>,
+	uri: Uri,
 	body: Ruma<sync_events::v3::Request>,
 ) -> Result<sync_events::v3::Response> {
+	let workspace_id: Option<String> = uri
+		.query()
+		.and_then(|q| {
+			q.split('&')
+				.find(|p| p.starts_with("workspace_id="))
+				.map(|p| p.trim_start_matches("workspace_id=").to_owned())
+		});
 	let sender_user = body.sender_user();
 	let sender_device = body.sender_device.as_deref();
 
@@ -206,6 +214,7 @@ pub(crate) async fn sync_events_route(
 				next_batch,
 				full_state,
 				&filter,
+				workspace_id.as_deref(),
 			)
 			.await?;
 
@@ -261,6 +270,33 @@ async fn build_empty_response(
 	}
 }
 
+async fn check_workspace_filter(
+	services: &Services,
+	workspace_id: Option<&str>,
+	room_id: OwnedRoomId,
+) -> Option<OwnedRoomId> {
+	let Some(wid) = workspace_id else {
+		return Some(room_id);
+	};
+	services
+		.workspace
+		.get_workspace_id(&room_id)
+		.await
+		.map_or(false, |w| w == wid)
+		.then_some(room_id)
+}
+
+async fn check_workspace_filter_with_state<S>(
+	services: &Services,
+	workspace_id: Option<&str>,
+	room_id: OwnedRoomId,
+	state: S,
+) -> Option<(OwnedRoomId, S)> {
+	check_workspace_filter(services, workspace_id, room_id)
+		.await
+		.map(|room_id| (room_id, state))
+}
+
 #[tracing::instrument(
 	name = "build",
 	level = INFO_SPAN_LEVEL,
@@ -279,12 +315,16 @@ async fn build_sync_events(
 	next_batch: u64,
 	full_state: bool,
 	filter: &FilterDefinition,
+	workspace_id: Option<&str>,
 ) -> Result<sync_events::v3::Response> {
 	let joined_rooms = services
 		.state_cache
 		.rooms_joined(sender_user)
 		.ready_filter(|&room_id| filter.room.matches(room_id))
 		.map(ToOwned::to_owned)
+		.broad_filter_map(|room_id| {
+			check_workspace_filter(services, workspace_id, room_id)
+		})
 		.broad_filter_map(|room_id| {
 			load_joined_room(
 				services,
@@ -317,6 +357,9 @@ async fn build_sync_events(
 		.state_cache
 		.rooms_left_state(sender_user)
 		.ready_filter(|(room_id, _)| filter.room.matches(room_id))
+		.broad_filter_map(|(room_id, state)| {
+			check_workspace_filter_with_state(services, workspace_id, room_id, state)
+		})
 		.broad_filter_map(|(room_id, _)| {
 			handle_left_room(
 				services,
@@ -337,6 +380,9 @@ async fn build_sync_events(
 		.state_cache
 		.rooms_invited_state(sender_user)
 		.ready_filter(|(room_id, _)| filter.room.matches(room_id))
+		.broad_filter_map(|(room_id, state)| {
+			check_workspace_filter_with_state(services, workspace_id, room_id, state)
+		})
 		.fold_default(async |mut invited_rooms: BTreeMap<_, _>, (room_id, invite_state)| {
 			let invite_count = services
 				.state_cache
@@ -361,6 +407,9 @@ async fn build_sync_events(
 		.state_cache
 		.rooms_knocked_state(sender_user)
 		.ready_filter(|(room_id, _)| filter.room.matches(room_id))
+		.broad_filter_map(|(room_id, state)| {
+			check_workspace_filter_with_state(services, workspace_id, room_id, state)
+		})
 		.fold_default(async |mut knocked_rooms: BTreeMap<_, _>, (room_id, knock_state)| {
 			let knock_count = services
 				.state_cache
