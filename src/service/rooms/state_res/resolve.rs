@@ -126,7 +126,7 @@ where
 		.inspect_ok(|list| trace!(?list, "sorted power events"))
 		.await?;
 
-	let power_set_event_ids: Vec<_> = sorted_power_set
+	let power_set_event_ids: Vec<_> = sorted_power_events
 		.iter()
 		.sorted_unstable()
 		.collect();
@@ -161,7 +161,7 @@ where
 
 	let remaining_events: Vec<_> = full_conflicted_set
 		.into_iter()
-		.filter(|id| !sorted_power_events_set.contains(id))
+		.filter(|id| !power_set_event_ids.contains(&id))
 		.collect();
 
 	debug!(count = remaining_events.len(), "remaining events");
@@ -219,7 +219,7 @@ where
 )]
 async fn full_conflicted_set<AuthSets, FetchExists, ExistsFut, FetchEvent, EventFut, Pdu>(
 	rules: &RoomVersionRules,
-	conflicted_states: ConflictMap<OwnedEventId>,
+	conflicted_states: StateMap<Vec<OwnedEventId>>,
 	auth_sets: AuthSets,
 	fetch: &FetchEvent,
 	exists: &FetchExists,
@@ -263,10 +263,10 @@ where
 
 	auth_difference(auth_sets)
 		.chain(conflicted_state_ids)
-		.broad_filter_map(async |id| exists(id.clone()).await.then_some(id))
+		.broad_filter_map(async |id: OwnedEventId| exists(id.clone()).await.then_some(id))
 		.chain(conflicted_subgraph)
-		.collect::<HashSet<_>>()
+		.collect::<HashSet<OwnedEventId>>()
 		.inspect(|set| debug!(count = set.len(), "full conflicted set"))
-		.inspect(|set| trace!(?set, "full conflicted set"))
+		.inspect(|set: &HashSet<OwnedEventId>| trace!(?set, "full conflicted set"))
 		.await
 }

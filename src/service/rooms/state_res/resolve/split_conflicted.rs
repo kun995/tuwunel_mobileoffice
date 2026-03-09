@@ -3,7 +3,7 @@ use std::{collections::HashMap, hash::Hash, iter::IntoIterator};
 use futures::{Stream, StreamExt};
 use tuwunel_core::validated;
 
-use super::{ConflictMap, StateMap};
+use super::StateMap;
 
 /// Split the unconflicted state map and the conflicted state set.
 ///

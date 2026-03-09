@@ -6,7 +6,7 @@ use ruma::api::{
 	IncomingResponse, MatrixVersion, OutgoingRequest, SendAccessToken, SupportedVersions,
 };
 use tuwunel_core::{
-	Err, Result, debug, debug_warn, err, implement, trace, utils::string_from_bytes, warn,
+	Err, Result, debug, err, implement, trace, utils::string_from_bytes, warn,
 };
 
 #[implement(super::Service)]

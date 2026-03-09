@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
 use ruma::{EventId, OwnedEventId, events::TimelineEventType};
 use tuwunel_core::{
-	Error, Result, at, is_equal_to,
+	Result,
 	matrix::Event,
 	trace,
 	utils::stream::{IterStream, TryReadyExt, WidebandExt},
@@ -38,7 +38,7 @@ use tuwunel_core::{
 	level = "debug",
 	skip_all,
 	fields(
-		power_levels = power_level_event_id
+		power_levels = power_level
 			.as_deref()
 			.map(EventId::as_str)
 			.unwrap_or_default(),

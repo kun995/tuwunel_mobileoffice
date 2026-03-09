@@ -71,6 +71,6 @@ use tuwunel_core::matrix::TypeStateKey;
 use self::{event_auth::check_state_dependent_auth_rules, fetch_state::FetchStateExt};
 pub use self::{
 	event_auth::{AuthTypes, auth_check, auth_types_for_event},
-	resolve::{AuthSet, ConflictMap, StateMap, resolve},
+	resolve::{AuthSet, StateMap, resolve},
 	topological_sort::topological_sort,
 };

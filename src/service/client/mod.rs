@@ -128,7 +128,7 @@ fn make_clients(services: &Services) -> Result<Clients> {
 			.redirect(redirect::Policy::limited(2))),
 
 		appservice: with!(cb => cb
-			.dns_resolver(appservice_resolver(services))
+			.dns_resolver2(appservice_resolver(services))
 			.connect_timeout(Duration::from_secs(5))
 			.read_timeout(Duration::from_secs(services.config.appservice_timeout))
 			.timeout(Duration::from_secs(services.config.appservice_timeout))
@@ -169,14 +169,12 @@ fn base(config: &Config, name: Option<&str>) -> Result<ClientBuilder> {
 		.user_agent(user_agent)
 		.redirect(redirect::Policy::limited(6))
 		.danger_accept_invalid_certs(config.allow_invalid_tls_certificates)
-		.tls_certs_merge(
-			webpki_root_certs::TLS_SERVER_ROOT_CERTS
-				.iter()
-				.map(|der| {
-					Certificate::from_der(der).expect("certificate must be valid der encoding")
-				}),
-		)
 		.connection_verbose(cfg!(debug_assertions));
+
+	builder = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+		.iter()
+		.map(|der| Certificate::from_der(der).expect("certificate must be valid der encoding"))
+		.fold(builder, |b, cert| b.add_root_certificate(cert));
 
 	#[cfg(feature = "gzip_compression")]
 	{

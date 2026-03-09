@@ -52,7 +52,7 @@ use super::super::{
 )]
 pub(super) async fn power_sort<Fetch, Fut, Pdu>(
 	rules: &RoomVersionRules,
-	full_conflicted_set: &AuthSet<OwnedEventId>,
+	full_conflicted_set: &HashSet<OwnedEventId>,
 	fetch: &Fetch,
 ) -> Result<Vec<OwnedEventId>>
 where
@@ -62,7 +62,7 @@ where
 {
 	// A representation of the DAG, a map of event ID to its list of auth events
 	// that are in the full conflicted set. Fill the graph.
-	let graph = full_conflicted_set
+	let graph: HashMap<OwnedEventId, ReferencedIds> = full_conflicted_set
 		.iter()
 		.stream()
 		.broad_filter_map(async |id| {
