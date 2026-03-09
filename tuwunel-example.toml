@@ -74,9 +74,6 @@
 
 # The UNIX socket tuwunel will listen on.
 #
-# tuwunel cannot listen on both an IP address and a UNIX socket. If
-# listening on a UNIX socket, you MUST remove/comment the `address` key.
-#
 # Remember to make sure that your reverse proxy has access to this socket
 # file, either by adding your reverse proxy to the 'tuwunel' group or
 # granting world R/W permissions with `unix_socket_perms` (666 minimum).
@@ -411,7 +408,7 @@
 
 # Maximum time to process a request received from a client (seconds).
 #
-#client_request_timeout = 180
+#client_request_timeout = 240
 
 # Maximum time to transmit a response to a client (seconds)
 #
@@ -475,9 +472,10 @@
 # - "all": All created rooms are encrypted.
 # - "invite": Any room created with `private_chat` or
 #   `trusted_private_chat` presets.
+# - "none": Explicit value for no effect.
 # - Other values default to no effect.
 #
-#encryption_enabled_by_default_for_room_type = false
+#encryption_enabled_by_default_for_room_type = "none"
 
 # Controls whether federation is allowed or not. It is not recommended to
 # disable this after installation due to potential federation breakage but
@@ -723,7 +721,12 @@
 
 # Maximum number of keys to request in each trusted server batch query.
 #
-#trusted_server_batch_size = 1024
+#trusted_server_batch_size = 192
+
+# Maximum number of request batches in flight simultaneously when querying
+# a trusted server.
+#
+#trusted_server_batch_concurrency = 2
 
 # Max log level for tuwunel. Allows debug, info, warn, or error.
 #
@@ -808,6 +811,14 @@
 #
 #login_via_token = true
 
+# Whether to enable login using traditional user/password authorization
+# flow.
+#
+# Set this option to false if you intend to allow logging in only using
+# other mechanisms, such as SSO.
+#
+#login_with_password = true
+
 # Login token expiration/TTL in milliseconds.
 #
 # These are short-lived tokens for the m.login.token endpoint.
@@ -872,8 +883,8 @@
 # registered users join. The rooms specified must be rooms that you have
 # joined at least once on the server, and must be public.
 #
-# example: ["#tuwunel:tuwunel.chat",
-# "!eoIzvAvVwY23LPDay8:tuwunel.chat"]
+# example: ["#tuwunel:grin.hu",
+# "!l2xV0sd51lraysuRcsWVECge4NULaH3g-ou95vgDgiM"]
 #
 #auto_join_rooms = []
 
@@ -1144,6 +1155,18 @@
 # will not be reclaimed as intended.
 #
 #rocksdb_never_drop_columns = false
+
+# Configures RocksDB to not preallocate WAL logs.
+#
+# Normally, RocksDB allocates certain types of files by calling
+# fallocate, writing the file contents, then truncating the logs to the
+# proper size. This causes pathological disk space usage on btrfs due
+# how it interacts with its Copy-on-Write implementation.
+#
+# It is recommended to set this to false if you run the server on btrfs,
+# and not touch it otherwise.
+#
+#rocksdb_allow_fallocate = true
 
 # This is a password that can be configured that will let you login to the
 # server bot account (currently `@conduit`) for emergency troubleshooting
@@ -1741,6 +1764,12 @@
 #
 #allow_room_admins_to_request_unredacted_events = true
 
+# Prevents local users from sending redactions.
+#
+# This check does not apply to server admins.
+#
+#disable_local_redactions = false
+
 # Enable database pool affinity support. On supporting systems, block
 # device queue topologies are detected and the request pool is optimized
 # for the hardware; db_pool_workers is determined automatically.
@@ -1988,13 +2017,23 @@
 #
 #support_mxid =
 
-# Element Call / MatrixRTC configuration (MSC4143).
-# Configures the LiveKit SFU server for voice/video calls.
-#
-# Requires a LiveKit server with JWT authentication.
-# The `livekit_service_url` should point to your LiveKit JWT endpoint.
+# LiveKit JWT endpoint.
+# Required for Element Call / MatrixRTC (MSC4143).
 #
 # Note: You must also set `client` above to your homeserver URL.
+#
+#livekit_url = ""
+
+# Custom MatrixRTC transports.
+#
+# If you're looking to setup Element Call / MatrixRTC with Livekit,
+# you should not use this option and instead set `livekit_url`.
+# This is only required if you want to configure a non-livekit MatrixRTC
+# transport. There are no known client implementations that support any
+# other transport types.
+#
+# This option was previously the only way to configure a Livekit
+# transport. It has been superseded by `livekit_url`.
 #
 # Example:
 # ```toml
@@ -2300,16 +2339,70 @@
 # compute a Matrix UserId for new registrations. Reviewing Tuwunel's
 # documentation will be necessary for a complete description in detail. An
 # empty array imposes no restriction here, avoiding generated fallbacks as
-# much as possible. For simplicity we reserve a claim called "unique"
-# which can be listed alone to ensure *only* generated ID's are used for
-# registrations.
+# much as possible.
+#
+# For simplicity we reserve a claim called "unique" which can be listed
+# alone to ensure *only* generated ID's are used for registrations.
+#
+# Note that listing the claim "sub" has special significance and will take
+# precedence over all other claims, listed or unlisted. "sub" is not
+# normally used to determine a UserId unless explicitly listed here.
+#
+# As of now arbitrary claims cannot be listed here, we only recognize
+# specific hard-coded claims.
 #
 #userid_claims = []
 
+# Trusted providers can cause username conflicts (i.e. account hijacking)
+# but this is precisely how an existing matrix account can be associated
+# with a provider. When this option is set to true, the way we compute a
+# Matrix UserId from userinfo claims is inverted: we find the first
+# matching user and grant access to it. Whereas by default, when set to
+# false, we skip matching users and register the first available username;
+# falling-back to random characters to avoid conflicts.
+#
+# Only set this option to true for providers you self-host and control.
+# Never set this option to true for the public providers such as GitHub,
+# GitLab, etc.
+#
+# Note that associating an existing user with an untrusted provider is
+# still possible but only with the command '!admin query oauth associate'.
+#
+#trusted = false
+
+# Setting this option to false will inhibit unique ID's from being
+# generated as a last-resort when determining a UserId from a provider's
+# claims. In the case of untrusted providers, when all provided claims
+# conflict with existing user accounts, a unique fallback ID needs
+# to be generated for registration to not be denied with an error.
+#
+# Set this option to false if you operate a private server or a trusted
+# identity provider where random UserId's are undesirable; the result of a
+# misconfiguration or other issue where an error is warranted.
+#
+# This option should be set to true for public servers or some users may
+# never be able to register.
+#
+#unique_id_fallbacks = true
+
+# Controls whether new user registration is possible from this provider.
+# When this option is set to false, authorizations from this provider
+# only affect existing users and will never result in a new registration
+# when the claims fail to match any existing user (in the case of trusted
+# providers) or an available username is found (in the case of untrusted
+# providers).
+#
+# Setting this option to false is generally not useful unless there is
+# an explicit reason to do so.
+#
+#registration = true
+
 # Optional extra path components after the issuer_url leading to the
-# location of the `.well-known` directory used for discovery. This will be
-# empty for specification-compliant providers. We have supplied any known
-# values based on `brand` (e.g. `/login/oauth` for GitHub).
+# location of the `.well-known` directory used for discovery. If the path
+# starts with a slash it will be treated as absolute, meaning overwriting
+# any path in the issuer_url. The path needs to end with a slash. This
+# will be empty for specification-compliant providers. We have supplied
+# any known values based on `brand` (e.g. `login/oauth/` for GitHub).
 #
 #base_path =
 
@@ -2355,6 +2448,13 @@
 # The duration in seconds before a grant authorization session expires.
 #
 #grant_session_duration = 300
+
+# Whether to check the redirect cookie during the callback. This is a
+# security feature and should remain enabled. This is available for
+# developers or deployments which cannot tolerate cookies and are willing
+# to tolerate the risks.
+#
+#check_cookie = true
 
 
 

@@ -79,6 +79,7 @@
 {"Action":"fail","Test":"TestClientSpacesSummary/redact_link"}
 {"Action":"fail","Test":"TestClientSpacesSummary/suggested_only"}
 {"Action":"fail","Test":"TestClientSpacesSummaryJoinRules"}
+{"Action":"pass","Test":"TestComplementCanCreateValidV12Rooms"}
 {"Action":"pass","Test":"TestContent"}
 {"Action":"pass","Test":"TestContentCSAPIMediaV1"}
 {"Action":"pass","Test":"TestContentMediaV1"}
@@ -225,6 +226,8 @@
 {"Action":"fail","Test":"TestKeyChangesLocal/New_login_should_create_a_device_lists.changed_entry"}
 {"Action":"fail","Test":"TestKeyClaimOrdering"}
 {"Action":"pass","Test":"TestKeysQueryWithDeviceIDAsObjectFails"}
+{"Action":"pass","Test":"TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11"}
+{"Action":"pass","Test":"TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12"}
 {"Action":"pass","Test":"TestKnockRoomsInPublicRoomsDirectory"}
 {"Action":"pass","Test":"TestKnockRoomsInPublicRoomsDirectoryInMSC3787Room"}
 {"Action":"fail","Test":"TestKnocking"}
@@ -555,6 +558,8 @@
 {"Action":"pass","Test":"TestRestrictedRoomsLocalJoinInMSC3787Room/Join_should_fail_with_mangled_join_rules"}
 {"Action":"pass","Test":"TestRestrictedRoomsLocalJoinInMSC3787Room/Join_should_succeed_when_invited"}
 {"Action":"fail","Test":"TestRestrictedRoomsLocalJoinInMSC3787Room/Join_should_succeed_when_joined_to_allowed_room"}
+{"Action":"pass","Test":"TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11"}
+{"Action":"pass","Test":"TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12"}
 {"Action":"fail","Test":"TestRestrictedRoomsRemoteJoin"}
 {"Action":"pass","Test":"TestRestrictedRoomsRemoteJoin/Join_should_fail_initially"}
 {"Action":"pass","Test":"TestRestrictedRoomsRemoteJoin/Join_should_fail_when_left_allowed_room"}
@@ -659,11 +664,11 @@
 {"Action":"pass","Test":"TestRoomSpecificUsernameChange/Eve_can_find_Alice_by_mxid"}
 {"Action":"pass","Test":"TestRoomSpecificUsernameChange/Eve_can_find_Alice_by_profile_display_name"}
 {"Action":"pass","Test":"TestRoomSpecificUsernameChange/Eve_cannot_find_Alice_by_room-specific_name_that_Eve_is_not_privy_to"}
-{"Action":"fail","Test":"TestRoomState"}
-{"Action":"fail","Test":"TestRoomState/Parallel"}
+{"Action":"pass","Test":"TestRoomState"}
+{"Action":"pass","Test":"TestRoomState/Parallel"}
 {"Action":"pass","Test":"TestRoomState/Parallel/GET_/directory/room/:room_alias_yields_room_ID"}
 {"Action":"pass","Test":"TestRoomState/Parallel/GET_/joined_rooms_lists_newly-created_room"}
-{"Action":"fail","Test":"TestRoomState/Parallel/GET_/rooms/:room_id/joined_members_fetches_my_membership"}
+{"Action":"pass","Test":"TestRoomState/Parallel/GET_/rooms/:room_id/joined_members_fetches_my_membership"}
 {"Action":"pass","Test":"TestRoomState/Parallel/GET_/rooms/:room_id/joined_members_is_forbidden_after_leaving_room"}
 {"Action":"pass","Test":"TestRoomState/Parallel/GET_/rooms/:room_id/state/m.room.member/:user_id?format=event_fetches_my_membership_event"}
 {"Action":"pass","Test":"TestRoomState/Parallel/GET_/rooms/:room_id/state/m.room.member/:user_id_fetches_my_membership"}

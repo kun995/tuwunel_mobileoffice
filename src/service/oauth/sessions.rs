@@ -2,6 +2,7 @@ pub mod association;
 
 use std::{
 	iter::once,
+	pin::pin,
 	sync::{Arc, Mutex},
 	time::SystemTime,
 };
@@ -191,6 +192,17 @@ pub async fn put(&self, session: &Session) {
 
 		self.db.userid_oauthid.raw_put(user_id, sess_ids);
 	}
+}
+
+/// Check if database state exists for one or more sessions associated with
+/// `user_id`
+#[implement(Sessions)]
+#[tracing::instrument(level = "debug", skip(self), ret(level = "debug"))]
+pub async fn exists_for_user(&self, user_id: &UserId) -> bool {
+	pin!(self.get_by_user(user_id))
+		.next()
+		.await
+		.is_some()
 }
 
 /// Fetch database state for a session from its associated `(iss,sub)`, in case

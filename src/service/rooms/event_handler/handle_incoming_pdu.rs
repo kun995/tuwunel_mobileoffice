@@ -1,16 +1,31 @@
-use futures::{FutureExt, TryFutureExt, TryStreamExt, future::try_join5};
-use ruma::{CanonicalJsonObject, EventId, RoomId, ServerName, UserId, events::StateEventType};
+use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, future::try_join5};
+use ruma::{
+	CanonicalJsonObject, EventId, OwnedEventId, RoomId, ServerName, UserId,
+	events::StateEventType,
+};
 use tuwunel_core::{
 	Err, Result, debug,
 	debug::INFO_SPAN_LEVEL,
-	err, implement,
-	matrix::{Event, room_version},
+	debug_warn, err, implement,
+	matrix::{Event, pdu::MAX_PREV_EVENTS, room_version},
+	smallvec::SmallVec,
 	trace,
-	utils::{BoolExt, stream::IterStream},
+	utils::{
+		BoolExt,
+		stream::{IterStream, TryWidebandExt},
+	},
 	warn,
 };
 
 use crate::rooms::timeline::RawPduId;
+
+type PrevResultsHandled = SmallVec<[PrevHandled; MAX_PREV_EVENTS]>;
+type PrevHandled = (OwnedEventId, Handled);
+
+type PrevResults = SmallVec<[PrevResult; MAX_PREV_EVENTS]>;
+type PrevResult = (OwnedEventId, Result<Handled>);
+
+type Handled = Option<(RawPduId, bool)>;
 
 /// When receiving an event one needs to:
 /// 0. Check the server is in the room
@@ -54,7 +69,7 @@ pub async fn handle_incoming_pdu<'a>(
 	event_id: &'a EventId,
 	pdu: CanonicalJsonObject,
 	is_timeline_event: bool,
-) -> Result<Option<(RawPduId, bool)>> {
+) -> Result<Handled> {
 	// 1. Skip the PDU if we already have it as a timeline event
 	if let Ok(pdu_id) = self.services.timeline.get_pdu_id(event_id).await {
 		debug!(?pdu_id, "Exists.");
@@ -109,9 +124,10 @@ pub async fn handle_incoming_pdu<'a>(
 	}
 
 	let room_version = room_version::from_create_event(create_event)?;
+	let recursion_level = 0;
 
-	let (incoming_pdu, val) = self
-		.handle_outlier_pdu(origin, room_id, event_id, pdu, &room_version, false)
+	let (incoming_pdu, pdu) = self
+		.handle_outlier_pdu(origin, room_id, event_id, pdu, &room_version, recursion_level, false)
 		.await?;
 
 	// 8. if not timeline event: stop
@@ -143,7 +159,14 @@ pub async fn handle_incoming_pdu<'a>(
 	// 9. Fetch any missing prev events doing all checks listed here starting at 1.
 	//    These are timeline events
 	let (sorted_prev_events, mut eventid_info) = self
-		.fetch_prev(origin, room_id, incoming_pdu.prev_events(), &room_version, first_ts_in_room)
+		.fetch_prev(
+			origin,
+			room_id,
+			incoming_pdu.prev_events(),
+			&room_version,
+			recursion_level,
+			first_ts_in_room,
+		)
 		.await?;
 
 	trace!(
@@ -151,27 +174,52 @@ pub async fn handle_incoming_pdu<'a>(
 		event_ids = ?sorted_prev_events,
 		"Handling previous events"
 	);
-	sorted_prev_events
-		.iter()
+	let _prev_handles: PrevResultsHandled = sorted_prev_events
+		.into_iter()
+		.enumerate()
 		.try_stream()
-		.map_ok(AsRef::as_ref)
-		.try_for_each(|prev_id| {
-			self.handle_prev_pdu(
-				origin,
-				room_id,
-				event_id,
-				eventid_info.remove(prev_id),
-				&room_version,
-				first_ts_in_room,
-				prev_id,
-				create_event.event_id(),
-			)
-			.inspect_err(move |e| {
-				warn!("Prev {prev_id} failed: {e}");
-				self.back_off(prev_id);
-			})
-			.map(|_| self.services.server.check_running())
+		.map_ok(|(i, prev_id)| (i, eventid_info.remove(&prev_id), prev_id))
+		.widen_and_then(MAX_PREV_EVENTS, async |(i, eventid_info, prev_id)| {
+			self.services.server.check_running()?;
+			match self
+				.handle_prev_pdu(
+					origin,
+					room_id,
+					event_id,
+					eventid_info,
+					&room_version,
+					recursion_level,
+					first_ts_in_room,
+					&prev_id,
+					create_event.event_id(),
+				)
+				.await
+			{
+				| Ok(Some(handled)) => {
+					self.cancel_back_off(&prev_id);
+					debug!(?i, ?prev_id, ?handled, "Prev event processed.");
+
+					Ok((prev_id, Ok(Some(handled))))
+				},
+				| Ok(None) => {
+					debug_warn!(?i, ?prev_id, "Prev event not processed.");
+
+					Ok((prev_id, Ok(None)))
+				},
+				| Err(e) => {
+					self.back_off(&prev_id);
+					warn!(?i, ?prev_id, ?event_id, ?room_id, "Prev event processing failed: {e}");
+
+					Ok((prev_id, Err(e)))
+				},
+			}
 		})
+		.try_collect::<PrevResults>()
+		.map_ok(PrevResults::into_iter)
+		.map_ok(IterStream::stream)
+		.map_ok(|s| s.map(|(id, res)| res.map(|res| (id, res))))
+		.try_flatten_stream()
+		.try_collect()
 		.boxed()
 		.await?;
 
@@ -180,8 +228,9 @@ pub async fn handle_incoming_pdu<'a>(
 		origin,
 		room_id,
 		incoming_pdu,
-		val,
+		pdu,
 		&room_version,
+		recursion_level,
 		create_event.event_id(),
 	)
 	.boxed()

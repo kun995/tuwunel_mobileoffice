@@ -14,12 +14,11 @@ use self::{
 };
 use crate::admin_command_dispatch;
 
-#[admin_command_dispatch]
+#[admin_command_dispatch(handler_prefix = "room")]
 #[derive(Debug, Subcommand)]
 pub(super) enum RoomCommand {
 	/// - List all rooms the server knows about
-	#[clap(alias = "list")]
-	ListRooms {
+	List {
 		page: Option<usize>,
 
 		/// Excludes rooms that we have federation disabled with
@@ -45,7 +44,7 @@ pub(super) enum RoomCommand {
 	Moderation(RoomModerationCommand),
 
 	#[command(subcommand)]
-	/// - Manage rooms' aliases
+	/// - Manage room aliases
 	Alias(RoomAliasCommand),
 
 	#[command(subcommand)]
@@ -58,9 +57,15 @@ pub(super) enum RoomCommand {
 	},
 
 	/// - Delete room
-	DeleteRoom {
+	Delete {
 		room_id: OwnedRoomId,
 
+		#[arg(short, long)]
+		force: bool,
+	},
+
+	/// - Prune empty rooms
+	PruneEmpty {
 		#[arg(short, long)]
 		force: bool,
 	},

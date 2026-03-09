@@ -85,7 +85,7 @@ pub(crate) async fn update_device_route(
 			};
 
 			if !appservice.registration.device_management {
-				return Err!(Request(NotFound("Device not found.")));
+				return Err!(Request(NotFound("Device management not enabled for appservice.")));
 			}
 
 			debug!(

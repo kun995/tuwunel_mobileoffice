@@ -9,10 +9,11 @@ use ruma::{
 	push::Ruleset,
 };
 use tuwunel_core::{
-	Err, Result, debug, debug_info, debug_warn, error, info,
+	Err, Result, debug, debug_info, debug_warn, err, error, info,
 	itertools::Itertools,
 	matrix::PduCount,
 	result::NotFound,
+	utils,
 	utils::{
 		IterStream, ReadyExt,
 		stream::{TryExpect, TryIgnore},
@@ -66,6 +67,7 @@ async fn fresh(services: &Services) -> Result {
 	db["global"].insert(b"retroactively_fix_bad_data_from_roomuserid_joined", []);
 	db["global"].insert(b"fix_referencedevents_missing_sep", []);
 	db["global"].insert(b"fix_readreceiptid_readreceipt_duplicates", []);
+	db["global"].insert(b"fix_hashed_sentinel_passwords", []);
 
 	// Create the admin room and server user on first run
 	if services.config.create_admin_room {
@@ -143,6 +145,14 @@ async fn migrate(services: &Services) -> Result {
 		|| services.globals.db.database_version().await < 17
 	{
 		fix_readreceiptid_readreceipt_duplicates(services).await?;
+	}
+
+	if db["global"]
+		.get(b"fix_hashed_sentinel_passwords")
+		.await
+		.is_not_found()
+	{
+		fix_hashed_sentinel_passwords(services).await?;
 	}
 
 	if services.globals.db.database_version().await < 17 {
@@ -580,5 +590,59 @@ async fn fix_readreceiptid_readreceipt_duplicates(services: &Services) -> Result
 	info!(?total, ?fixed, "Fixed undeleted entries in readreceiptid_readreceipt.");
 
 	db["global"].insert(b"fix_readreceiptid_readreceipt_duplicates", []);
+	db.engine.sort()
+}
+
+async fn fix_hashed_sentinel_passwords(services: &Services) -> Result {
+	use tuwunel_core::utils::hash::verify_password;
+
+	const PASSWORD_SENTINEL: &str = "*";
+
+	if services.config.identity_provider.is_empty() {
+		debug!("Skipping sentinel password migration since no SSO IdP configured.");
+		return Ok(());
+	}
+
+	let db = &services.db;
+	let cork = db.cork_and_sync();
+	let userid_password = db["userid_password"].clone();
+	let hashed_sentinel = utils::hash::password(PASSWORD_SENTINEL).map_err(|e| {
+		err!("Could not apply migration: failed to hash sentinel password: {e:?}")
+	})?;
+
+	warn!(
+		"Fixing occurrences of password-hash {hashed_sentinel:?} generated from \
+		 {PASSWORD_SENTINEL:?}"
+	);
+
+	let (checked, good, bad) = userid_password
+		.stream()
+		.expect_ok()
+		.ready_fold(
+			(0, 0, 0),
+			|(mut checked, mut good, mut bad): (usize, usize, usize),
+			 (key, val): (&str, &str)| {
+				let good_sentinel = val == PASSWORD_SENTINEL;
+				let bad_sentinel = !val.is_empty()
+					&& !good_sentinel
+					&& verify_password(PASSWORD_SENTINEL, val).is_ok();
+
+				checked = checked.saturating_add(usize::from(true));
+				good = good.saturating_add(usize::from(good_sentinel));
+				bad = bad.saturating_add(usize::from(bad_sentinel));
+
+				if bad_sentinel {
+					userid_password.insert(key, PASSWORD_SENTINEL);
+				}
+
+				(checked, good, bad)
+			},
+		)
+		.await;
+
+	drop(cork);
+	info!(?checked, ?good, ?bad, "Fixed any occurrences of hashed sentinel passwords");
+
+	db["global"].insert(b"fix_hashed_sentinel_passwords", []);
 	db.engine.sort()
 }

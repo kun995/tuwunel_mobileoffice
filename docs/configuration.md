@@ -35,7 +35,7 @@ string. This does not apply to options that take booleans or numbers:
 - `-O max_request_size=99999999` works ✅
 - `-O server_name=example.com` does not work ❌
 - `--option log=\"debug\"` works ✅
-- `--option server_name='"example.com'"` works ✅
+- `--option server_name='"example.com"'` works ✅
 
 ## Relevance of configuration settings
 

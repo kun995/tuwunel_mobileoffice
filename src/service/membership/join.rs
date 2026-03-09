@@ -27,10 +27,10 @@ use ruma::{
 };
 use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
-	Err, Result, debug, debug_error, debug_info, debug_warn, err, error, implement, info,
+	Err, Result, at, debug, debug_error, debug_info, debug_warn, err, error, implement, info,
 	matrix::{event::gen_event_id_canonical_json, room_version},
-	pdu::{PduBuilder, format::from_incoming_federation},
-	state_res, trace,
+	pdu::{PduBuilder, check_pdu_format, format::from_incoming_federation},
+	trace,
 	utils::{self, BoolExt, IterStream, ReadyExt, future::TryExtExt, math::Expected, shuffle},
 	warn,
 };
@@ -41,6 +41,7 @@ use crate::{
 	rooms::{
 		state::RoomMutexGuard,
 		state_compressor::{CompressedState, HashSetCompressStateEvent},
+		state_res,
 	},
 };
 
@@ -155,7 +156,7 @@ pub async fn join_remote(
 
 	if !self
 		.services
-		.server
+		.config
 		.supported_room_version(&room_version_id)
 	{
 		return Err!(BadServerResponse(
@@ -619,7 +620,7 @@ pub async fn join_local(
 
 	if !self
 		.services
-		.server
+		.config
 		.supported_room_version(&room_version_id)
 	{
 		return Err!(BadServerResponse(
@@ -756,7 +757,7 @@ async fn create_join_event(
 		.server_keys
 		.gen_id_hash_and_sign_event(&mut event, room_version_id)?;
 
-	state_res::check_pdu_format(&event, &room_version_rules.event_format)?;
+	check_pdu_format(&event, &room_version_rules.event_format)?;
 
 	Ok((event, event_id, join_authorized_via_users_server))
 }
@@ -797,8 +798,9 @@ async fn make_join_request(
 				user_id: sender_user.to_owned(),
 				ver: self
 					.services
-					.server
+					.config
 					.supported_room_versions()
+					.map(at!(0))
 					.collect(),
 			})
 			.await;

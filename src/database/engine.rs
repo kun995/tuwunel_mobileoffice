@@ -3,6 +3,7 @@ mod cf_opts;
 pub(crate) mod context;
 mod db_opts;
 pub(crate) mod descriptor;
+mod events;
 mod files;
 mod logger;
 mod memory_usage;

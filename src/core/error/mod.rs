@@ -52,6 +52,9 @@ pub enum Error {
 	CargoToml(#[from] cargo_toml::Error),
 	#[error(transparent)]
 	Clap(#[from] clap::error::Error),
+	#[cfg(unix)]
+	#[error(transparent)]
+	Errno(#[from] nix::errno::Errno),
 	#[error(transparent)]
 	Extension(#[from] axum::extract::rejection::ExtensionRejection),
 	#[error(transparent)]

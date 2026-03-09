@@ -5,15 +5,23 @@ use ruma::{
 use tuwunel_core::{
 	Err, Result, debug, debug_info, err, implement,
 	matrix::{Event, PduEvent, event::TypeExt, room_version},
-	pdu::format::from_incoming_federation,
-	ref_at, state_res, trace,
+	pdu::{check_pdu_format, format::from_incoming_federation},
+	ref_at, trace,
 	utils::{future::TryExtExt, stream::IterStream},
 	warn,
 };
 
 use super::check_room_id;
+use crate::rooms::state_res;
 
 #[implement(super::Service)]
+#[cfg_attr(unabridged, tracing::instrument(
+    name = "outlier",
+    level = "debug",
+    skip_all,
+    fields(lev = %recursion_level)
+))]
+#[expect(clippy::too_many_arguments)]
 pub(super) async fn handle_outlier_pdu(
 	&self,
 	origin: &ServerName,
@@ -21,9 +29,10 @@ pub(super) async fn handle_outlier_pdu(
 	event_id: &EventId,
 	mut pdu_json: CanonicalJsonObject,
 	room_version: &RoomVersionId,
+	recursion_level: usize,
 	auth_events_known: bool,
 ) -> Result<(PduEvent, CanonicalJsonObject)> {
-	debug!(?event_id, ?auth_events_known, "handle outlier");
+	debug!(?event_id, ?auth_events_known, %recursion_level, "handle outlier");
 
 	// 1. Remove unsigned field
 	pdu_json.remove("unsigned");
@@ -70,7 +79,7 @@ pub(super) async fn handle_outlier_pdu(
 
 	let room_rules = room_version::rules(room_version)?;
 
-	state_res::check_pdu_format(&pdu_json, &room_rules.event_format)?;
+	check_pdu_format(&pdu_json, &room_rules.event_format)?;
 
 	// Now that we have checked the signature and hashes we can make mutations and
 	// convert to our PduEvent type.
@@ -85,7 +94,14 @@ pub(super) async fn handle_outlier_pdu(
 		//    the auth events are also rejected "due to auth events"
 		// NOTE: Step 5 is not applied anymore because it failed too often
 		debug!("Fetching auth events");
-		Box::pin(self.fetch_auth(origin, room_id, event.auth_events(), room_version)).await;
+		Box::pin(self.fetch_auth(
+			origin,
+			room_id,
+			event.auth_events(),
+			room_version,
+			recursion_level,
+		))
+		.await;
 	}
 
 	// 6. Reject "due to auth events" if the event doesn't pass auth based on the
@@ -103,7 +119,7 @@ pub(super) async fn handle_outlier_pdu(
 
 	let auth_events: Vec<_> = event
 		.auth_events()
-		.chain(hydra_create_id.as_deref().into_iter())
+		.chain(hydra_create_id.as_deref())
 		.stream()
 		.filter_map(|auth_event_id| {
 			self.event_fetch(auth_event_id)

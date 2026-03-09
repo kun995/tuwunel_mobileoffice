@@ -24,6 +24,10 @@ sudo pacman -S nginx
 Create a new configuration file at `/etc/nginx/sites-available/tuwunel` (or `/etc/nginx/conf.d/tuwunel.conf` on some distributions):
 
 ```nginx
+upstream tuwunel {
+  127.0.0.1:8008; # IP and port where tuwunel is listening
+}
+
 # Client-Server API over HTTPS (port 443)
 server {
   listen 443 ssl http2;
@@ -34,9 +38,9 @@ server {
   # Increase this to match the max_request_size in your tuwunel.toml
   client_max_body_size 100M;
 
-  # Forward requests to Tuwunel (listening on 127.0.0.1:8008)
+  # Forward requests to Tuwunel
   location / {
-    proxy_pass http://127.0.0.1:8008;
+    proxy_pass http://tuwunel;
 
     # Preserve host and scheme - critical for proper Matrix operation
     proxy_set_header Host $host;
@@ -62,7 +66,7 @@ server {
 
   # Forward to the same local port as client-server API
   location / {
-    proxy_pass http://127.0.0.1:8008;
+    proxy_pass http://tuwunel;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-For $remote_addr;
     proxy_set_header X-Forwarded-Proto https;
@@ -103,7 +107,7 @@ However, if you experience federation retries or dropped long-poll connections, 
 
 ```nginx
 location / {
-  proxy_pass http://127.0.0.1:8008;
+  proxy_pass http://tuwunel;
   proxy_set_header Host $host;
   proxy_set_header X-Forwarded-For $remote_addr;
   proxy_set_header X-Forwarded-Proto https;

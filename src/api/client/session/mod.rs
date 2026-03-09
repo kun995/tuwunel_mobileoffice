@@ -78,7 +78,7 @@ pub(crate) async fn get_login_types_route(
 				| LoginType::Sso(SsoLoginType { identity_providers })
 					if list_idps && identity_providers.is_empty() =>
 					false,
-
+				| LoginType::Password(_) => services.config.login_with_password,
 				| _ => true,
 			})
 			.collect(),

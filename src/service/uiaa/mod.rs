@@ -16,6 +16,8 @@ use tuwunel_core::{
 };
 use tuwunel_database::{Deserialized, Json, Map};
 
+use crate::users::PASSWORD_SENTINEL;
+
 pub struct Service {
 	userdevicesessionid_uiaarequest: RwLock<RequestMap>,
 	db: Data,
@@ -107,9 +109,11 @@ pub async fn try_auth(
 			// Check if password is correct
 			let user_id = user_id_from_username;
 			let mut password_verified = false;
+			let mut password_sentinel = false;
 
 			// First try local password hash verification
 			if let Ok(hash) = self.services.users.password_hash(&user_id).await {
+				password_sentinel = hash == PASSWORD_SENTINEL;
 				password_verified = hash::verify_password(password, &hash).is_ok();
 			}
 
@@ -128,6 +132,19 @@ pub async fn try_auth(
 						.await
 						.is_ok();
 				}
+			}
+
+			// For SSO users that have never set a password, allow.
+			if !password_verified
+				&& password_sentinel
+				&& self
+					.services
+					.oauth
+					.sessions
+					.exists_for_user(&user_id)
+					.await
+			{
+				return Ok((true, uiaainfo));
 			}
 
 			if !password_verified {

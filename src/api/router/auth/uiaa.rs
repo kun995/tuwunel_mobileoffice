@@ -5,7 +5,13 @@ use ruma::{
 		client::uiaa::{AuthData, AuthFlow, AuthType, Jwt, UiaaInfo},
 	},
 };
-use tuwunel_core::{Err, Error, Result, err, is_equal_to, utils};
+use tuwunel_core::{
+	Err, Error, Result, err, utils,
+	utils::{
+		OptionExt,
+		future::{OptionFutureExt, TryExtExt},
+	},
+};
 use tuwunel_service::{Services, uiaa::SESSION_ID_LENGTH};
 
 use crate::{Ruma, client::jwt};
@@ -15,14 +21,46 @@ where
 	T: IncomingRequest + Send + Sync,
 {
 	let sender_device = body.sender_device()?;
+	let sender_user = body.sender_user.as_deref();
 
-	let flows = [
-		AuthFlow::new([AuthType::Password].into()),
-		AuthFlow::new([AuthType::Jwt].into()),
-	];
+	let password_flow = [AuthType::Password];
+	let has_password = sender_user
+		.map_async(|sender_user| {
+			services
+				.users
+				.has_password(sender_user)
+				.unwrap_or(false)
+		})
+		.unwrap_or(false)
+		.await;
+
+	//TODO: UIAA for SSO.
+	let sso_flow = [AuthType::Sso];
+	let has_sso = false;
+	let _has_sso = sender_user
+		.map_async(|sender_user| {
+			services
+				.oauth
+				.sessions
+				.exists_for_user(sender_user)
+		})
+		.unwrap_or(false)
+		.await;
+
+	//NOTE: Not implemented as a fallback/web for now.
+	let has_jwt = false;
+	let jwt_flow = [AuthType::Jwt];
 
 	let mut uiaainfo = UiaaInfo {
-		flows: flows.into(),
+		flows: has_password
+			.then_some(password_flow)
+			.into_iter()
+			.chain(has_sso.then_some(sso_flow))
+			.chain(has_jwt.then_some(jwt_flow))
+			.map(Vec::from)
+			.map(AuthFlow::new)
+			.collect(),
+
 		..Default::default()
 	};
 
@@ -69,16 +107,6 @@ where
 					.sender_user
 					.as_deref()
 					.ok_or_else(|| err!(Request(MissingToken("Missing access token."))))?;
-
-				// Skip UIAA for SSO/OIDC users.
-				if services
-					.users
-					.origin(sender_user)
-					.await
-					.is_ok_and(is_equal_to!("sso"))
-				{
-					return Ok(sender_user.to_owned());
-				}
 
 				uiaainfo.session = Some(utils::random_string(SESSION_ID_LENGTH));
 				services

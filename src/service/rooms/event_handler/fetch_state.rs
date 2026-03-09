@@ -24,6 +24,7 @@ pub(super) async fn fetch_state(
 	room_id: &RoomId,
 	event_id: &EventId,
 	room_version: &RoomVersionId,
+	recursion_level: usize,
 	create_event_id: &EventId,
 ) -> Result<Option<HashMap<u64, OwnedEventId>>> {
 	let res = self
@@ -39,7 +40,7 @@ pub(super) async fn fetch_state(
 	debug!("Fetching state events");
 	let state_ids = res.pdu_ids.iter().map(AsRef::as_ref);
 	let state_vec = self
-		.fetch_auth(origin, room_id, state_ids, room_version)
+		.fetch_auth(origin, room_id, state_ids, room_version, recursion_level)
 		.boxed()
 		.await;
 

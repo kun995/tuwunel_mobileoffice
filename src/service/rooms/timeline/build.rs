@@ -2,18 +2,15 @@ use std::{collections::HashSet, iter::once};
 
 use futures::{FutureExt, StreamExt};
 use ruma::{
-	OwnedEventId, OwnedServerName, RoomId, RoomVersionId, UserId,
+	OwnedEventId, OwnedServerName, RoomId, UserId,
 	events::{
 		TimelineEventType,
-		room::{
-			member::{MembershipState, RoomMemberEventContent},
-			redaction::RoomRedactionEventContent,
-		},
+		room::member::{MembershipState, RoomMemberEventContent},
 	},
 };
 use tuwunel_core::{
 	Err, Result, implement,
-	matrix::{event::Event, pdu::PduBuilder},
+	matrix::{event::Event, pdu::PduBuilder, room_version},
 	utils::{IterStream, ReadyExt},
 };
 
@@ -62,36 +59,24 @@ pub async fn build_and_append_pdu(
 
 	// If redaction event is not authorized, do not append it to the timeline
 	if *pdu.kind() == TimelineEventType::RoomRedaction {
-		use RoomVersionId::*;
-		match self
+		let room_version = self
 			.services
 			.state
 			.get_room_version(pdu.room_id())
-			.await?
+			.await?;
+
+		let room_rules = room_version::rules(&room_version)?;
+
+		let redacts_id = pdu.redacts_id(&room_rules);
+
+		if let Some(redacts_id) = &redacts_id
+			&& !self
+				.services
+				.state_accessor
+				.user_can_redact(redacts_id, pdu.sender(), pdu.room_id(), false)
+				.await?
 		{
-			| V1 | V2 | V3 | V4 | V5 | V6 | V7 | V8 | V9 | V10 => {
-				if let Some(redact_id) = pdu.redacts()
-					&& !self
-						.services
-						.state_accessor
-						.user_can_redact(redact_id, pdu.sender(), pdu.room_id(), false)
-						.await?
-				{
-					return Err!(Request(Forbidden("User cannot redact this event.")));
-				}
-			},
-			| _ => {
-				let content: RoomRedactionEventContent = pdu.get_content()?;
-				if let Some(redact_id) = &content.redacts
-					&& !self
-						.services
-						.state_accessor
-						.user_can_redact(redact_id, pdu.sender(), pdu.room_id(), false)
-						.await?
-				{
-					return Err!(Request(Forbidden("User cannot redact this event.")));
-				}
-			},
+			return Err!(Request(Forbidden("User cannot redact this event.")));
 		}
 	}
 

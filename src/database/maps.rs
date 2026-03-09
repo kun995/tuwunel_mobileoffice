@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use rocksdb::DBCompressionType as CompressionType;
 use tuwunel_core::Result;
 
 use crate::{
@@ -37,7 +38,8 @@ pub(super) static MAPS: &[Descriptor] = &[
 	Descriptor {
 		name: "authchainkey_authchain",
 		cache_disp: CacheDisp::SharedWith("shorteventid_authchain"),
-		index_size: 512,
+		compression: CompressionType::None,
+		index_size: 1024,
 		block_size: 4096,
 		key_size_hint: Some(8), // intentionally match shorteventid_authchain
 		val_size_hint: Some(256),

@@ -1,4 +1,5 @@
 #![type_length_limit = "65536"]
+#![allow(unused_features)] // 1.96.0-nightly 2026-03-07 bug
 
 extern crate rust_rocksdb as rocksdb;
 

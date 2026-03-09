@@ -78,7 +78,7 @@ pub(crate) async fn upgrade_room_route(
 	let version_rules = room_version::rules(new_version)?;
 
 	if !services
-		.server
+		.config
 		.supported_room_version(new_version)
 	{
 		return Err!(Request(UnsupportedRoomVersion(
@@ -448,7 +448,7 @@ async fn move_local_aliases(&self) -> Result {
 		.filter_map(|alias| {
 			self.services
 				.alias
-				.remove_alias(alias, self.sender_user)
+				.remove_alias_by(alias, self.sender_user)
 				.inspect_err(move |e| error!(?alias, ?self, "Failed to remove alias: {e}"))
 				.map_ok(move |()| alias)
 				.ok()
@@ -456,7 +456,7 @@ async fn move_local_aliases(&self) -> Result {
 		.ready_for_each(|alias| {
 			self.services
 				.alias
-				.set_alias(alias, self.new_room_id, self.sender_user)
+				.set_alias_by(alias, self.new_room_id, self.sender_user)
 				.inspect_err(|e| error!(?self, "Failed to add alias: {e}"))
 				.ok();
 		})

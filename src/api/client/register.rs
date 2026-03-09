@@ -333,7 +333,7 @@ pub(crate) async fn register_route(
 		.full_register(Register {
 			user_id: Some(&user_id),
 			password,
-			appservice_info: body.appservice_info.as_ref(),
+			is_appservice: body.appservice_info.is_some(),
 			is_guest,
 			grant_first_user_admin: true,
 			..Default::default()

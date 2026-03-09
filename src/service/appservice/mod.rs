@@ -80,7 +80,10 @@ impl Service {
 				self.registration_info
 					.write()
 					.await
-					.insert(id.clone(), reg.try_into()?)
+					.insert(
+						id.clone(),
+						RegistrationInfo::new(reg, self.services.globals.server_name())?,
+					)
 					.map_or(Ok(()), |_| Err!("Conflicting Appservice ID: {id:?}"))
 			})
 			.await
@@ -105,42 +108,36 @@ impl Service {
 		Ok(())
 	}
 
-	/// Registers an appservice and returns the ID to the caller
-	pub async fn register_appservice(
-		&self,
-		registration: &Registration,
-		appservice_config_body: &str,
-	) -> Result {
-		let appservice_user = UserId::parse_with_server_name(
-			&registration.sender_localpart,
-			&self.services.config.server_name,
-		)?;
+	pub async fn register_appservice(&self, registration: Registration) -> Result {
+		let appservice_yaml = serde_yaml::to_string(&registration)?;
 
-		if !self.services.users.exists(&appservice_user).await {
+		let id = registration.id.clone();
+
+		let registration_info =
+			RegistrationInfo::new(registration, self.services.globals.server_name())?;
+
+		let appservice_user = &registration_info.sender;
+
+		if !self.services.users.exists(appservice_user).await {
 			self.services
 				.users
-				.create(&appservice_user, None, None)
+				.create(appservice_user, None, None)
 				.await?;
 		}
 
 		//TODO: Check for collisions between exclusive appservice namespaces
+		self.db
+			.id_appserviceregistrations
+			.insert(&id, appservice_yaml);
+
 		self.registration_info
 			.write()
 			.await
-			.insert(registration.id.clone(), registration.clone().try_into()?);
-
-		self.db
-			.id_appserviceregistrations
-			.insert(&registration.id, appservice_config_body);
+			.insert(id, registration_info);
 
 		Ok(())
 	}
 
-	/// Remove an appservice registration
-	///
-	/// # Arguments
-	///
-	/// * `service_name` - the registration ID of the appservice
 	pub async fn unregister_appservice(&self, appservice_id: &str) -> Result {
 		// removes the appservice registration info
 		self.registration_info

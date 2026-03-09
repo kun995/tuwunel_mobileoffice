@@ -1,7 +1,7 @@
 use axum::extract::State;
 use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use ruma::{
-	OwnedEventId, RoomId, UserId,
+	OwnedEventId, OwnedRoomAliasId, RoomId, UserId,
 	api::client::state::{get_state_event_for_key, get_state_events, send_state_event},
 	events::{
 		AnyStateEventContent, StateEventType,
@@ -133,8 +133,8 @@ pub(crate) async fn get_state_events_for_key_route(
 
 	let event_format = body
 		.format
-		.as_ref()
-		.is_some_and(|f| f.to_lowercase().eq("event"));
+		.as_deref()
+		.is_some_and(|f| f.eq_ignore_ascii_case("event"));
 
 	Ok(get_state_event_for_key::v3::Response {
 		content: event_format.or(|| event.get_content_as_value()),
@@ -320,16 +320,28 @@ async fn allowed_to_send_state_event(
 		| StateEventType::RoomCanonicalAlias => {
 			match json.deserialize_as_unchecked::<RoomCanonicalAliasEventContent>() {
 				| Ok(canonical_alias_content) => {
-					let mut aliases = canonical_alias_content.alt_aliases.clone();
+					let current_event = services
+						.state_accessor
+						.room_state_get_content::<RoomCanonicalAliasEventContent>(
+							room_id,
+							&StateEventType::RoomCanonicalAlias,
+							"",
+						)
+						.await
+						.ok();
 
-					if let Some(alias) = canonical_alias_content.alias {
-						aliases.push(alias);
-					}
+					let current_aliases: Vec<OwnedRoomAliasId> = current_event
+						.map(|content| content.aliases().cloned().collect())
+						.unwrap_or_default();
+
+					let aliases = canonical_alias_content
+						.aliases()
+						.filter(|alias| !current_aliases.contains(alias));
 
 					for alias in aliases {
 						let (alias_room_id, _servers) = services
 							.alias
-							.resolve_alias(&alias)
+							.resolve_alias(alias)
 							.await
 							.map_err(|e| {
 								err!(Request(BadAlias("Failed resolving alias \"{alias}\": {e}")))

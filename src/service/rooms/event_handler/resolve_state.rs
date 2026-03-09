@@ -5,12 +5,14 @@ use ruma::{OwnedEventId, RoomId, RoomVersionId};
 use tuwunel_core::{
 	Result, err, implement,
 	matrix::room_version,
-	state_res::{self, AuthSet, StateMap},
 	trace,
 	utils::stream::{IterStream, ReadyExt, TryWidebandExt, WidebandExt},
 };
 
-use crate::rooms::state_compressor::CompressedState;
+use crate::rooms::{
+	state_compressor::CompressedState,
+	state_res::{self, AuthSet, StateMap},
+};
 
 #[implement(super::Service)]
 #[tracing::instrument(
@@ -103,15 +105,10 @@ pub async fn resolve_state(
 }
 
 #[implement(super::Service)]
-#[tracing::instrument(
-	name = "resolve",
-	level = "debug",
-	skip_all,
-	fields(%room_id),
-)]
+#[tracing::instrument(name = "resolve", level = "debug", skip_all)]
 pub(super) async fn state_resolution<StateSets, AuthSets>(
 	&self,
-	room_id: &RoomId,
+	_room_id: &RoomId,
 	room_version: &RoomVersionId,
 	state_sets: StateSets,
 	auth_chains: AuthSets,

@@ -245,12 +245,12 @@ async fn set_intersection_sorted_stream2() {
 	let r = intersection_sorted_stream2(a.iter().stream(), b.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	assert!(r.eq(&["bar"]));
+	assert_eq!(r, &["bar"]);
 
 	let r = intersection_sorted_stream2(b.iter().stream(), a.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	assert!(r.eq(&["bar"]));
+	assert_eq!(r, &["bar"]);
 
 	let a = ["aaa", "ccc", "xxx", "yyy"];
 	let b = ["hhh", "iii", "jjj", "zzz"];
@@ -264,14 +264,14 @@ async fn set_intersection_sorted_stream2() {
 	let r = intersection_sorted_stream2(a.iter().stream(), b.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	assert!(r.eq(&["aaa", "ccc", "eee"]));
+	assert_eq!(r, &["aaa", "ccc", "eee"]);
 
 	let a = ["aaa", "ccc", "eee", "ggg", "hhh", "iii"];
 	let b = ["bbb", "ccc", "ddd", "fff", "ggg", "iii"];
 	let r = intersection_sorted_stream2(a.iter().stream(), b.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	assert!(r.eq(&["ccc", "ggg", "iii"]));
+	assert_eq!(r, &["ccc", "ggg", "iii"]);
 }
 
 #[tokio::test]
@@ -284,13 +284,11 @@ async fn set_difference_sorted_stream2() {
 	let r = difference_sorted_stream2(a.iter().stream(), b.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	println!("{r:?}");
-	assert!(r.eq(&["foo"]));
+	assert_eq!(r, &["foo"]);
 
 	let r = difference_sorted_stream2(b.iter().stream(), a.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	println!("{r:?}");
 	assert!(r.is_empty());
 
 	let a = ["aaa", "ccc", "xxx", "yyy"];
@@ -298,22 +296,29 @@ async fn set_difference_sorted_stream2() {
 	let r = difference_sorted_stream2(a.iter().stream(), b.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	println!("{r:?}");
-	assert!(r.eq(&["aaa", "ccc", "xxx", "yyy"]));
+	assert_eq!(r, &["aaa", "ccc", "xxx", "yyy"]);
 
 	let a = ["aaa", "ccc", "eee", "ggg"];
 	let b = ["aaa", "bbb", "ccc", "ddd", "eee"];
 	let r = difference_sorted_stream2(a.iter().stream(), b.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	println!("{r:?}");
-	assert!(r.eq(&["ggg"]));
+	assert_eq!(r, &["ggg"]);
 
 	let a = ["aaa", "ccc", "eee", "ggg", "hhh", "iii"];
 	let b = ["bbb", "ccc", "ddd", "fff", "ggg", "iii"];
 	let r = difference_sorted_stream2(a.iter().stream(), b.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	println!("{r:?}");
-	assert!(r.eq(&["aaa", "eee", "hhh"]));
+	assert_eq!(r, &["aaa", "eee", "hhh"]);
+}
+
+#[test]
+fn page_size() {
+	use crate::utils::sys::page_size;
+
+	let val = page_size().expect("Failed to get system page size");
+	println!("{val:?}");
+
+	assert!(val != 0, "page size was zero");
 }

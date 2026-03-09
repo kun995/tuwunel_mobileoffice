@@ -112,8 +112,8 @@ impl Resolver {
 	fn configure_opts(server: &Arc<Server>, mut opts: ResolverOpts) -> ResolverOpts {
 		let config = &server.config;
 
-		opts.negative_max_ttl = Some(Duration::from_secs(60 * 60 * 24 * 30));
-		opts.positive_max_ttl = Some(Duration::from_secs(60 * 60 * 24 * 7));
+		opts.negative_max_ttl = Some(Duration::from_hours(720));
+		opts.positive_max_ttl = Some(Duration::from_hours(168));
 		opts.timeout = Duration::from_secs(config.dns_timeout);
 		opts.attempts = config.dns_attempts as usize;
 		opts.try_tcp_on_error = config.dns_tcp_fallback;

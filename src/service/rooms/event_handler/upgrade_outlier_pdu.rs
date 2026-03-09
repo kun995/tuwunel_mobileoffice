@@ -7,7 +7,7 @@ use ruma::{
 };
 use tuwunel_core::{
 	Err, Result, debug, debug_info, err, implement, is_equal_to,
-	matrix::{Event, EventTypeExt, PduEvent, StateKey, room_version, state_res},
+	matrix::{Event, EventTypeExt, PduEvent, StateKey, pdu::check_pdu_format, room_version},
 	trace,
 	utils::stream::{BroadbandExt, ReadyExt},
 	warn,
@@ -15,6 +15,7 @@ use tuwunel_core::{
 
 use crate::rooms::{
 	state_compressor::{CompressedState, HashSetCompressStateEvent},
+	state_res,
 	timeline::RawPduId,
 };
 
@@ -22,9 +23,11 @@ use crate::rooms::{
 #[tracing::instrument(
 	name = "upgrade",
 	level = "debug",
+	ret(level = "debug"),
 	skip_all,
-	ret(level = "debug")
+	fields(lev = %recursion_level)
 )]
+#[expect(clippy::too_many_arguments)]
 pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	&self,
 	origin: &ServerName,
@@ -32,6 +35,7 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	incoming_pdu: PduEvent,
 	val: CanonicalJsonObject,
 	room_version: &RoomVersionId,
+	recursion_level: usize,
 	create_event_id: &EventId,
 ) -> Result<Option<(RawPduId, bool)>> {
 	// Skip the PDU if we already have it as a timeline event
@@ -60,7 +64,7 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	let room_rules = room_version::rules(room_version)?;
 
 	trace!(format = ?room_rules.event_format, "Checking format");
-	state_res::check_pdu_format(&val, &room_rules.event_format)?;
+	check_pdu_format(&val, &room_rules.event_format)?;
 
 	// 10. Fetch missing state and auth chain events by calling /state_ids at
 	//     backwards extremities doing all the checks in this list starting at 1.
@@ -78,7 +82,14 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 
 	if state_at_incoming_event.is_none() {
 		state_at_incoming_event = self
-			.fetch_state(origin, room_id, incoming_pdu.event_id(), room_version, create_event_id)
+			.fetch_state(
+				origin,
+				room_id,
+				incoming_pdu.event_id(),
+				room_version,
+				recursion_level,
+				create_event_id,
+			)
 			.boxed()
 			.await?;
 	}
@@ -138,7 +149,7 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 
 	// Soft fail check before doing state res
 	trace!("Performing soft-fail check");
-	let soft_fail = match incoming_pdu.redacts_id(room_version) {
+	let soft_fail = match incoming_pdu.redacts_id(&room_rules) {
 		| None => false,
 		| Some(redact_id) =>
 			!self
@@ -276,6 +287,11 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 			&state_lock,
 		)
 		.await?;
+
+	debug_assert!(
+		pdu_id.is_some() || soft_fail,
+		"Ok(None) returned by timeline for soft-failed PDU's"
+	);
 
 	if soft_fail {
 		self.services

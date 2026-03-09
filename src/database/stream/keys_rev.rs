@@ -24,10 +24,16 @@ impl<'a> Cursor<'a, Key<'a>> for KeysRev<'a> {
 	fn state(&self) -> &State<'a> { &self.state }
 
 	#[inline]
-	fn fetch(&self) -> Option<Key<'a>> { self.state.fetch_key().map(slice_longevity) }
+	fn state_mut(&mut self) -> &mut State<'a> { &mut self.state }
 
 	#[inline]
-	fn seek(&mut self) { self.state.seek_rev(); }
+	fn count(&self) -> (usize, Option<usize>) { self.state().count_rev() }
+
+	#[inline]
+	fn fetch(&self) -> Option<Key<'a>> { self.state().fetch_key().map(slice_longevity) }
+
+	#[inline]
+	fn seek(&mut self) { self.state_mut().seek_rev(); }
 }
 
 impl<'a> Stream for KeysRev<'a> {
@@ -36,9 +42,11 @@ impl<'a> Stream for KeysRev<'a> {
 	fn poll_next(mut self: Pin<&mut Self>, _ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
 		Poll::Ready(self.seek_and_get())
 	}
+
+	fn size_hint(&self) -> (usize, Option<usize>) { self.count() }
 }
 
 impl FusedStream for KeysRev<'_> {
 	#[inline]
-	fn is_terminated(&self) -> bool { !self.state.init && !self.state.valid() }
+	fn is_terminated(&self) -> bool { !self.state().init && !self.state().valid() }
 }

@@ -34,7 +34,7 @@ use tuwunel_service::{
 	oauth::{
 		CODE_VERIFIER_LENGTH, Provider, SESSION_ID_LENGTH, Session, UserInfo, unique_id_sub,
 	},
-	users::Register,
+	users::{PASSWORD_SENTINEL, Register},
 };
 use url::Url;
 
@@ -301,24 +301,28 @@ pub(crate) async fn sso_callback_route(
 		return Err!(Request(Unauthorized("Authorization grant session has expired.")));
 	}
 
-	let cookie = body
-		.cookie
-		.get(GRANT_SESSION_COOKIE)
-		.map(Cookie::value)
-		.map(serde_html_form::from_str::<GrantCookie<'_>>)
-		.transpose()?
-		.ok_or_else(|| err!(Request(Unauthorized("Missing cookie {GRANT_SESSION_COOKIE:?}"))))?;
+	if provider.check_cookie {
+		let cookie = body
+			.cookie
+			.get(GRANT_SESSION_COOKIE)
+			.map(Cookie::value)
+			.map(serde_html_form::from_str::<GrantCookie<'_>>)
+			.transpose()?
+			.ok_or_else(|| {
+				err!(Request(Unauthorized("Missing cookie {GRANT_SESSION_COOKIE:?}")))
+			})?;
 
-	if cookie.client_id.as_ref() != client_id.as_str() {
-		return Err!(Request(Unauthorized("Client ID {client_id:?} cookie mismatch.")));
-	}
+		if cookie.client_id.as_ref() != client_id.as_str() {
+			return Err!(Request(Unauthorized("Client ID {client_id:?} cookie mismatch.")));
+		}
 
-	if Some(cookie.nonce.as_ref()) != session.cookie_nonce.as_deref() {
-		return Err!(Request(Unauthorized("Cookie nonce does not match session state.")));
-	}
+		if Some(cookie.nonce.as_ref()) != session.cookie_nonce.as_deref() {
+			return Err!(Request(Unauthorized("Cookie nonce does not match session state.")));
+		}
 
-	if cookie.state.as_ref() != sess_id {
-		return Err!(Request(Unauthorized("Session ID {sess_id:?} cookie mismatch.")));
+		if cookie.state.as_ref() != sess_id {
+			return Err!(Request(Unauthorized("Session ID {sess_id:?} cookie mismatch.")));
+		}
 	}
 
 	// Request access token.
@@ -392,6 +396,10 @@ pub(crate) async fn sso_callback_route(
 
 	// Attempt to register a non-existing user.
 	if !services.users.exists(&user_id).await {
+		if !provider.registration {
+			return Err!(Request(Forbidden("Registration from this provider is disabled")));
+		}
+
 		register_user(&services, &provider, &session, &userinfo, &user_id).await?;
 	}
 
@@ -476,9 +484,10 @@ async fn register_user(
 		.users
 		.full_register(Register {
 			user_id: Some(user_id),
-			password: Some("*"),
+			password: Some(PASSWORD_SENTINEL),
 			origin: Some("sso"),
 			displayname: userinfo.name.as_deref(),
+			grant_first_user_admin: true,
 			..Default::default()
 		})
 		.await?;
@@ -501,7 +510,7 @@ async fn register_user(
 
 	// log in conduit admin channel if a non-guest user registered
 	let notice =
-		format!("New user \"{user_id}\" registered on this server via {idp_name} ({idp_id})",);
+		format!("New user \"{user_id}\" registered on this server via {idp_name} ({idp_id})");
 
 	info!("{notice}");
 	if services.server.config.admin_room_notices {
@@ -592,10 +601,14 @@ async fn decide_user_id(
 		return Ok(user_id);
 	}
 
-	let allowed =
-		|claim: &str| provider.userid_claims.is_empty() || provider.userid_claims.contains(claim);
+	let explicit = |claim: &str| provider.userid_claims.contains(claim);
+
+	let allowed = |claim: &str| provider.userid_claims.is_empty() || explicit(claim);
 
 	let choices = [
+		explicit("sub")
+			.then_some(userinfo.sub.as_str())
+			.map(str::to_lowercase),
 		userinfo
 			.preferred_username
 			.as_deref()
@@ -622,14 +635,14 @@ async fn decide_user_id(
 	];
 
 	for choice in choices.into_iter().flatten() {
-		if let Some(user_id) = try_user_id(services, &choice, false).await {
+		if let Some(user_id) = try_user_id(services, provider, &choice, false).await {
 			return Ok(user_id);
 		}
 	}
 
 	let length = Some(15..23);
 	let unique_id = truncate_deterministic(unique_id, length).to_lowercase();
-	if let Some(user_id) = try_user_id(services, &unique_id, true).await {
+	if let Some(user_id) = try_user_id(services, provider, &unique_id, true).await {
 		return Ok(user_id);
 	}
 
@@ -639,8 +652,9 @@ async fn decide_user_id(
 #[tracing::instrument(level = "debug", skip_all, fields(username))]
 async fn try_user_id(
 	services: &Services,
+	provider: &Provider,
 	username: &str,
-	may_exist: bool,
+	unique_id: bool,
 ) -> Option<OwnedUserId> {
 	let server_name = services.globals.server_name();
 	let user_id = parse_user_id(server_name, username)
@@ -657,7 +671,15 @@ async fn try_user_id(
 	}
 
 	if services.users.exists(&user_id).await {
-		debug_warn!(?username, "Username exists.");
+		if provider.trusted {
+			info!(
+				?username,
+				provider = ?provider.brand,
+				"Authorizing trusted provider access to existing account."
+			);
+
+			return Some(user_id);
+		}
 
 		if services
 			.users
@@ -666,13 +688,22 @@ async fn try_user_id(
 			.ok()
 			.is_none_or(|origin| origin != "sso")
 		{
-			debug_warn!(?username, "Username has non-sso origin.");
+			debug_warn!(?username, "Existing username has non-sso origin.");
 			return None;
 		}
 
-		if !may_exist {
+		if !unique_id {
+			debug_warn!(?username, "Username exists.");
 			return None;
 		}
+	} else if unique_id && !provider.unique_id_fallbacks {
+		debug_warn!(
+			?username,
+			provider = ?provider.brand,
+			"Unique ID fallbacks disabled.",
+		);
+
+		return None;
 	}
 
 	Some(user_id)

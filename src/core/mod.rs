@@ -1,4 +1,5 @@
 #![type_length_limit = "12288"]
+#![allow(unused_features)] // 1.96.0-nightly 2026-03-07 bug
 
 pub mod alloc;
 pub mod config;
@@ -20,14 +21,13 @@ pub use ::jsonwebtoken as jwt;
 pub use ::ruma;
 pub use ::smallstr;
 pub use ::smallvec;
+pub use ::tokio_metrics;
 pub use ::toml;
 pub use ::tracing;
 pub use config::Config;
 pub use error::Error;
 pub use info::{rustc_flags_capture, version, version::version};
-pub use matrix::{
-	Event, EventTypeExt, Pdu, PduCount, PduEvent, PduId, RoomVersion, pdu, state_res,
-};
+pub use matrix::{Event, EventTypeExt, Pdu, PduCount, PduEvent, PduId, RoomVersion, pdu};
 pub use server::Server;
 pub use utils::{ctor, dtor, implement, result, result::Result};
 

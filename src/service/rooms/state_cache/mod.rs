@@ -17,7 +17,7 @@ use tuwunel_core::{
 	result::LogErr,
 	trace,
 	utils::{
-		BoolExt,
+		self, BoolExt,
 		future::OptionStream,
 		stream::{BroadbandExt, ReadyExt, TryIgnore},
 	},
@@ -207,12 +207,10 @@ pub fn get_shared_rooms<'a>(
 	user_a: &'a UserId,
 	user_b: &'a UserId,
 ) -> impl Stream<Item = &RoomId> + Send + 'a {
-	use tuwunel_core::utils::set;
-
-	let a = self.rooms_joined(user_a);
+	let a = self.rooms_joined(user_a).boxed();
 	let b = self.rooms_joined(user_b).boxed();
 
-	set::intersection_sorted_stream2(a, b)
+	utils::set::intersection_sorted_stream2(a, b)
 }
 
 /// Returns an iterator of all joined members of a room.

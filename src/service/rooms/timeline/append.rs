@@ -1,13 +1,12 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use ruma::{
-	CanonicalJsonObject, CanonicalJsonValue, EventId, RoomVersionId, UserId,
+	CanonicalJsonObject, CanonicalJsonValue, EventId, UserId,
 	events::{
 		TimelineEventType,
 		room::{
 			encrypted::Relation,
 			member::{MembershipState, RoomMemberEventContent},
-			redaction::RoomRedactionEventContent,
 		},
 	},
 };
@@ -16,6 +15,7 @@ use tuwunel_core::{
 	matrix::{
 		event::Event,
 		pdu::{PduCount, PduEvent, PduId, RawPduId},
+		room_version,
 	},
 	utils::{self, result::LogErr},
 };
@@ -211,30 +211,24 @@ async fn append_pdu_effects(
 ) -> Result {
 	match *pdu.kind() {
 		| TimelineEventType::RoomRedaction => {
-			use RoomVersionId::*;
-
-			let room_version_id = self
+			let room_version = self
 				.services
 				.state
 				.get_room_version(pdu.room_id())
 				.await?;
 
-			let content: RoomRedactionEventContent;
-			let event_id = match room_version_id {
-				| V1 | V2 | V3 | V4 | V5 | V6 | V7 | V8 | V9 | V10 => pdu.redacts(),
-				| _ => {
-					content = pdu.get_content()?;
-					content.redacts.as_deref()
-				},
-			};
-			if let Some(redact_id) = event_id
+			let room_rules = room_version::rules(&room_version)?;
+
+			let redacts_id = pdu.redacts_id(&room_rules);
+
+			if let Some(redacts_id) = &redacts_id
 				&& self
 					.services
 					.state_accessor
-					.user_can_redact(redact_id, pdu.sender(), pdu.room_id(), false)
+					.user_can_redact(redacts_id, pdu.sender(), pdu.room_id(), false)
 					.await?
 			{
-				self.redact_pdu(redact_id, pdu, shortroomid, state_lock)
+				self.redact_pdu(redacts_id, pdu, shortroomid, state_lock)
 					.await?;
 			}
 		},

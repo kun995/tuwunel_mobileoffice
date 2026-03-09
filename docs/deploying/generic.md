@@ -73,7 +73,7 @@ Matrix's default federation port is port 8448, and clients must be using port 44
 If you would like to use only port 443, or a different port, you will need to setup
 delegation. Tuwunel has config options for doing delegation, or you can configure
 your reverse proxy to manually serve the necessary JSON files to do delegation
-(see the `[global.well_known]` config section).
+(see the `[global.well_known]` config section and the [delegation example](root-domain-delegation.md)).
 
 If Tuwunel runs behind a router or in a container and has a different public
 IP address than the host system these public ports need to be forwarded directly
@@ -158,7 +158,7 @@ Regardless of which reverse proxy you choose, you will need to:
    - `/_tuwunel/` - ad-hoc Tuwunel routes such as `/local_user_count` and `/server_version`
 
 2. **Optionally reverse proxy (recommended):**
-   - `/.well-known/matrix/client` and `/.well-known/matrix/server` if using Tuwunel to perform delegation (see the `[global.well_known]` config section)
+   - `/.well-known/matrix/client` and `/.well-known/matrix/server` if using Tuwunel to perform delegation (see the `[global.well_known]` config section and the [delegation example](root-domain-delegation.md))
    - `/.well-known/matrix/support` if using Tuwunel to send the homeserver admin contact and support page (formerly known as MSC1929)
    - `/` if you would like to see `hewwo from tuwunel woof!` at the root
 
