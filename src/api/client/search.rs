@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use axum::extract::State;
+use axum::{extract::State, http::Uri};
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use ruma::{
 	OwnedRoomId, RoomId, UInt, UserId,
@@ -16,7 +16,7 @@ use tuwunel_core::{
 	Err, Result, at, is_true,
 	matrix::Event,
 	result::FlatOk,
-	utils::{IterStream, option::OptionExt, stream::ReadyExt},
+	utils::{IterStream, option::OptionExt, stream::{BroadbandExt, ReadyExt}},
 };
 use tuwunel_service::{Services, rooms::search::RoomQuery};
 
@@ -37,15 +37,28 @@ const BATCH_MAX: usize = 20;
 ///   history visibility)
 pub(crate) async fn search_events_route(
 	State(services): State<crate::State>,
+	uri: Uri,
 	body: Ruma<Request>,
 ) -> Result<Response> {
 	let sender_user = body.sender_user();
 	let next_batch = body.next_batch.as_deref();
+
+	// Parse optional workspace_id from query string (?workspace_id=xxx)
+	let workspace_id: Option<String> = uri
+		.query()
+		.and_then(|q| {
+			q.split('&')
+				.find(|p| p.starts_with("workspace_id="))
+				.map(|p| p.trim_start_matches("workspace_id=").to_owned())
+		});
+
 	let room_events = body
 		.search_categories
 		.room_events
 		.as_ref()
-		.map_async(|criteria| category_room_events(&services, sender_user, next_batch, criteria))
+		.map_async(|criteria| {
+			category_room_events(&services, sender_user, next_batch, criteria, workspace_id.as_deref())
+		})
 		.await
 		.transpose()?;
 
@@ -62,6 +75,7 @@ async fn category_room_events(
 	sender_user: &UserId,
 	next_batch: Option<&str>,
 	criteria: &Criteria,
+	workspace_id: Option<&str>,
 ) -> Result<ResultRoomEvents> {
 	let filter = &criteria.filter;
 
@@ -85,11 +99,26 @@ async fn category_room_events(
 		.map(IterStream::stream)
 		.map(StreamExt::boxed)
 		.unwrap_or_else(|| {
-			services
-				.state_cache
-				.rooms_joined(sender_user)
-				.map(ToOwned::to_owned)
-				.boxed()
+			if let Some(wid) = workspace_id {
+				// Scope search to rooms belonging to this workspace that the user has joined
+				services
+					.workspace
+					.rooms_by_workspace(wid)
+					.broad_filter_map(async |room_id| {
+						services
+							.state_cache
+							.is_joined(sender_user, &room_id)
+							.await
+							.then_some(room_id)
+					})
+					.boxed()
+			} else {
+				services
+					.state_cache
+					.rooms_joined(sender_user)
+					.map(ToOwned::to_owned)
+					.boxed()
+			}
 		});
 
 	let results: Vec<_> = rooms
