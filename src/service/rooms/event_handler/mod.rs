@@ -76,7 +76,16 @@ impl crate::Service for Service {
 }
 
 #[implement(Service)]
-fn back_off(&self, event_id: &EventId) {
+fn cancel_back_off(&self, event_id: &EventId) -> bool {
+	self.bad_event_ratelimiter
+		.write()
+		.expect("locked")
+		.remove(event_id)
+		.is_some()
+}
+
+#[implement(Service)]
+fn back_off(&self, event_id: &EventId) -> bool {
 	use hash_map::Entry::{Occupied, Vacant};
 
 	match self
@@ -87,9 +96,11 @@ fn back_off(&self, event_id: &EventId) {
 	{
 		| Vacant(e) => {
 			e.insert((Instant::now(), 1));
+			true
 		},
 		| Occupied(mut e) => {
 			*e.get_mut() = (Instant::now(), e.get().1.saturating_add(1));
+			false
 		},
 	}
 }
@@ -106,15 +117,32 @@ fn is_backed_off(&self, event_id: &EventId, range: Range<Duration>) -> bool {
 		return false;
 	};
 
-	continue_exponential_backoff(range.start, range.end, time.elapsed(), tries)
+	if !continue_exponential_backoff(range.start, range.end, time.elapsed(), tries) {
+		return false;
+	}
+
+	true
 }
 
 #[implement(Service)]
+#[tracing::instrument(
+	name = "exists",
+	level = "trace",
+	ret(level = "trace"),
+	skip_all,
+	fields(%event_id)
+)]
 async fn event_exists(&self, event_id: &EventId) -> bool {
 	self.services.timeline.pdu_exists(event_id).await
 }
 
 #[implement(Service)]
+#[tracing::instrument(
+	name = "fetch",
+	level = "trace",
+	skip_all,
+	fields(%event_id)
+)]
 async fn event_fetch(&self, event_id: &EventId) -> Result<PduEvent> {
 	self.services.timeline.get_pdu(event_id).await
 }

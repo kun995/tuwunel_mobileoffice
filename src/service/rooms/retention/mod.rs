@@ -59,7 +59,7 @@ impl crate::Service for Service {
 			}
 
 			tokio::select! {
-				() = tokio::time::sleep(Duration::from_secs(60 * 60)) => {},
+				() = tokio::time::sleep(Duration::from_hours(1)) => {},
 				() = self.services.server.until_shutdown() => return Ok(())
 			};
 		}

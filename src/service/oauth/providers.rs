@@ -69,11 +69,11 @@ pub fn get_config(&self, id: &str) -> Result<Provider> {
 
 	if let Some(provider) = providers
 		.values()
-		.find(|config| config.brand == id.to_lowercase())
+		.find(|config| config.brand.eq_ignore_ascii_case(id))
 		.filter(|_| {
 			providers
 				.values()
-				.filter(|config| config.brand == id.to_lowercase())
+				.filter(|config| config.brand.eq_ignore_ascii_case(id))
 				.count()
 				.eq(&1)
 		})
@@ -97,11 +97,11 @@ async fn get_cached(&self, id: &str) -> Option<Provider> {
 
 	providers
 		.values()
-		.find(|provider| provider.brand == id.to_lowercase())
+		.find(|provider| provider.brand.eq_ignore_ascii_case(id))
 		.filter(|_| {
 			providers
 				.values()
-				.filter(|provider| provider.brand == id.to_lowercase())
+				.filter(|provider| provider.brand.eq_ignore_ascii_case(id))
 				.count()
 				.eq(&1)
 		})
@@ -136,7 +136,7 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 
 	if provider.base_path.is_none() {
 		provider.base_path = match provider.brand.as_str() {
-			| "github" => Some("/login/oauth".to_owned()),
+			| "github" => Some("login/oauth/".to_owned()),
 			| _ => None,
 		};
 	}
@@ -157,7 +157,7 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 			.and_then(JsonValue::as_str)
 			.map(Url::parse)
 			.transpose()?
-			.or_else(|| make_url(&provider, "/authorize").ok())
+			.or_else(|| make_url(&provider, "authorize").ok())
 			.map(|url| provider.authorization_url.replace(url));
 	}
 
@@ -167,7 +167,7 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 			.and_then(JsonValue::as_str)
 			.map(Url::parse)
 			.transpose()?
-			.or_else(|| make_url(&provider, "/revocation").ok())
+			.or_else(|| make_url(&provider, "revocation").ok())
 			.map(|url| provider.revocation_url.replace(url));
 	}
 
@@ -177,7 +177,7 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 			.and_then(JsonValue::as_str)
 			.map(Url::parse)
 			.transpose()?
-			.or_else(|| make_url(&provider, "/introspection").ok())
+			.or_else(|| make_url(&provider, "introspection").ok())
 			.map(|url| provider.introspection_url.replace(url));
 	}
 
@@ -189,7 +189,7 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 			.transpose()?
 			.or_else(|| match provider.brand.as_str() {
 				| "github" => "https://api.github.com/user".try_into().ok(),
-				| _ => make_url(&provider, "/userinfo").ok(),
+				| _ => make_url(&provider, "userinfo").ok(),
 			})
 			.map(|url| provider.userinfo_url.replace(url));
 	}
@@ -202,14 +202,23 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 			.transpose()?
 			.or_else(|| {
 				let path = if provider.brand == "github" {
-					"/access_token"
+					"access_token"
 				} else {
-					"/token"
+					"token"
 				};
 
 				make_url(&provider, path).ok()
 			})
 			.map(|url| provider.token_url.replace(url));
+	}
+
+	if provider.callback_url.is_none()
+		&& let Some(server_url) = self.services.config.well_known.client.as_ref()
+	{
+		let callback_path =
+			format!("_matrix/client/unstable/login/sso/callback/{}", provider.client_id);
+
+		provider.callback_url = Some(server_url.join(&callback_path)?);
 	}
 
 	Ok(provider)
@@ -237,7 +246,7 @@ pub async fn discover(&self, provider: &Provider) -> Result<JsonValue> {
 fn discovery_url(provider: &Provider) -> Result<Url> {
 	let default_url = provider
 		.discovery
-		.then(|| make_url(provider, "/.well-known/openid-configuration"))
+		.then(|| make_url(provider, ".well-known/openid-configuration"))
 		.transpose()?;
 
 	let Some(url) = provider
@@ -288,14 +297,17 @@ fn make_url(provider: &Provider, path: &str) -> Result<Url> {
 	let mut suffix = provider.base_path.clone().unwrap_or_default();
 
 	suffix.push_str(path);
-	let url = provider
-		.issuer_url
-		.as_ref()
-		.ok_or_else(|| {
-			let id = &provider.client_id;
-			err!(Config("issuer_url", "Provider {id:?} required field"))
-		})?
-		.join(&suffix)?;
+	let issuer = provider.issuer_url.as_ref().ok_or_else(|| {
+		let id = &provider.client_id;
+		err!(Config("issuer_url", "Provider {id:?} required field"))
+	})?;
+	let issuer_path = issuer.path();
 
-	Ok(url)
+	if issuer_path.ends_with('/') {
+		Ok(issuer.join(suffix.as_str())?)
+	} else {
+		let mut url = issuer.to_owned();
+		url.set_path((issuer_path.to_owned() + "/").as_str());
+		Ok(url.join(&suffix)?)
+	}
 }

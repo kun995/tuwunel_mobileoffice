@@ -51,7 +51,7 @@ This is just a summary for the impatient. See the full
 [documentation](https://matrix-construct.github.io/tuwunel/).
 
 > [!TIP]
-> Avoid using a sub-domain for your `server_name`. You can always delegate later with a [`.well-known`](https://github.com/spantaleev/matrix-docker-ansible-deploy/blob/master/docs/configuring-well-known.md)
+> Avoid using a sub-domain for your `server_name`. You can always delegate later with a [`.well-known`](https://matrix-construct.github.io/tuwunel/deploying/root-domain-delegation.html)
 > file, but you can never change your `server_name`.
 
 **2.** Setup TLS certificates. Most users enjoy the [Caddy](https://caddyserver.com/) reverse-proxy

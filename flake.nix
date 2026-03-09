@@ -45,7 +45,7 @@
           file = ./rust-toolchain.toml;
 
           # See also `rust-toolchain.toml`
-          sha256 = "sha256-SDu4snEWjuZU475PERvu+iO50Mi39KVjqCeJeNvpguU=";
+          sha256 = "sha256-qqF33vNuAdU5vua96VKVIwuc43j4EFeEXbjQ6+l4mO4=";
         };
 
         mkScope =

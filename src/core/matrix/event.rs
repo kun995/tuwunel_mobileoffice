@@ -11,8 +11,8 @@ mod unsigned;
 use std::fmt::Debug;
 
 use ruma::{
-	CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, RoomId,
-	RoomVersionId, UserId, events::TimelineEventType,
+	CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, RoomId, UserId,
+	events::TimelineEventType, room_version_rules::RoomVersionRules,
 };
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, value::RawValue as RawJsonValue};
@@ -107,11 +107,11 @@ pub trait Event: Clone + Debug + Send + Sync {
 	}
 
 	#[inline]
-	fn redacts_id(&self, room_version: &RoomVersionId) -> Option<OwnedEventId>
+	fn redacts_id(&self, room_rules: &RoomVersionRules) -> Option<OwnedEventId>
 	where
 		Self: Sized,
 	{
-		redact::redacts_id(self, room_version)
+		redact::redacts_id(self, room_rules)
 	}
 
 	#[inline]

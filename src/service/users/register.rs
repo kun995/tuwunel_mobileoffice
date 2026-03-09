@@ -2,15 +2,13 @@ use futures::FutureExt;
 use ruma::{UserId, events::GlobalAccountDataEventType, push};
 use tuwunel_core::{Err, Result, error, implement, info, is_equal_to, warn};
 
-use crate::appservice::RegistrationInfo;
-
 #[derive(Debug, Default)]
 pub struct Register<'a> {
 	pub user_id: Option<&'a UserId>,
 	pub username: Option<&'a str>,
 	pub password: Option<&'a str>,
 	pub origin: Option<&'a str>,
-	pub appservice_info: Option<&'a RegistrationInfo>,
+	pub is_appservice: bool,
 	pub is_guest: bool,
 	pub grant_first_user_admin: bool,
 	pub displayname: Option<&'a str>,
@@ -29,7 +27,7 @@ pub async fn full_register(
 		user_id,
 		password,
 		origin,
-		appservice_info,
+		is_appservice,
 		is_guest,
 		grant_first_user_admin,
 		displayname,
@@ -100,6 +98,7 @@ pub async fn full_register(
 	// users
 	// Note: the server user is generated first
 	if !is_guest
+		&& !is_appservice
 		&& grant_first_user_admin
 		&& self.services.config.grant_admin_to_first_user
 		&& let Ok(admin_room) = self.services.admin.get_admin_room().await
@@ -118,9 +117,7 @@ pub async fn full_register(
 		warn!("Granting {user_id} admin privileges as the first user");
 	}
 
-	if appservice_info.is_none()
-		&& (self.services.config.allow_guests_auto_join_rooms || !is_guest)
-	{
+	if !is_appservice && (self.services.config.allow_guests_auto_join_rooms || !is_guest) {
 		for room in &self.services.server.config.auto_join_rooms {
 			let Ok(room_id) = self.services.alias.maybe_resolve(room).await else {
 				error!(

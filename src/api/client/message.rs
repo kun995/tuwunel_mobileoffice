@@ -54,7 +54,7 @@ const IGNORED_MESSAGE_TYPES: &[TimelineEventType] = &[
 	CallNotify,
 ];
 
-const LIMIT_MAX: usize = 100;
+const LIMIT_MAX: usize = 1000;
 const LIMIT_DEFAULT: usize = 10;
 
 /// # `GET /_matrix/client/r0/rooms/{roomId}/messages`
@@ -67,7 +67,6 @@ pub(crate) async fn get_message_events_route(
 	State(services): State<crate::State>,
 	body: Ruma<get_message_events::v3::Request>,
 ) -> Result<get_message_events::v3::Response> {
-	debug_assert!(IGNORED_MESSAGE_TYPES.is_sorted(), "IGNORED_MESSAGE_TYPES is not sorted");
 	let sender_user = body.sender_user();
 	let sender_device = body.sender_device.as_deref();
 	let room_id = &body.room_id;
@@ -122,8 +121,7 @@ pub(crate) async fn get_message_events_route(
 	let events: Vec<_> = it
 		.ready_take_while(|(count, _)| Some(*count) != to)
 		.ready_filter_map(|item| event_filter(item, filter))
-		.wide_filter_map(|item| ignored_filter(&services, item, sender_user))
-		.wide_filter_map(|item| visibility_filter(&services, item, sender_user))
+		.wide_filter_map(|item| event_filters(&services, sender_user, item))
 		.take(limit)
 		.collect()
 		.await;
@@ -228,6 +226,17 @@ async fn get_member_event(
 		.ok()
 }
 
+async fn event_filters(
+	services: &Services,
+	user_id: &UserId,
+	item: PdusIterItem,
+) -> Option<PdusIterItem> {
+	let item = ignored_filter(services, item, user_id).await?;
+	let item = visibility_filter(services, item, user_id).await?;
+
+	Some(item)
+}
+
 #[inline]
 pub(crate) async fn ignored_filter(
 	services: &Services,
@@ -238,7 +247,7 @@ pub(crate) async fn ignored_filter(
 
 	is_ignored_pdu(services, pdu, user_id)
 		.await
-		.eq(&false)
+		.is_false()
 		.then_some(item)
 }
 

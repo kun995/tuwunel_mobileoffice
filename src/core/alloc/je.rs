@@ -26,15 +26,16 @@ use crate::{
 #[cfg(feature = "jemalloc_conf")]
 #[unsafe(no_mangle)]
 pub static malloc_conf: &[u8] = const_str::concat_bytes!(
-	"lg_extent_max_active_fit:4",
-	",oversize_threshold:16777216",
-	",tcache_max:2097152",
-	",dirty_decay_ms:16000",
-	",muzzy_decay_ms:144000",
+	"tcache:true",
 	",percpu_arena:percpu",
 	",metadata_thp:always",
 	",background_thread:true",
 	",max_background_threads:-1",
+	",lg_extent_max_active_fit:4",
+	",oversize_threshold:2097152",
+	",tcache_max:524288",
+	",dirty_decay_ms:16000",
+	",muzzy_decay_ms:144000",
 	//MALLOC_CONF_PROF,
 	0
 );
@@ -303,12 +304,22 @@ pub fn stats_reset() -> Result { notify(&mallctl!("stats.mutexes.reset")) }
 
 pub fn prof_reset() -> Result { notify(&mallctl!("prof.reset")) }
 
+pub fn prof_dump() -> Result { notify(&mallctl!("prof.dump")) }
+
+pub fn prof_gdump(enable: bool) -> Result<bool> {
+	set::<u8>(&mallctl!("prof.gdump"), enable.into()).map(is_nonzero!())
+}
+
 pub fn prof_enable(enable: bool) -> Result<bool> {
 	set::<u8>(&mallctl!("prof.active"), enable.into()).map(is_nonzero!())
 }
 
 pub fn is_prof_enabled() -> Result<bool> {
 	get::<u8>(&mallctl!("prof.active")).map(is_nonzero!())
+}
+
+pub fn prof_interval() -> Result<u64> {
+	get::<u64>(&mallctl!("prof.interval")).and_then(math::try_into)
 }
 
 pub fn trim<I: Into<Option<usize>> + Copy>(arena: I) -> Result {

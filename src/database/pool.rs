@@ -320,7 +320,7 @@ fn worker_loop(self: &Arc<Self>, recv: &Receiver<Cmd>) {
 	fields(
 		receivers = recv.receiver_count(),
 		queued = recv.len(),
-		busy = self.busy.fetch_sub(1, Ordering::Relaxed) - 1,
+		busy = self.busy.fetch_sub(1, Ordering::AcqRel) - 1,
 	),
 )]
 fn worker_wait(self: &Arc<Self>, recv: &Receiver<Cmd>) -> Result<Cmd, RecvError> {

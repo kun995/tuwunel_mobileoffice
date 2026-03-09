@@ -2,6 +2,7 @@ pub mod check;
 pub mod manager;
 pub mod media_storage;
 pub mod proxy;
+pub mod room_version;
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
@@ -32,11 +33,10 @@ pub use self::media_storage::{
 pub use self::{check::check, manager::Manager};
 use crate::{
 	Err, Result, err,
-	utils::{self, option::OptionExt, string::EMPTY, sys},
+	utils::{self, string::EMPTY, sys},
 };
 
 /// All the config options for tuwunel.
-#[expect(clippy::struct_excessive_bools)]
 #[expect(rustdoc::broken_intra_doc_links, rustdoc::bare_urls)]
 #[derive(Clone, Debug, Deserialize)]
 #[config_example_generator(
@@ -110,8 +110,8 @@ pub struct Config {
 	/// "::1"]
 	///
 	/// default: ["127.0.0.1", "::1"]
-	#[serde(default = "default_address")]
-	address: ListeningAddr,
+	#[serde(default)]
+	address: Option<ListeningAddr>,
 
 	/// The port(s) tuwunel will listen on.
 	///
@@ -132,9 +132,6 @@ pub struct Config {
 	pub tls: TlsConfig,
 
 	/// The UNIX socket tuwunel will listen on.
-	///
-	/// tuwunel cannot listen on both an IP address and a UNIX socket. If
-	/// listening on a UNIX socket, you MUST remove/comment the `address` key.
 	///
 	/// Remember to make sure that your reverse proxy has access to this socket
 	/// file, either by adding your reverse proxy to the 'tuwunel' group or
@@ -537,7 +534,7 @@ pub struct Config {
 
 	/// Maximum time to process a request received from a client (seconds).
 	///
-	/// default: 180
+	/// default: 240
 	#[serde(default = "default_client_request_timeout")]
 	pub client_request_timeout: u64,
 
@@ -609,7 +606,10 @@ pub struct Config {
 	/// - "all": All created rooms are encrypted.
 	/// - "invite": Any room created with `private_chat` or
 	///   `trusted_private_chat` presets.
+	/// - "none": Explicit value for no effect.
 	/// - Other values default to no effect.
+	///
+	/// default: "none"
 	#[serde(default)]
 	pub encryption_enabled_by_default_for_room_type: Option<String>,
 
@@ -903,9 +903,16 @@ pub struct Config {
 
 	/// Maximum number of keys to request in each trusted server batch query.
 	///
-	/// default: 1024
+	/// default: 192
 	#[serde(default = "default_trusted_server_batch_size")]
 	pub trusted_server_batch_size: usize,
+
+	/// Maximum number of request batches in flight simultaneously when querying
+	/// a trusted server.
+	///
+	/// default: 2
+	#[serde(default = "default_trusted_server_batch_concurrency")]
+	pub trusted_server_batch_concurrency: usize,
 
 	/// Max log level for tuwunel. Allows debug, info, warn, or error.
 	///
@@ -1010,6 +1017,16 @@ pub struct Config {
 	#[serde(default = "true_fn")]
 	pub login_via_token: bool,
 
+	/// Whether to enable login using traditional user/password authorization
+	/// flow.
+	///
+	/// Set this option to false if you intend to allow logging in only using
+	/// other mechanisms, such as SSO.
+	///
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub login_with_password: bool,
+
 	/// Login token expiration/TTL in milliseconds.
 	///
 	/// These are short-lived tokens for the m.login.token endpoint.
@@ -1087,8 +1104,8 @@ pub struct Config {
 	/// registered users join. The rooms specified must be rooms that you have
 	/// joined at least once on the server, and must be public.
 	///
-	/// example: ["#tuwunel:tuwunel.chat",
-	/// "!eoIzvAvVwY23LPDay8:tuwunel.chat"]
+	/// example: ["#tuwunel:grin.hu",
+	/// "!l2xV0sd51lraysuRcsWVECge4NULaH3g-ou95vgDgiM"]
 	///
 	/// default: []
 	#[serde(default = "Vec::new")]
@@ -1382,6 +1399,20 @@ pub struct Config {
 	/// default: false
 	#[serde(default)]
 	pub rocksdb_never_drop_columns: bool,
+
+	/// Configures RocksDB to not preallocate WAL logs.
+	///
+	/// Normally, RocksDB allocates certain types of files by calling
+	/// fallocate, writing the file contents, then truncating the logs to the
+	/// proper size. This causes pathological disk space usage on btrfs due
+	/// how it interacts with its Copy-on-Write implementation.
+	///
+	/// It is recommended to set this to false if you run the server on btrfs,
+	/// and not touch it otherwise.
+	///
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub rocksdb_allow_fallocate: bool,
 
 	/// This is a password that can be configured that will let you login to the
 	/// server bot account (currently `@conduit`) for emergency troubleshooting
@@ -2062,6 +2093,12 @@ pub struct Config {
 	#[serde(default = "true_fn")]
 	pub allow_room_admins_to_request_unredacted_events: bool,
 
+	/// Prevents local users from sending redactions.
+	///
+	/// This check does not apply to server admins.
+	#[serde(default)]
+	pub disable_local_redactions: bool,
+
 	/// Enable database pool affinity support. On supporting systems, block
 	/// device queue topologies are detected and the request pool is optimized
 	/// for the hardware; db_pool_workers is determined automatically.
@@ -2365,13 +2402,25 @@ pub struct WellKnownConfig {
 	/// example "@admin:example.com"
 	pub support_mxid: Option<OwnedUserId>,
 
-	/// Element Call / MatrixRTC configuration (MSC4143).
-	/// Configures the LiveKit SFU server for voice/video calls.
-	///
-	/// Requires a LiveKit server with JWT authentication.
-	/// The `livekit_service_url` should point to your LiveKit JWT endpoint.
+	/// LiveKit JWT endpoint.
+	/// Required for Element Call / MatrixRTC (MSC4143).
 	///
 	/// Note: You must also set `client` above to your homeserver URL.
+	///
+	/// default: ""
+	#[serde(default)]
+	pub livekit_url: Option<String>,
+
+	/// Custom MatrixRTC transports.
+	///
+	/// If you're looking to setup Element Call / MatrixRTC with Livekit,
+	/// you should not use this option and instead set `livekit_url`.
+	/// This is only required if you want to configure a non-livekit MatrixRTC
+	/// transport. There are no known client implementations that support any
+	/// other transport types.
+	///
+	/// This option was previously the only way to configure a Livekit
+	/// transport. It has been superseded by `livekit_url`.
 	///
 	/// Example:
 	/// ```toml
@@ -2729,18 +2778,78 @@ pub struct IdentityProvider {
 	/// compute a Matrix UserId for new registrations. Reviewing Tuwunel's
 	/// documentation will be necessary for a complete description in detail. An
 	/// empty array imposes no restriction here, avoiding generated fallbacks as
-	/// much as possible. For simplicity we reserve a claim called "unique"
-	/// which can be listed alone to ensure *only* generated ID's are used for
-	/// registrations.
+	/// much as possible.
+	///
+	/// For simplicity we reserve a claim called "unique" which can be listed
+	/// alone to ensure *only* generated ID's are used for registrations.
+	///
+	/// Note that listing the claim "sub" has special significance and will take
+	/// precedence over all other claims, listed or unlisted. "sub" is not
+	/// normally used to determine a UserId unless explicitly listed here.
+	///
+	/// As of now arbitrary claims cannot be listed here, we only recognize
+	/// specific hard-coded claims.
 	///
 	/// default: []
 	#[serde(default)]
 	pub userid_claims: BTreeSet<String>,
 
+	/// Trusted providers can cause username conflicts (i.e. account hijacking)
+	/// but this is precisely how an existing matrix account can be associated
+	/// with a provider. When this option is set to true, the way we compute a
+	/// Matrix UserId from userinfo claims is inverted: we find the first
+	/// matching user and grant access to it. Whereas by default, when set to
+	/// false, we skip matching users and register the first available username;
+	/// falling-back to random characters to avoid conflicts.
+	///
+	/// Only set this option to true for providers you self-host and control.
+	/// Never set this option to true for the public providers such as GitHub,
+	/// GitLab, etc.
+	///
+	/// Note that associating an existing user with an untrusted provider is
+	/// still possible but only with the command '!admin query oauth associate'.
+	///
+	/// default: false
+	#[serde(default)]
+	pub trusted: bool,
+
+	/// Setting this option to false will inhibit unique ID's from being
+	/// generated as a last-resort when determining a UserId from a provider's
+	/// claims. In the case of untrusted providers, when all provided claims
+	/// conflict with existing user accounts, a unique fallback ID needs
+	/// to be generated for registration to not be denied with an error.
+	///
+	/// Set this option to false if you operate a private server or a trusted
+	/// identity provider where random UserId's are undesirable; the result of a
+	/// misconfiguration or other issue where an error is warranted.
+	///
+	/// This option should be set to true for public servers or some users may
+	/// never be able to register.
+	///
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub unique_id_fallbacks: bool,
+
+	/// Controls whether new user registration is possible from this provider.
+	/// When this option is set to false, authorizations from this provider
+	/// only affect existing users and will never result in a new registration
+	/// when the claims fail to match any existing user (in the case of trusted
+	/// providers) or an available username is found (in the case of untrusted
+	/// providers).
+	///
+	/// Setting this option to false is generally not useful unless there is
+	/// an explicit reason to do so.
+	///
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub registration: bool,
+
 	/// Optional extra path components after the issuer_url leading to the
-	/// location of the `.well-known` directory used for discovery. This will be
-	/// empty for specification-compliant providers. We have supplied any known
-	/// values based on `brand` (e.g. `/login/oauth` for GitHub).
+	/// location of the `.well-known` directory used for discovery. If the path
+	/// starts with a slash it will be treated as absolute, meaning overwriting
+	/// any path in the issuer_url. The path needs to end with a slash. This
+	/// will be empty for specification-compliant providers. We have supplied
+	/// any known values based on `brand` (e.g. `login/oauth/` for GitHub).
 	pub base_path: Option<String>,
 
 	/// Overrides the `.well-known` location where the provider's openid
@@ -2781,6 +2890,15 @@ pub struct IdentityProvider {
 	/// default: 300
 	#[serde(default = "default_sso_grant_session_duration")]
 	pub grant_session_duration: Option<u64>,
+
+	/// Whether to check the redirect cookie during the callback. This is a
+	/// security feature and should remain enabled. This is available for
+	/// developers or deployments which cannot tolerate cookies and are willing
+	/// to tolerate the risks.
+	///
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub check_cookie: bool,
 }
 
 impl IdentityProvider {
@@ -2792,12 +2910,13 @@ impl IdentityProvider {
 			return Ok(client_secret.clone());
 		}
 
-		self.client_secret_file
-			.as_ref()
-			.map_async(tokio::fs::read_to_string)
-			.await
-			.transpose()?
-			.ok_or_else(|| err!("No client secret or client secret file configured"))
+		let Some(client_secret_file) = &self.client_secret_file else {
+			return Err!("No client secret or client secret file configured");
+		};
+
+		let client_secret = tokio::fs::read_to_string(client_secret_file).await?;
+
+		Ok(client_secret.trim().to_owned())
 	}
 }
 
@@ -3048,10 +3167,16 @@ impl Config {
 			.extract::<Self>()
 			.map_err(|e| err!("There was a problem with your configuration file: {e}"))?;
 
-		// don't start if we're listening on both UNIX sockets and TCP at same time
-		check::is_dual_listening(raw_config)?;
-
 		Ok(config)
+	}
+
+	pub fn get_unix_socket_perms(&self) -> Result<u32> {
+		let octal_perms = self.unix_socket_perms.to_string();
+		let socket_perms = u32::from_str_radix(&octal_perms, 8).map_err(|_| {
+			err!(Config("unix_socket_perms", "failed to convert octal permissions"))
+		})?;
+
+		Ok(socket_perms)
 	}
 
 	#[must_use]
@@ -3059,7 +3184,7 @@ impl Config {
 		let mut addrs = Vec::with_capacity(
 			self.get_bind_hosts()
 				.len()
-				.saturating_add(self.get_bind_ports().len()),
+				.saturating_mul(self.get_bind_ports().len()),
 		);
 		for host in &self.get_bind_hosts() {
 			for port in &self.get_bind_ports() {
@@ -3071,9 +3196,15 @@ impl Config {
 	}
 
 	fn get_bind_hosts(&self) -> Vec<IpAddr> {
-		match &self.address.addrs {
-			| Left(addr) => vec![*addr],
-			| Right(addrs) => addrs.clone(),
+		if let Some(address) = &self.address {
+			match &address.addrs {
+				| Left(addr) => vec![*addr],
+				| Right(addrs) => addrs.clone(),
+			}
+		} else if self.unix_socket_path.is_some() {
+			vec![]
+		} else {
+			vec![Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()]
 		}
 	}
 
@@ -3093,12 +3224,6 @@ fn true_fn() -> bool { true }
 fn default_server_name() -> OwnedServerName { ruma::owned_server_name!("localhost") }
 
 fn default_database_path() -> PathBuf { "/var/lib/tuwunel".to_owned().into() }
-
-fn default_address() -> ListeningAddr {
-	ListeningAddr {
-		addrs: Right(vec![Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()]),
-	}
-}
 
 fn default_port() -> ListeningPort { ListeningPort { ports: Left(8008) } }
 
@@ -3353,7 +3478,9 @@ fn parallelism_scaled_u32(val: u32) -> u32 {
 
 fn parallelism_scaled(val: usize) -> usize { val.saturating_mul(sys::available_parallelism()) }
 
-fn default_trusted_server_batch_size() -> usize { 256 }
+fn default_trusted_server_batch_size() -> usize { 192 }
+
+fn default_trusted_server_batch_concurrency() -> usize { 2 }
 
 fn default_db_pool_workers() -> usize {
 	sys::available_parallelism()
@@ -3375,7 +3502,7 @@ fn default_stream_amplification() -> usize { 1024 }
 
 fn default_client_receive_timeout() -> u64 { 75 }
 
-fn default_client_request_timeout() -> u64 { 180 }
+fn default_client_request_timeout() -> u64 { 240 }
 
 fn default_client_response_timeout() -> u64 { 120 }
 

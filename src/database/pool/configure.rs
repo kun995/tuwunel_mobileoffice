@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use tuwunel_core::{
-	Server, debug,
+	Server, at, debug,
 	debug::INFO_SPAN_LEVEL,
 	debug_info, debug_warn, expected, info, is_equal_to,
 	utils::{
@@ -12,7 +12,7 @@ use tuwunel_core::{
 		stream::{AMPLIFICATION_LIMIT, WIDTH_LIMIT},
 		sys::{
 			compute::{available_parallelism, cores_available, is_core_available},
-			storage,
+			max_threads, storage,
 		},
 	},
 };
@@ -116,6 +116,13 @@ pub(super) fn configure(server: &Arc<Server>) -> (Vec<usize>, Vec<usize>, Vec<us
 		})
 		.collect();
 
+	// Query getrlimit(2) to impose any additional restriction, divide to leave room
+	// for other threads in the process.
+	let max_threads = max_threads()
+		.map(at!(0))
+		.unwrap_or(usize::MAX)
+		.saturating_div(3);
+
 	// Determine an ideal max worker count based on true capacity. As stated prior
 	// the true value is rarely attainable in any thread-worker model, and clamped.
 	let max_workers = devices
@@ -126,6 +133,7 @@ pub(super) fn configure(server: &Arc<Server>) -> (Vec<usize>, Vec<usize>, Vec<us
 		.chain(default_worker_count.into_iter())
 		.fold(0_usize, usize::saturating_add)
 		.min(config.db_pool_max_workers)
+		.clamp(WORKER_LIMIT.0, max_threads)
 		.clamp(WORKER_LIMIT.0, WORKER_LIMIT.1);
 
 	// Tamper for the total number of workers by reducing the count for each group.

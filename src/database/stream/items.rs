@@ -24,10 +24,16 @@ impl<'a> Cursor<'a, KeyVal<'a>> for Items<'a> {
 	fn state(&self) -> &State<'a> { &self.state }
 
 	#[inline]
-	fn fetch(&self) -> Option<KeyVal<'a>> { self.state.fetch().map(keyval_longevity) }
+	fn state_mut(&mut self) -> &mut State<'a> { &mut self.state }
 
 	#[inline]
-	fn seek(&mut self) { self.state.seek_fwd(); }
+	fn count(&self) -> (usize, Option<usize>) { self.state().count_fwd() }
+
+	#[inline]
+	fn fetch(&self) -> Option<KeyVal<'a>> { self.state().fetch().map(keyval_longevity) }
+
+	#[inline]
+	fn seek(&mut self) { self.state_mut().seek_fwd(); }
 }
 
 impl<'a> Stream for Items<'a> {
@@ -36,9 +42,11 @@ impl<'a> Stream for Items<'a> {
 	fn poll_next(mut self: Pin<&mut Self>, _ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
 		Poll::Ready(self.seek_and_get())
 	}
+
+	fn size_hint(&self) -> (usize, Option<usize>) { self.count() }
 }
 
 impl FusedStream for Items<'_> {
 	#[inline]
-	fn is_terminated(&self) -> bool { !self.state.init && !self.state.valid() }
+	fn is_terminated(&self) -> bool { !self.state().init && !self.state().valid() }
 }

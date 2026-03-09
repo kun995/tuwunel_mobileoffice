@@ -1,6 +1,5 @@
-#![type_length_limit = "262144"] //TODO: REDUCE ME
 #![expect(clippy::toplevel_ref_arg)]
-#![expect(clippy::duration_suboptimal_units)] // remove after MSRV 1.91
+#![allow(unused_features)] // 1.96.0-nightly 2026-03-07 bug
 
 pub mod client;
 pub mod router;

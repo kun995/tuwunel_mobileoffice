@@ -14,22 +14,29 @@ pub use tokio::runtime::{Handle, Runtime};
 use tuwunel_core::result::LogDebugErr;
 use tuwunel_core::{
 	Result, debug, is_true,
-	utils::sys::compute::{nth_core_available, set_affinity},
+	utils::sys::{
+		compute::{nth_core_available, set_affinity},
+		max_threads,
+	},
 };
 
 use crate::{Args, Server};
 
-const WORKER_NAME: &str = "tuwunel:worker";
-const WORKER_MIN: usize = 2;
-const WORKER_KEEPALIVE: u64 = 36;
-const MAX_BLOCKING_THREADS: usize = 1024;
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(10000);
+const WORKER_THREAD_NAME: &str = "tuwunel:worker";
+const WORKER_THREAD_MIN: usize = 2;
+const BLOCKING_THREAD_KEEPALIVE: u64 = 36;
+const BLOCKING_THREAD_NAME: &str = "tuwunel:spawned";
+const BLOCKING_THREAD_MAX: usize = 1024;
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
-const DISABLE_MUZZY_THRESHOLD: usize = 4;
+const DISABLE_MUZZY_THRESHOLD: usize = 8;
 
 static WORKER_AFFINITY: OnceLock<bool> = OnceLock::new();
 static GC_ON_PARK: OnceLock<Option<bool>> = OnceLock::new();
 static GC_MUZZY: OnceLock<Option<bool>> = OnceLock::new();
+
+static CORES_OCCUPIED: AtomicUsize = AtomicUsize::new(0);
+static THREAD_SPAWNS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn new(args: Option<&Args>) -> Result<Runtime> {
 	let args_default = args.is_none().then(Args::default);
@@ -47,14 +54,20 @@ pub fn new(args: Option<&Args>) -> Result<Runtime> {
 		.set(args.gc_muzzy)
 		.expect("set GC_MUZZY from program argument");
 
+	let max_blocking_threads = max_threads()
+		.expect("obtained RLIMIT_NPROC or default")
+		.0
+		.saturating_div(3)
+		.clamp(WORKER_THREAD_MIN, BLOCKING_THREAD_MAX);
+
 	let mut builder = Builder::new_multi_thread();
 	builder
 		.enable_io()
 		.enable_time()
-		.thread_name(WORKER_NAME)
-		.worker_threads(args.worker_threads.max(WORKER_MIN))
-		.max_blocking_threads(MAX_BLOCKING_THREADS)
-		.thread_keep_alive(Duration::from_secs(WORKER_KEEPALIVE))
+		.thread_name_fn(thread_name)
+		.worker_threads(args.worker_threads.max(WORKER_THREAD_MIN))
+		.max_blocking_threads(max_blocking_threads)
+		.thread_keep_alive(Duration::from_secs(BLOCKING_THREAD_KEEPALIVE))
 		.global_queue_interval(args.global_event_interval)
 		.event_interval(args.kernel_event_interval)
 		.max_io_events_per_tick(args.kernel_events_per_tick)
@@ -95,20 +108,22 @@ pub fn shutdown(server: &Arc<Server>, runtime: Runtime) -> Result {
 
 	// The final metrics output is promoted to INFO when tokio_unstable is active in
 	// a release/bench mode and DEBUG is likely optimized out
-	const LEVEL: Level = if cfg!(debug_assertions) {
+	const LEVEL: Level = if cfg!(not(any(tokio_unstable, feature = "release_max_log_level"))) {
 		Level::DEBUG
 	} else {
 		Level::INFO
 	};
 
 	wait_shutdown(server, runtime);
-	let runtime_metrics = server
-		.server
-		.metrics
-		.runtime_interval()
-		.unwrap_or_default();
 
-	tuwunel_core::event!(LEVEL, ?runtime_metrics, "Final runtime metrics");
+	if let Some(runtime_metrics) = server.server.metrics.runtime_interval() {
+		tuwunel_core::event!(LEVEL, ?runtime_metrics, "Final runtime metrics.");
+	}
+
+	if let Ok(resource_usage) = tuwunel_core::utils::sys::usage() {
+		tuwunel_core::event!(LEVEL, ?resource_usage, "Final resource usage.");
+	}
+
 	Ok(())
 }
 
@@ -121,11 +136,11 @@ pub fn shutdown(server: &Arc<Server>, runtime: Runtime) -> Result {
 
 fn wait_shutdown(_server: &Arc<Server>, runtime: Runtime) {
 	debug!(
-		timeout = ?SHUTDOWN_TIMEOUT,
+		timeout = ?RUNTIME_SHUTDOWN_TIMEOUT,
 		"Waiting for runtime..."
 	);
 
-	runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+	runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 
 	// Join any jemalloc threads so they don't appear in use at exit.
 	#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
@@ -134,33 +149,45 @@ fn wait_shutdown(_server: &Arc<Server>, runtime: Runtime) {
 		.ok();
 }
 
+fn thread_name() -> String {
+	let handle = Handle::current();
+	let num_workers = handle.metrics().num_workers();
+	let i = THREAD_SPAWNS.load(Ordering::Acquire);
+
+	if i >= num_workers {
+		BLOCKING_THREAD_NAME.into()
+	} else {
+		WORKER_THREAD_NAME.into()
+	}
+}
+
 #[tracing::instrument(
 	name = "fork",
 	level = "debug",
 	skip_all,
 	fields(
-		id = ?thread::current().id(),
+		tid = ?thread::current().id(),
 		name = %thread::current().name().unwrap_or("None"),
 	),
 )]
 fn thread_start() {
-	debug_assert_eq!(
-		Some(WORKER_NAME),
-		thread::current().name(),
+	debug_assert!(
+		thread::current().name() == Some(WORKER_THREAD_NAME)
+			|| thread::current().name() == Some(BLOCKING_THREAD_NAME),
 		"tokio worker name mismatch at thread start"
 	);
 
 	if WORKER_AFFINITY.get().is_some_and(is_true!()) {
 		set_worker_affinity();
 	}
+
+	THREAD_SPAWNS.fetch_add(1, Ordering::AcqRel);
 }
 
 fn set_worker_affinity() {
-	static CORES_OCCUPIED: AtomicUsize = AtomicUsize::new(0);
-
 	let handle = Handle::current();
 	let num_workers = handle.metrics().num_workers();
-	let i = CORES_OCCUPIED.fetch_add(1, Ordering::Relaxed);
+	let i = CORES_OCCUPIED.fetch_add(1, Ordering::AcqRel);
 	if i >= num_workers {
 		return;
 	}
@@ -197,18 +224,24 @@ fn set_worker_mallctl(_: usize) {}
 	level = "debug",
 	skip_all,
 	fields(
-		id = ?thread::current().id(),
+		tid = ?thread::current().id(),
 		name = %thread::current().name().unwrap_or("None"),
 	),
 )]
-fn thread_stop() {}
+fn thread_stop() {
+	if cfg!(any(tokio_unstable, not(feature = "release_max_log_level")))
+		&& let Ok(resource_usage) = tuwunel_core::utils::sys::thread_usage()
+	{
+		tuwunel_core::debug!(?resource_usage, "Thread resource usage.");
+	}
+}
 
 #[tracing::instrument(
 	name = "work",
 	level = "trace",
 	skip_all,
 	fields(
-		id = ?thread::current().id(),
+		tid = ?thread::current().id(),
 		name = %thread::current().name().unwrap_or("None"),
 	),
 )]
@@ -219,7 +252,7 @@ fn thread_unpark() {}
 	level = "trace",
 	skip_all,
 	fields(
-		id = ?thread::current().id(),
+		tid = ?thread::current().id(),
 		name = %thread::current().name().unwrap_or("None"),
 	),
 )]
@@ -248,6 +281,7 @@ fn gc_on_park() {
 	skip_all,
 	fields(
 		id = %meta.id(),
+		tid = ?thread::current().id(),
 	),
 )]
 fn task_spawn(meta: &tokio::runtime::TaskMeta<'_>) {}
@@ -258,7 +292,8 @@ fn task_spawn(meta: &tokio::runtime::TaskMeta<'_>) {}
 	level = "trace",
 	skip_all,
 	fields(
-		id = %meta.id()
+		id = %meta.id(),
+		tid = ?thread::current().id()
 	),
 )]
 fn task_terminate(meta: &tokio::runtime::TaskMeta<'_>) {}
@@ -269,7 +304,8 @@ fn task_terminate(meta: &tokio::runtime::TaskMeta<'_>) {}
 	level = "trace",
 	skip_all,
 	fields(
-		id = %meta.id()
+		id = %meta.id(),
+		tid = ?thread::current().id()
 	),
 )]
 fn task_enter(meta: &tokio::runtime::TaskMeta<'_>) {}
@@ -280,7 +316,8 @@ fn task_enter(meta: &tokio::runtime::TaskMeta<'_>) {}
 	level = "trace",
 	skip_all,
 	fields(
-		id = %meta.id()
+		id = %meta.id(),
+		tid = ?thread::current().id()
 	),
 )]
 fn task_leave(meta: &tokio::runtime::TaskMeta<'_>) {}

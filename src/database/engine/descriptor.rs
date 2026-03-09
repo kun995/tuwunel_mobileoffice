@@ -169,6 +169,7 @@ pub(crate) static RANDOM_CACHE: Descriptor = Descriptor {
 pub(crate) static RANDOM_SMALL_CACHE: Descriptor = Descriptor {
 	compaction: CompactionStyle::Fifo,
 	cache_disp: CacheDisp::Unique,
+	compression: CompressionType::None,
 	limit_size: 1024 * 1024 * 64,
 	ttl: 60 * 60 * 24 * 14,
 	file_shape: 2,

@@ -25,6 +25,10 @@ pub(crate) struct State<'a> {
 pub(crate) trait Cursor<'a, T>: Send {
 	fn state(&self) -> &State<'a>;
 
+	fn state_mut(&mut self) -> &mut State<'a>;
+
+	fn count(&self) -> (usize, Option<usize>);
+
 	fn fetch(&self) -> Option<T>;
 
 	fn seek(&mut self);
@@ -111,9 +115,15 @@ impl<'a> State<'a> {
 		}
 	}
 
-	pub(super) fn is_incomplete(&self) -> bool {
-		matches!(self.status(), Some(e) if is_incomplete(&e))
-	}
+	#[inline]
+	#[expect(clippy::unused_self)]
+	#[tracing::instrument(level = "trace", skip_all, ret)]
+	pub(super) fn count_fwd(&self) -> (usize, Option<usize>) { (0, None) }
+
+	#[inline]
+	#[expect(clippy::unused_self)]
+	#[tracing::instrument(level = "trace", skip_all, ret)]
+	pub(super) fn count_rev(&self) -> (usize, Option<usize>) { (0, None) }
 
 	#[inline]
 	fn fetch_key(&self) -> Option<Key<'_>> { self.inner.key() }
@@ -123,6 +133,10 @@ impl<'a> State<'a> {
 
 	#[inline]
 	fn fetch(&self) -> Option<KeyVal<'_>> { self.inner.item() }
+
+	pub(super) fn is_incomplete(&self) -> bool {
+		matches!(self.status(), Some(e) if is_incomplete(&e))
+	}
 
 	#[inline]
 	pub(super) fn status(&self) -> Option<rocksdb::Error> { self.inner.status().err() }

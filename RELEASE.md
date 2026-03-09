@@ -1,87 +1,95 @@
-# Tuwunel 1.5.0
+# Tuwunel 1.5.1
 
-January 31, 2025
+March 6, 2026
+
+### Security Fixes
+
+- A security audit of SSO/OIDC released with 1.5.0 uncovered several issues. We strongly advise everyone using SSO/OIDC upgrade to this release. Users should also note that until MSC2454 is implemented (tracked by #314) accounts will have to set a password to access functionality protected by User Interactive Authentication (e.g. when removing devices). We are deeply grateful to @outfrost and @exodrifter for their effort and professionalism as security researchers.
+
+- Case-sensitive comparisons in Room Access Control Lists were fixed by @velikopter (ruma/ruma#2358) (matrix-construct/ruma#3) (814cbc2f3).
 
 ### New Features & Enhancements
 
-- SSO/OIDC support. This feature allows users to register and login via authorizations from OIDC Identity Providers. For example, you can now use your GitHub account to register on the server. Tuwunel implements the OIDC client protocol directly. This is referred to as "legacy SSO" in the Matrix specification; Matrix client support is widespread. Credit to @samip5 for opening the feature-issue (#7), the most 👍 feature of the project.
+- New options for `identity_provider` configurations include: `trusted` allowing association of SSO accounts to existing matrix users (#252); `unique_id_fallbacks` to disable random-string users; `registration` to prevent registration through an IdP altogether; `check_cookie` for deployments that cannot use cookies.
 
-- [MSC2815](https://github.com/matrix-org/matrix-spec-proposals/pull/2815) has been implemented, allowing configurable redacted event retention and retrieval by room admins. The content of redacted events is persisted for sixty days by default. Redacted events can be viewed using Gomuks.
+- Thanks to @Enginecrafter77 password authorization flows can now be disabled by configuring `login_with_password = false`. Clients will hide the input boxes for username and password. This option is useful for an e.g. SSO-only server. (#336)
 
-- Secure limited-use registration token support was implemented by @dasha-uwu building off earlier work by @gingershaped in (56f3f5ea154). Use this feature with the new `!admin token` set of commands.
+- Thanks to @Lymia users of btrfs will see reduced space usage if they configure the new option `rocksdb_allow_fallocate = false`. (#322) (PR also has links to more information)
 
-- An outstanding major rework of the presence system by @lhjt in (#264) coordinates conflicting updates from multiple devices and further builds on push suppression features first introduced by @tototomate123.
+- Instructions for how to configure the TURN server built into Livekit and several corrections were contributed by serial documentation author @winyadepla in (#285).
 
-- [MSC3706](https://github.com/matrix-org/matrix-spec-proposals/pull/3706) has been implemented, improving the performance and reliability of joining rooms over federation (b33e73672b).
+- Many users will appreciate substantial documentation by @alametti for configuring well-known and root domain delegation in (#352).
 
-- @VlaDexa implemented reading the `client_secret` configuration for an SSO Identity Provider from a separate file; a recommended secure practice (#256).
+- Thank you @the-hazelnut for updating TURN and Matrix RTC documentation with ports to be forwarded for NAT. (#305) (#306)
 
-- Special thanks to @winyadepla for adding highly sought Matrix RTC (Element Call) documentation for Tuwunel in (#265) and for having a kind heart to follow up with maintenance in (#270).
+- The `username` claim is now recognized when deciding the MXID during SSO account registration thanks to a suggestion by @aazf in (#287).
 
-- Thank you @Xerusion for documenting Traefik for deploying Tuwunel in (#259). This will save a lot of time and headache for many new users!
+- The max limit for `/messages` was increased from 100 to 1000 by @dasha-uwu which should match the limit on Synapse but with far less of a performance hazard.
 
-- At the request of @ChronosXYZ in (#260), @dasha-uwu implemented a configurable feature to include all local users in search results, rather than limiting to those in public or shared rooms (95121ad905fb).
+- @dasha-uwu properly optimized certain checked-math macros; other checked-math macros were also optimized for inlining.
 
-- Thanks to a collaboration by @x86pup and @VlaDexa working through Nix maintenance we can now upgrade the MSRV to 1.91.1 (#275).
+- Concurrent batch requests can now be made to a notary server. The default concurrency is now two, and the size of the batches have been decreased by a third. This should reduce the time it takes to join large rooms.
 
-- Thank you @scvalex for updating the README indicating Tuwunel is in stable NixOS (#233).
+- Optimization of functions which hurt performance for syncing user-presence were partially completed, though with marked improvement from before.
 
-- Thank you @divideableZero for updating the README with great news about an [Alpine Package](https://pkgs.alpinelinux.org/package/edge/testing/x86_64/tuwunel) (#248).
-
-- Storage hardware characteristics for mdraid devices on Linux are now detected. On these systems we can now shape database requests to increase performance above generic defaults.
-
-- EdDSA is now a supported algorithm for JWT logins. Thank you @vnhdx for the excellent report in (#258).
-
-- Optimizations were made to maximize concurrency and cache performance when gathering the `auth_chain`.
-
-- An admin command to manually remove a pusher is available (note: not intended for normal use).
-
-- An admin command to list local users by recent activity was added.
+- Optimization of new state-resolution functionality added during Project Hydra took place. Along with additional optimization for auth-chain gathering, CPU use for large/complex rooms (so-called "bad rooms") has been greatly reduced.
 
 ### Bug Fixes
 
-- LDAP users are now auto-joined to configured rooms upon creation. Thank you @yefimg for (#234), we especially appreciate help from domain-experts on these features.
+- Special thanks to @hatomist for fixing an error which changes a users's account-type when they set a password (#313). This impacted LDAP and some SSO users. We apologize for the inconvenience this may have caused.
 
-- A surgical fix by @kuhnchris in (#254) addressed a pesky bug where LDAP logins would result in admin privileges being removed for the user. Thank you @foxing-quietly for reporting in (#236).
+- We appreciate effort by @Jeidnx for addressing various issues with SSO/OIDC Identity Provider configuration in (#281). Also noteworthy was the idea to derive the callback_url from other parameters by default rather than explicitly requiring it. Thanks to @Magnitaizer for reporting initially in (#276).
 
-- @OptimoSupreme fixed issues with unread notification counting, including eliminating one of the last remaining non-async database calls in the codebase in (#253).
+- Thanks @VlaDexa for fixing the missing output formatting for the oauth delete command. (#321)
 
-- @x86pup fixed linker issues for platforms without static builds of `io_uring`. Thanks @darix for reporting in (#238).
+- Thank you @risu729 for updating the default port number in the docker run command documentation. (#298)
 
-- @x86pup fixed compatibility for our optimized jemalloc build on macOS (#239).
+- Thank you @Lamby777 for removing an errant `version` field in the docker-compose example. (299)
 
-- @dasha-uwu made Livekit operate properly even when federation is disabled (b5f50c3fda3). Thank you @apodavalov for reporting in (#240).
+- Thank you @cornerot for updating the docker-compose with-traefik which still said Conduit instead of Tuwunel after all this time. (#308)
 
-- Thank you @VlaDexa for updating the `Cache-Control` header to cache media as `private` which is more appropriate now in the Authenticated Media era.
+- Thank you @exodrifter for fixing errors and typos in the MatrixRTC documentation (#343) based on a report by @RhenCloud (#338).
 
-- Appservices now receive events properly matching on the sender MXID's localpart thanks to @dasha-uwu (c5508bba58d0).
+- Thank you @wuyukai0403 for proofreading and fixing a typo in the troubleshooting document. (#312)
 
-- Additional PDU format and compliance checks were added by @dasha-uwu (7b2079f71499).
+- A report by @BVollmerhaus lead to the reopening of (#240) to use Livekit/lk-jwt-service when federation is disabled. This was re-resolved by @dasha-uwu in (b79920a).
 
-- Codepaths in sync systems which assumed `device_id` from appservices were fixed by @dasha-uwu.
+- Thanks to @Jeidnx for identifying a missing SSO redirect route in (#290) which was fixed in (matrix-construct/ruma@0130f6a).
 
-- Auto-joining version 12 rooms was inhibited from a bug fixed by @dasha-uwu in (7115fb2796f).
+- We appreciate the panic report by @Spaenny in #296 which occurred during SSL-related upgrades on the main branch. Fixed by @dasha-uwu (87faf81).
 
-- Thank you @x86pup for updating our ldap3 dependency with SSL/TLS enhancements in (#243) and fixing errors reported by @fruzitent in (#108).
+- Thanks to report (#302) by @data-niklas whitespace in the configured `client_secret_file` is now properly ignored thanks to @dasha-uwu (6f5ae17).
 
-- Thanks to @x86pup `join_rule` is now properly defaulted in `/publicRooms` responses in (#244); additional compliance tests now pass!
+- After @Giwayume reported in (#303) that URL previews failed for some sites, an investigation by @dasha-uwu discovered Tuwunel's User-Agent header required some adjustment.
 
-- Thank you @bdfd9 for reporting a regression where tracing spans around registrations did not filter out passwords from the list of fields.
+- @dasha-uwu refactored the Unix socket listener with main-branch testing by @VlaDexa (#310) and follow-up fixes in (488bd62).
 
-- The timezone and extended profile features were not correctly stabilized last summer and the `m.tz` field was incorrectly labeled `tz`. Thank you @bunnyblack:matrix.org for reporting in #tuwunel:matrix.org.
+- @jonathanmajh reported in (#315) and @wmstens simultaneously reported in (#318) that admin status was not granted to the server's first user when registering with SSO/OIDC. This was fixed by (e74186a).
 
-- @dasha-uwu fixed git tags not being pulled and applied to CI builds (eadc9e782d8).
+- After a report by @tcyrus in (#328) that the RPM postinst script is not properly creating the tuwunel user. This was fixed by @x86pup in (5a55f84).
 
-- @dasha-uwu fixed a bug in sliding-sync which may result in lost invites (fd519ff7f174).
+- Thank you @cloudrac3r for reporting in (#330) that events were being unnecessarily sent to some appservices. This was fixed by @dasha-uwu in (d073e17).
 
-- `since` tokens in legacy sync are now clamped to a maximum when the client sends a value greater than expected, preventing a possibility of missing events during the request.
+- Thanks to the report in (#331) by @BVollmerhaus the first registered user is not granted admin when originating from an appservice. Fixed by @dasha-uwu in (9dfba59).
 
-- Media deletion commands which are time-based suffered a bug from incorrect creation timestamps on some filesystems. This was resolved by exclusively using the `mtime` attribute, which is acceptable because Matrix media is immutable.
+- The report by @rexbron in (#337) discovered that some distributions set modest limits on threads per process. On many-core (32+) we may exceed these limits. The `RLIMIT_NPROC` is now raised (9e09162) to mitigate this.
 
-- Queries for the deprecated `_matrix._tcp` SRV record have been reactivated due to an ineffective and unenforced sunset by the specification and other implementations.
+- @x86pup set ManagedOOMPreference=avoid due to systemd not recognizing pressure-based deallocation with `madvise(2)` is not an out-of-memory condition.
 
-- Thank you @x86pup and @dasha-uwu for various maintenance and linting efforts for the latest rustc versions and in general.
+- @dasha-uwu removed unnecessary added delays in the client endpoint for reporting.
 
-### Honorable Mentions
+- Server shutdown did not properly indicate offline status of the conduit user due to a recent regression, now fixed.
 
-- Please take a moment to recognize how lucky we are to have @scvalex as our NixOS package maintainer. From having the wherewithal to rise above the noise and lend this project trust from the very first days, time and again this gentleman has gone above and beyond on our behalf. Thank you @symphorien at NixOS as well for the patch applied surgically in https://github.com/NixOS/nixpkgs/pull/462394.
+- @dasha-uwu fixed logic issues in the client `/members` query filter. These same logic errors were also found in Synapse and Dendrite.
+
+- @dasha-uwu fixed the missing advertisement for `org.matrix.msc3827.stable` in client `/versions`.
+
+- Custom profile fields were sometimes being double-escaped in responses to clients due to a JSON re-interpretation issue which is now fixed.
+
+- @dasha-uwu fixed checks related to canonical aliases (0381547c5).
+
+- @dasha-uwu relaxed the `encryption_enabled_by_default_for_room_type` "invite" option to not match all rooms.
+
+- @x86pup fixed an issue with `display_name` and `avatar_url` omitted in `/joined_members` (fixed in our Ruma).
+
+- Event processing of missing `prev_event`'s are no longer interrupted by an error from a sibling `prev_event`. This reduces CPU use by not repeating event processing before it would otherwise succeed.

@@ -4,14 +4,14 @@ use std::{
 	time::Duration,
 };
 
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, TryFutureExt};
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, EventId, OwnedEventId, RoomId, RoomVersionId,
 	ServerName, api::federation::event::get_event,
 };
 use tuwunel_core::{
-	debug, debug_error, debug_warn, implement,
-	matrix::{PduEvent, event::gen_event_id_canonical_json},
+	debug, debug_error, debug_warn, expected, implement,
+	matrix::{PduEvent, event::gen_event_id_canonical_json, pdu::MAX_AUTH_EVENTS},
 	trace,
 	utils::stream::{BroadbandExt, IterStream, ReadyExt},
 	warn,
@@ -30,7 +30,11 @@ use tuwunel_core::{
 #[tracing::instrument(
 	level = "debug",
 	skip_all,
-	fields(%origin),
+	fields(
+		%origin,
+		events = %events.clone().count(),
+		lev = %recursion_level,
+	),
 )]
 pub(super) async fn fetch_auth<'a, Events>(
 	&self,
@@ -38,9 +42,10 @@ pub(super) async fn fetch_auth<'a, Events>(
 	room_id: &RoomId,
 	events: Events,
 	room_version: &RoomVersionId,
+	recursion_level: usize,
 ) -> Vec<(PduEvent, Option<CanonicalJsonObject>)>
 where
-	Events: Iterator<Item = &'a EventId> + Send,
+	Events: Iterator<Item = &'a EventId> + Clone + Send,
 {
 	let events_with_auth_events: Vec<_> = events
 		.stream()
@@ -66,8 +71,8 @@ where
 				.stream()
 				.ready_filter(|(next_id, _)| {
 					let backed_off = self.is_backed_off(next_id, Range {
-						start: Duration::from_secs(5 * 60),
-						end: Duration::from_secs(60 * 60 * 24),
+						start: Duration::from_mins(5),
+						end: Duration::from_hours(24),
 					});
 
 					!backed_off
@@ -79,6 +84,7 @@ where
 						&next_id,
 						value.clone(),
 						room_version,
+						expected!(recursion_level + 1),
 						true,
 					));
 
@@ -89,6 +95,7 @@ where
 						if next_id == id {
 							pdus.push((pdu, Some(json)));
 						}
+						self.cancel_back_off(&next_id);
 					} else {
 						self.back_off(&next_id);
 					}
@@ -125,18 +132,17 @@ async fn fetch_auth_chain(
 	// c. Ask origin server over federation
 	// We also handle its auth chain here so we don't get a stack overflow in
 	// handle_outlier_pdu.
+	let mut events_all = HashSet::new();
+	let mut events_in_reverse_order = Vec::new();
 	let mut todo_auth_events: VecDeque<_> = [event_id.to_owned()].into();
-	let mut events_in_reverse_order = Vec::with_capacity(todo_auth_events.len());
-
-	let mut events_all = HashSet::with_capacity(todo_auth_events.len());
 	while let Some(next_id) = todo_auth_events.pop_front() {
 		if events_all.contains(&next_id) {
 			continue;
 		}
 
 		if self.is_backed_off(&next_id, Range {
-			start: Duration::from_secs(2 * 60),
-			end: Duration::from_secs(60 * 60 * 8),
+			start: Duration::from_mins(2),
+			end: Duration::from_hours(8),
 		}) {
 			debug_warn!("Backed off from {next_id}");
 			continue;
@@ -152,8 +158,11 @@ async fn fetch_auth_chain(
 			.services
 			.federation
 			.execute(origin, get_event::v1::Request { event_id: next_id.clone() })
+			.inspect_err(|e| debug_error!(?next_id, "Failed to fetch event: {e}"))
+			.inspect_ok(|_| {
+				self.cancel_back_off(&next_id);
+			})
 			.await
-			.inspect_err(|e| debug_error!("Failed to fetch event {next_id}: {e}"))
 		else {
 			debug_warn!("Backing off from {next_id}");
 			self.back_off(&next_id);
@@ -168,6 +177,7 @@ async fn fetch_auth_chain(
 			continue;
 		};
 
+		self.cancel_back_off(&next_id);
 		if calculated_event_id != next_id {
 			warn!(
 				"Server didn't return event id we requested: requested: {next_id}, we got \
@@ -176,23 +186,16 @@ async fn fetch_auth_chain(
 			);
 		}
 
-		if let Some(auth_events) = value
+		value
 			.get("auth_events")
 			.and_then(CanonicalJsonValue::as_array)
-		{
-			for auth_event in auth_events {
-				match serde_json::from_value::<OwnedEventId>(auth_event.clone().into()) {
-					| Ok(auth_event) => {
-						todo_auth_events.push_back(auth_event);
-					},
-					| _ => {
-						warn!("Auth event id is not valid");
-					},
-				}
-			}
-		} else {
-			warn!("Auth event list invalid");
-		}
+			.into_iter()
+			.flatten()
+			.filter_map(|auth_event| auth_event.try_into().ok())
+			.take(MAX_AUTH_EVENTS)
+			.for_each(|auth_event: &EventId| {
+				todo_auth_events.push_back(auth_event.to_owned());
+			});
 
 		events_in_reverse_order.push((next_id.clone(), value));
 		events_all.insert(next_id);

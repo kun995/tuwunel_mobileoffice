@@ -197,6 +197,13 @@ pub(super) enum DebugCommand {
 	///   invocation.
 	RuntimeInterval,
 
+	/// - Print detailed tokio task metrics accumulated in total.
+	TaskMetrics,
+
+	/// - Print detailed tokio task metrics accumulated since last command
+	///   invocation.
+	TaskInterval,
+
 	/// - Print the current time
 	Time,
 

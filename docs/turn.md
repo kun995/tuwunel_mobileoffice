@@ -51,7 +51,6 @@ called `docker-compose.yml` and run `docker compose up -d` in the same
 directory.
 
 ```yml
-version: 3
 services:
     turn:
       container_name: coturn-server
@@ -68,3 +67,6 @@ documentation](https://github.com/coturn/coturn/blob/master/docker/coturn/README
 
 For security recommendations see Synapse's [Coturn
 documentation](https://element-hq.github.io/synapse/latest/turn-howto.html).
+
+The TURN server requires the appropriate ports to be forwarded, where your installation is behind NAT. 
+These are currently `3478/tcp`, `3478/udp`, `5349/tcp`, and `5349/udp`. 

@@ -1,7 +1,4 @@
-use std::{
-	collections::{HashMap, HashSet},
-	iter::once,
-};
+use std::{collections::HashMap, iter::once};
 
 use futures::{FutureExt, StreamExt, stream::FuturesOrdered};
 use ruma::{
@@ -10,17 +7,21 @@ use ruma::{
 };
 use tuwunel_core::{
 	Result, debug_warn, err, implement,
-	matrix::{Event, PduEvent},
-	state_res::{self},
+	matrix::{Event, PduEvent, pdu::MAX_PREV_EVENTS},
+	utils::stream::IterStream,
 };
 
 use super::check_room_id;
+use crate::rooms::state_res;
 
 #[implement(super::Service)]
 #[tracing::instrument(
 	level = "debug",
 	skip_all,
-	fields(%origin),
+	fields(
+		%origin,
+		events = %initial_set.clone().count(),
+	),
 )]
 #[expect(clippy::type_complexity)]
 pub(super) async fn fetch_prev<'a, Events>(
@@ -29,20 +30,34 @@ pub(super) async fn fetch_prev<'a, Events>(
 	room_id: &RoomId,
 	initial_set: Events,
 	room_version: &RoomVersionId,
+	recursion_level: usize,
 	first_ts_in_room: MilliSecondsSinceUnixEpoch,
 ) -> Result<(Vec<OwnedEventId>, HashMap<OwnedEventId, (PduEvent, CanonicalJsonObject)>)>
 where
-	Events: Iterator<Item = &'a EventId> + Send,
+	Events: Iterator<Item = &'a EventId> + Clone + Send,
 {
 	let mut todo_outlier_stack: FuturesOrdered<_> = initial_set
+		.stream()
 		.map(ToOwned::to_owned)
+		.filter_map(async |event_id| {
+			self.services
+				.timeline
+				.non_outlier_pdu_exists(&event_id)
+				.await
+				.is_err()
+				.then_some(event_id)
+		})
 		.map(async |event_id| {
-			let fetch = self.fetch_auth(origin, room_id, once(event_id.as_ref()), room_version);
+			let events = once(event_id.as_ref());
+			let auth = self
+				.fetch_auth(origin, room_id, events, room_version, recursion_level)
+				.await;
 
-			(event_id.clone(), fetch.await)
+			(event_id, auth)
 		})
 		.map(FutureExt::boxed)
-		.collect();
+		.collect()
+		.await;
 
 	let mut amount = 0;
 	let mut eventid_info = HashMap::new();
@@ -50,7 +65,7 @@ where
 	while let Some((prev_event_id, mut outlier)) = todo_outlier_stack.next().await {
 		let Some((pdu, mut json_opt)) = outlier.pop() else {
 			// Fetch and handle failed
-			graph.insert(prev_event_id.clone(), HashSet::new());
+			graph.insert(prev_event_id.clone(), Default::default());
 			continue;
 		};
 
@@ -59,7 +74,7 @@ where
 		let limit = self.services.server.config.max_fetch_prev_events;
 		if amount > limit {
 			debug_warn!(?limit, "Max prev event limit reached!");
-			graph.insert(prev_event_id.clone(), HashSet::new());
+			graph.insert(prev_event_id.clone(), Default::default());
 			continue;
 		}
 
@@ -74,28 +89,38 @@ where
 
 		let Some(json) = json_opt else {
 			// Get json failed, so this was not fetched over federation
-			graph.insert(prev_event_id.clone(), HashSet::new());
+			graph.insert(prev_event_id.clone(), Default::default());
 			continue;
 		};
 
 		if pdu.origin_server_ts() > first_ts_in_room {
 			amount = amount.saturating_add(1);
+			debug_assert!(
+				pdu.prev_events().count() <= MAX_PREV_EVENTS,
+				"PduEvent {prev_event_id} has too many prev_events"
+			);
+
 			for prev_prev in pdu.prev_events() {
-				if !graph.contains_key(prev_prev) {
-					let prev_prev = prev_prev.to_owned();
-					let fetch = async move {
-						let fetch = self.fetch_auth(
+				if graph.contains_key(prev_prev) {
+					continue;
+				}
+
+				let prev_prev = prev_prev.to_owned();
+				let fetch = async move {
+					let fetch = self
+						.fetch_auth(
 							origin,
 							room_id,
 							once(prev_prev.as_ref()),
 							room_version,
-						);
+							recursion_level,
+						)
+						.await;
 
-						(prev_prev.clone(), fetch.await)
-					};
+					(prev_prev, fetch)
+				};
 
-					todo_outlier_stack.push_back(fetch.boxed());
-				}
+				todo_outlier_stack.push_back(fetch.boxed());
 			}
 
 			graph.insert(
@@ -104,7 +129,7 @@ where
 			);
 		} else {
 			// Time based check failed
-			graph.insert(prev_event_id.clone(), HashSet::new());
+			graph.insert(prev_event_id.clone(), Default::default());
 		}
 
 		eventid_info.insert(prev_event_id.clone(), (pdu, json));
@@ -125,6 +150,17 @@ where
 	let sorted = state_res::topological_sort(&graph, &event_fetch)
 		.await
 		.map_err(|e| err!(Database(error!("Error sorting prev events: {e}"))))?;
+
+	debug_assert_eq!(
+		sorted.len(),
+		graph.len(),
+		"topological sort returned a different number of outputs than inputs"
+	);
+
+	debug_assert!(
+		sorted.len() >= eventid_info.len(),
+		"returned topologically sorted events differ from eventid_info"
+	);
 
 	Ok((sorted, eventid_info))
 }

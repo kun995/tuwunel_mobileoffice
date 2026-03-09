@@ -1,4 +1,5 @@
 #![cfg(test)]
+#![allow(unused_features)] // 1.96.0-nightly 2026-03-07 bug
 
 use insta::{assert_debug_snapshot, with_settings};
 use tuwunel::{Args, Server, runtime};

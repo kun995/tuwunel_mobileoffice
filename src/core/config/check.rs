@@ -1,11 +1,10 @@
 use std::env::consts::OS;
 
 use either::Either;
-use figment::Figment;
 use itertools::Itertools;
 
 use super::{DEPRECATED_KEYS, IdentityProvider};
-use crate::{Config, Err, Result, Server, debug, debug_info, debug_warn, error, warn};
+use crate::{Config, Err, Result, debug, debug_info, error, warn};
 
 /// Performs check() with additional checks specific to reloading old config
 /// with new config.
@@ -24,9 +23,8 @@ pub fn reload(old: &Config, new: &Config) -> Result {
 }
 
 pub fn check(config: &Config) -> Result {
-	if cfg!(debug_assertions) {
-		warn!("Note: tuwunel was built without optimisations (i.e. debug build)");
-	}
+	#[cfg(debug_assertions)]
+	warn!("Note: tuwunel was built without optimisations (i.e. debug build)");
 
 	if config.allow_invalid_tls_certificates {
 		warn!(
@@ -45,14 +43,18 @@ pub fn check(config: &Config) -> Result {
 		));
 	}
 
-	if cfg!(all(feature = "hardened_malloc", feature = "jemalloc", not(target_env = "msvc"))) {
-		debug_warn!(
-			"hardened_malloc and jemalloc compile-time features are both enabled, this causes \
-			 jemalloc to be used."
-		);
-	}
+	#[cfg(all(
+		feature = "hardened_malloc",
+		feature = "jemalloc",
+		not(target_env = "msvc")
+	))]
+	debug_warn!(
+		"hardened_malloc and jemalloc compile-time features are both enabled, this causes \
+		 jemalloc to be used."
+	);
 
-	if cfg!(not(unix)) && config.unix_socket_path.is_some() {
+	#[cfg(not(unix))]
+	if config.unix_socket_path.is_some() {
 		return Err!(Config(
 			"unix_socket_path",
 			"UNIX socket support is only available on *nix platforms. Please remove \
@@ -60,12 +62,20 @@ pub fn check(config: &Config) -> Result {
 		));
 	}
 
-	if config.unix_socket_path.is_none() && config.get_bind_hosts().is_empty() {
-		return Err!(Config("address", "No TCP addresses were specified to listen on"));
+	if config.unix_socket_path.is_none() {
+		if config.get_bind_hosts().is_empty() {
+			return Err!(Config("address", "No TCP addresses were specified to listen on"));
+		}
+
+		if config.get_bind_ports().is_empty() {
+			return Err!(Config("port", "No ports were specified to listen on"));
+		}
 	}
 
-	if config.unix_socket_path.is_none() && config.get_bind_ports().is_empty() {
-		return Err!(Config("port", "No ports were specified to listen on"));
+	let certs_set = config.tls.certs.is_some();
+	let key_set = config.tls.key.is_some();
+	if certs_set ^ key_set {
+		return Err!(Config("tls", "tls.certs and tls.key must either both be set or unset"));
 	}
 
 	if !config.listening {
@@ -122,7 +132,8 @@ pub fn check(config: &Config) -> Result {
 	}
 
 	// yeah, unless the user built a debug build hopefully for local testing only
-	if cfg!(not(debug_assertions)) && config.server_name == "your.server.name" {
+	#[cfg(not(debug_assertions))]
+	if config.server_name == "your.server.name" {
 		return Err!(Config(
 			"server_name",
 			"You must specify a valid server name for production usage of tuwunel."
@@ -290,9 +301,7 @@ pub fn check(config: &Config) -> Result {
 		));
 	}
 
-	if !Server::available_room_versions()
-		.any(|(version, _)| version == config.default_room_version)
-	{
+	if !config.supported_room_version(&config.default_room_version) {
 		return Err!(Config(
 			"default_room_version",
 			"Room version {:?} is not available",
@@ -418,19 +427,4 @@ fn warn_unknown_key(config: &Config) -> Result {
 	} else {
 		Ok(())
 	}
-}
-
-/// Checks the presence of the `address` and `unix_socket_path` keys in the
-/// raw_config, exiting the process if both keys were detected.
-pub(super) fn is_dual_listening(raw_config: &Figment) -> Result {
-	let contains_address = raw_config.contains("address");
-	let contains_unix_socket = raw_config.contains("unix_socket_path");
-	if contains_address && contains_unix_socket {
-		return Err!(
-			"TOML keys \"address\" and \"unix_socket_path\" were both defined. Please specify \
-			 only one option."
-		);
-	}
-
-	Ok(())
 }

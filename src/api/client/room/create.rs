@@ -83,7 +83,7 @@ pub(crate) async fn create_room_route(
 		.as_ref()
 		.map_or(Ok(&services.server.config.default_room_version), |version| {
 			services
-				.server
+				.config
 				.supported_room_version(version)
 				.then_ok_or_else(version, || {
 					err!(Request(UnsupportedRoomVersion(
@@ -311,12 +311,15 @@ pub(crate) async fn create_room_route(
 		let config = services
 			.config
 			.encryption_enabled_by_default_for_room_type
-			.as_deref()
-			.unwrap_or("off");
+			.as_deref();
 
-		let invite = matches!(config, "invite");
-		let always = matches!(config, "all" | "invite");
-		if always || (invite && matches!(preset, PrivateChat | TrustedPrivateChat)) {
+		let should_encrypt = match config {
+			| Some("all") => true,
+			| Some("invite") => matches!(preset, PrivateChat | TrustedPrivateChat),
+			| _ => false,
+		};
+
+		if should_encrypt {
 			let algorithm = EventEncryptionAlgorithm::MegolmV1AesSha2;
 			let content = RoomEncryptionEventContent::new(algorithm);
 			services
@@ -425,7 +428,7 @@ pub(crate) async fn create_room_route(
 	if let Some(alias) = alias {
 		services
 			.alias
-			.set_alias(&alias, &room_id, sender_user)?;
+			.set_alias_by(&alias, &room_id, sender_user)?;
 	}
 
 	if body.visibility == room::Visibility::Public {
@@ -921,7 +924,10 @@ async fn can_publish_directory_check(
 		.lockdown_public_room_directory
 		|| body.appservice_info.is_some()
 		|| body.visibility != room::Visibility::Public
-		|| services.users.is_admin(body.sender_user()).await
+		|| services
+			.admin
+			.user_is_admin(body.sender_user())
+			.await
 	{
 		return Ok(());
 	}
@@ -946,7 +952,10 @@ async fn can_create_room_check(
 ) -> Result {
 	if !services.config.allow_room_creation
 		&& body.appservice_info.is_none()
-		&& !services.users.is_admin(body.sender_user()).await
+		&& !services
+			.admin
+			.user_is_admin(body.sender_user())
+			.await
 	{
 		return Err!(Request(Forbidden("Room creation has been disabled.",)));
 	}

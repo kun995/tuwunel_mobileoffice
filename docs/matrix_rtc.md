@@ -68,7 +68,11 @@ keys:
 type = "livekit"
 livekit_service_url = "https://matrix-rtc.yourdomain.com"
 ```
+<<<<<<< HEAD
 3. Close the file.
+=======
+3. Ensure that you have `[global.well_known]` uncommented, above this line. .well-known will not be served correctly if this is not the case. 
+>>>>>>> 0d434114472f159ac53a5332d917a3df27508207
 
 #### 3.2. .well-known served independently
 ***Follow this step if you serve your .well-known/matrix files directly. Otherwise follow Step 3.1***
@@ -102,6 +106,8 @@ The final file should look something like this:
 ### 4. Configure Firewall
 You will need to allow ports `7881/tcp` and `50100:50200/udp` through your firewall. If you use UFW, the commands are: `ufw allow 7881/tcp` and `ufw allow 50100:50200/udp`.
 
+If you are behind NAT, you will also need to forward `7880/tcp`, `7881/tcp`, and `50100:50200/udp` to livekit. 
+
 ### 5. Configure Reverse Proxy
 As reverse proxies can be installed in different ways, step by step instructions are not given for this section.
 If you use Caddy as your reverse proxy, follow step 5.1. If you use Nginx, follow step 5.2.
@@ -112,7 +118,7 @@ If you use Caddy as your reverse proxy, follow step 5.1. If you use Nginx, follo
 matrix-rtc.yourdomain.com {
     # This is matrix-rtc-jwt
     @jwt_service {
-        path /sfu/get* /healthz*
+        path /sfu/get* /healthz* /get_token*
     }
     handle @jwt_service {
         reverse_proxy localhost:8081 {
@@ -157,7 +163,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/matrix-rtc.yourdomain.com/privkey.pem;
 
     # lk-jwt-service
-    location ~ ^(/sfu/get|/healthz) {
+    location ~ ^/(sfu/get|healthz|get_token) {
         proxy_pass http://localhost:8081;
 
         proxy_set_header Host $host;
@@ -296,4 +302,42 @@ static-auth-secret=AUTH_SECRET
 ```
 
 ### Using the Livekit Built In TURN Server
+It is also possible to use the built in Livekit TURN server. Getting this to work can be a somewhat involved process, and a TURN server is not usually required for Matrix RTC calls. Consequently, instructions are not provided here at this time. If you would like to configure this, more information can be found [here](https://docs.livekit.io/transport/self-hosting/deployment/#improving-connectivity-with-turn).
+- This guide provides example configuration for Caddy and Nginx reverse proxies. Others can be used, but the configuration will need to be adapted.
+4. Add the following. `mrtckey` and `mrtcsecret` should be random strings. It is suggested that `mrtckey` is 20 characters and `mrtcsecret` is 64 characters.
+      - LIVEKIT_JWT_PORT=8081
+      - LIVEKIT_KEY=mrtckey
+      - LIVEKIT_SECRET=mrtcsecret
+    ports:
+      - 7880:7880/tcp
+      - 7881:7881/tcp
+      - 50100-50200:50100-50200/udp
+4. Close the file.
+6. Add the following. `mrtckey` and `mrtcsecret` should be the same as those from compose.yaml. 
+  mrtckey: "mrtcsecret"
+7. Close the file.
+***Follow this step if your .well-known configuration is served by tuwunel. Otherwise follow Step 3.2***
+3. Ensure that you have `[global.well_known]` uncommented, above this line. .well-known will not be served correctly if this is not the case. 
+3. Close the file.
+3. Close the file.
+If you are behind NAT, you will also need to forward `7880/tcp`, `7881/tcp`, and `50100:50200/udp` to livekit. 
+
+If you use Caddy as your reverse proxy, follow step 5.1. If you use Nginx, follow step 5.2.
+        path /sfu/get* /healthz* /get_token*
+        reverse_proxy localhost:8081 {
+            header_up Host {host}
+            header_up X-Forwarded-Server {host}
+            header_up X-Real-IP {remote}
+            header_up X-Forwarded-For {remote}
+            header_up X-Forwarded-Proto {scheme}
+        }
+            header_up Host {host}
+            header_up X-Forwarded-Server {host}
+            header_up X-Real-IP {remote}
+            header_up X-Forwarded-For {remote}
+            header_up X-Forwarded-Proto {scheme}
+    location ~ ^/(sfu/get|healthz|get_token) {
+### TURN Integration
+If you follow this guide, and also set up Coturn as per the tuwunel documentation, there will be a port clash between the two services. To avoid this, the following must be added to your `coturn.conf`:
+If you have Coturn configured, you can use it as a TURN server for Livekit to improve call reliability. As Coturn allows multiple instances of `static-auth-secret`, it is suggested that the secret used for Livekit is different to that used for tuwunel.
 It is also possible to use the built in Livekit TURN server. Getting this to work can be a somewhat involved process, and a TURN server is not usually required for Matrix RTC calls. Consequently, instructions are not provided here at this time. If you would like to configure this, more information can be found [here](https://docs.livekit.io/transport/self-hosting/deployment/#improving-connectivity-with-turn).

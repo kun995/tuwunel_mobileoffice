@@ -155,7 +155,7 @@ pub struct Args {
 	/// memory to the operating system using MADV_FREE without MADV_DONTNEED.
 	/// Setting to false increases performance by reducing pagefaults, but
 	/// resident memory usage appears high until there is memory pressure. The
-	/// default is true unless the system has four or more cores.
+	/// default is true unless the system has eight or more cores.
 	#[arg(
 		long,
 		hide(true),
