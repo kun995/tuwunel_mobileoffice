@@ -6,7 +6,6 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use sha2::Digest;
 use tokio::{fs, io::AsyncWriteExt};
 
 use super::{MediaStorage, StorageMetadata};
@@ -26,13 +25,17 @@ impl FilesystemStorage {
 		Ok(Self { base_path })
 	}
 
-	/// Get the full path for a given key
-	fn get_path(&self, key: &[u8]) -> PathBuf {
+	/// Get the full filesystem path for a given SHA-256 content hash.
+	///
+	/// The key is expected to be raw SHA-256 bytes (32 bytes), which are
+	/// hex-encoded to produce a stable, content-addressable filename.
+	fn get_path(&self, hash_bytes: &[u8]) -> PathBuf {
 		let mut path = self.base_path.clone();
-		// Hash the key to get a consistent filename
-		let digest = sha2::Sha256::digest(key);
-		let encoded = encode_key(&digest);
-		path.push(encoded);
+		let hex: String = hash_bytes
+			.iter()
+			.map(|b| format!("{b:02x}"))
+			.collect();
+		path.push(hex);
 		path
 	}
 }

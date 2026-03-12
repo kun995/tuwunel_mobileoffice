@@ -163,17 +163,15 @@ impl MediaStorage for HybridStorage {
 	}
 
 	async fn exists(&self, key: &[u8]) -> Result<bool> {
-		// Check secondary first (faster)
-		if self.secondary.exists(key).await? {
+		// Check secondary first (faster, local filesystem)
+		if self.secondary.exists(key).await.unwrap_or(false) {
 			return Ok(true);
 		}
 
-		// Check primary if fallback enabled
-		if self.config.read_fallback {
-			return self.primary.exists(key).await;
-		}
-
-		Ok(false)
+		// Always check primary (S3) — files are always written to primary,
+		// so this must not be gated by read_fallback. This is also used
+		// by the deduplication logic in media::create().
+		self.primary.exists(key).await
 	}
 
 	async fn metadata(&self, key: &[u8]) -> Result<Option<StorageMetadata>> {

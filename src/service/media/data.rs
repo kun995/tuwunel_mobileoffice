@@ -14,6 +14,11 @@ pub(crate) struct Data {
 	mediaid_file: Arc<Map>,
 	mediaid_user: Arc<Map>,
 	url_previews: Arc<Map>,
+	/// Maps SHA-256 content hash (32 bytes) → reference count (u32, big-endian)
+	media_sha256_refs: Arc<Map>,
+	/// Maps media DB key → SHA-256 content hash (32 bytes)
+	/// Needed so that delete() can look up a key's hash without re-reading the file
+	mediaid_sha256: Arc<Map>,
 }
 
 #[derive(Debug)]
@@ -29,6 +34,8 @@ impl Data {
 			mediaid_file: db["mediaid_file"].clone(),
 			mediaid_user: db["mediaid_user"].clone(),
 			url_previews: db["url_previews"].clone(),
+			media_sha256_refs: db["media_sha256_refs"].clone(),
+			mediaid_sha256: db["mediaid_sha256"].clone(),
 		}
 	}
 
@@ -166,6 +173,68 @@ impl Data {
 			.collect()
 			.await
 	}
+
+	// ---- SHA-256 deduplication helpers ----
+
+	/// Increment the reference count for a content hash.
+	/// Returns the new reference count (1 means this is a new unique file).
+	pub(super) fn increment_sha256_ref(&self, hash: &[u8; 32]) -> Result<u32> {
+		let current = self.get_sha256_ref(hash);
+		let new_count = current.saturating_add(1);
+		self.media_sha256_refs
+			.insert(hash.as_slice(), &new_count.to_be_bytes());
+		Ok(new_count)
+	}
+
+	/// Decrement the reference count for a content hash.
+	/// Returns the new reference count (0 means the file can be physically deleted).
+	pub(super) fn decrement_sha256_ref(&self, hash: &[u8; 32]) -> Result<u32> {
+		let current = self.get_sha256_ref(hash);
+		if current == 0 {
+			// Already at zero — nothing to decrement, just clean up
+			return Ok(0);
+		}
+		let new_count = current - 1;
+		if new_count == 0 {
+			self.media_sha256_refs.remove(hash.as_slice());
+		} else {
+			self.media_sha256_refs
+				.insert(hash.as_slice(), &new_count.to_be_bytes());
+		}
+		Ok(new_count)
+	}
+
+	/// Get the current reference count for a content hash (0 if not found).
+	pub(super) fn get_sha256_ref(&self, hash: &[u8; 32]) -> u32 {
+		self.media_sha256_refs
+			.get_blocking(hash.as_slice())
+			.ok()
+			.and_then(|bytes| {
+				let arr: [u8; 4] = bytes.as_ref().try_into().ok()?;
+				Some(u32::from_be_bytes(arr))
+			})
+			.unwrap_or(0)
+	}
+
+	/// Store the content hash associated with a media DB key.
+	/// Called during upload so that delete() can look up the hash later.
+	pub(super) fn set_media_hash(&self, key: &[u8], hash: &[u8; 32]) {
+		self.mediaid_sha256.insert(key, hash.as_slice());
+	}
+
+	/// Retrieve the content hash associated with a media DB key.
+	pub(super) fn get_media_hash(&self, key: &[u8]) -> Option<[u8; 32]> {
+		self.mediaid_sha256
+			.get_blocking(key)
+			.ok()
+			.and_then(|bytes| bytes.as_ref().try_into().ok())
+	}
+
+	/// Remove the stored content hash for a media DB key (called after delete).
+	pub(super) fn remove_media_hash(&self, key: &[u8]) {
+		self.mediaid_sha256.remove(key);
+	}
+
 
 	#[inline]
 	pub(super) fn remove_url_preview(&self, url: &str) -> Result {

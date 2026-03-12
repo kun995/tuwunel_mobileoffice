@@ -131,6 +131,21 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		// Maps SHA-256 content hash (32 bytes) → u32 reference count
+		// Used for content-based media deduplication
+		name: "media_sha256_refs",
+		key_size_hint: Some(32),
+		val_size_hint: Some(4),
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		// Maps media DB key → SHA-256 content hash (32 bytes)
+		// Allows delete() to find which hash to decrement when removing an MXC
+		name: "mediaid_sha256",
+		val_size_hint: Some(32),
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
 		name: "oauthid_session",
 		..descriptor::RANDOM_SMALL
 	},

@@ -8,6 +8,7 @@
 use std::{cmp, num::Saturating as Sat};
 
 use ruma::{Mxc, UInt, UserId, http_headers::ContentDisposition, media::Method};
+use sha2::Digest;
 use tuwunel_core::{Result, checked, err, implement};
 
 use super::{FileMeta, data::Metadata};
@@ -31,12 +32,20 @@ impl super::Service {
 		dim: &Dim,
 		file: &[u8],
 	) -> Result {
+		let content_hash: [u8; 32] = sha2::Sha256::digest(file).into();
+
 		let key =
 			self.db
 				.create_file_metadata(mxc, user, dim, content_disposition, content_type)?;
 
-		// Use storage trait to save thumbnail
-		self.get_storage().create(&key, file).await?;
+		self.db.set_media_hash(&key, &content_hash);
+		self.db.increment_sha256_ref(&content_hash)?;
+
+		let already_stored = self.get_storage().exists(&content_hash).await.unwrap_or(false);
+
+		if !already_stored {
+			self.get_storage().create(&content_hash, file).await?;
+		}
 
 		Ok(())
 	}
@@ -79,8 +88,10 @@ impl super::Service {
 #[implement(super::Service)]
 #[tracing::instrument(name = "saved", level = "debug", skip(self, data))]
 async fn get_thumbnail_saved(&self, data: Metadata) -> Result<Option<FileMeta>> {
+	let storage_key = self.db.get_media_hash(&data.key).map(|h| h.to_vec()).unwrap_or(data.key.clone());
+
 	// Use storage trait to read thumbnail
-	match self.get_storage().read(&data.key).await? {
+	match self.get_storage().read(&storage_key).await? {
 		Some(bytes) => Ok(Some(into_filemeta(data, bytes.to_vec()))),
 		None => Ok(None),
 	}
@@ -96,8 +107,10 @@ async fn get_thumbnail_generate(
 	dim: &Dim,
 	data: Metadata,
 ) -> Result<Option<FileMeta>> {
+	let storage_key = self.db.get_media_hash(&data.key).map(|h| h.to_vec()).unwrap_or(data.key.clone());
+
 	// Use storage trait to read original file
-	let content = match self.get_storage().read(&data.key).await? {
+	let content = match self.get_storage().read(&storage_key).await? {
 		Some(bytes) => bytes.to_vec(),
 		None => return Ok(None),
 	};
@@ -118,6 +131,8 @@ async fn get_thumbnail_generate(
 		.write_to(&mut cursor, image::ImageFormat::Png)
 		.map_err(|error| err!(error!(?error, "Error writing PNG thumbnail.")))?;
 
+	let thumbnail_hash: [u8; 32] = sha2::Sha256::digest(&thumbnail_bytes).into();
+
 	// Save thumbnail in database so we don't have to generate it again next time
 	let thumbnail_key = self.db.create_file_metadata(
 		mxc,
@@ -127,8 +142,14 @@ async fn get_thumbnail_generate(
 		data.content_type.as_deref(),
 	)?;
 
-	// Use storage trait to save generated thumbnail
-	self.get_storage().create(&thumbnail_key, &thumbnail_bytes).await?;
+	self.db.set_media_hash(&thumbnail_key, &thumbnail_hash);
+	self.db.increment_sha256_ref(&thumbnail_hash)?;
+
+	let already_stored = self.get_storage().exists(&thumbnail_hash).await.unwrap_or(false);
+
+	if !already_stored {
+		self.get_storage().create(&thumbnail_hash, &thumbnail_bytes).await?;
+	}
 
 	Ok(Some(into_filemeta(data, thumbnail_bytes)))
 }

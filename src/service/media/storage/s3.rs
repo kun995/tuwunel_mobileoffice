@@ -18,7 +18,7 @@ use aws_sdk_s3::{
 #[cfg(feature = "s3_storage")]
 use bytes::Bytes;
 #[cfg(feature = "s3_storage")]
-use tuwunel_core::{err, Result};
+use tuwunel_core::{err, trace, Result};
 
 #[cfg(feature = "s3_storage")]
 use super::{MediaStorage, StorageMetadata};
@@ -70,43 +70,25 @@ impl S3Storage {
 
 
 
-	/// Get the S3 key for a given storage key
-	/// Extracts media_id from the key (format: mxc://server/MEDIA_ID)
-	/// to use as S3 key instead of base64-encoded metadata
-	fn get_s3_key(&self, key: &[u8]) -> String {
-		// Try to extract media_id from key
-		// Key format is typically: mxc://server/MEDIA_ID + metadata
-		let key_str = String::from_utf8_lossy(key);
-		
-		// Extract media_id from MXC URI
-		let media_id = if let Some(mxc_part) = key_str.split('\0').next() {
-			// MXC format: mxc://server/MEDIA_ID
-			if let Some(id) = mxc_part.split('/').last() {
-				// Clean the media_id: only keep alphanumeric and safe chars
-				id.chars()
-					.filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-					.collect::<String>()
-			} else {
-				String::new()
-			}
-		} else {
-			String::new()
-		};
-		
-		// Use media_id if valid, otherwise fallback to base64
-		let s3_key = if !media_id.is_empty() && media_id.len() >= 10 {
-			media_id
-		} else {
-			// Fallback to base64 encoding
-			encode_key(key)
-		};
-		
+	/// Build the S3 object key from raw SHA-256 content hash bytes.
+	///
+	/// The key is the lowercase hex encoding of the 32-byte hash, optionally
+	/// prefixed with the configured prefix. For example:
+	///   - No prefix:  `a3f9d2c1ab8e4f7d...` (64 hex chars)
+	///   - With prefix `media`: `media/a3f9d2c1ab8e4f7d...`
+	fn get_s3_key(&self, hash_bytes: &[u8]) -> String {
+		// Hex-encode the raw bytes
+		let hex: String = hash_bytes
+			.iter()
+			.map(|b| format!("{b:02x}"))
+			.collect();
+
 		let final_key = match &self.prefix {
-			Some(prefix) => format!("{}/{}", prefix, s3_key),
-			None => s3_key,
+			Some(prefix) => format!("{prefix}/{hex}"),
+			None => hex,
 		};
 
-		// Remove leading slash if present (S3 best practice)
+		// Remove leading slash if somehow present (S3 best practice)
 		final_key.trim_start_matches('/').to_string()
 	}
 
@@ -196,6 +178,8 @@ impl MediaStorage for S3Storage {
 	async fn exists(&self, key: &[u8]) -> Result<bool> {
 		let s3_key = self.get_s3_key(key);
 
+		trace!("S3 exists check: bucket={} key={}", self.bucket, s3_key);
+
 		match self
 			.client
 			.head_object()
@@ -204,11 +188,18 @@ impl MediaStorage for S3Storage {
 			.send()
 			.await
 		{
-			Ok(_) => Ok(true),
-			Err(e) if is_not_found_error(&e) => Ok(false),
+			Ok(_) => {
+				trace!("S3 exists: YES key={}", s3_key);
+				Ok(true)
+			},
+			Err(e) if is_not_found_error(&e) => {
+				trace!("S3 exists: NO (404) key={}", s3_key);
+				Ok(false)
+			},
 			Err(e) => Err(err!(Database(error!("S3 head_object failed: {}", e)))),
 		}
 	}
+
 
 	async fn metadata(&self, key: &[u8]) -> Result<Option<StorageMetadata>> {
 		let s3_key = self.get_s3_key(key);

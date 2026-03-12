@@ -11,6 +11,7 @@ use std::{path::PathBuf, sync::Arc, time::SystemTime};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use ruma::{Mxc, OwnedMxcUri, UserId, http_headers::ContentDisposition};
+use sha2::Digest;
 use tokio::fs;
 use tokio::sync::OnceCell;
 use tuwunel_core::{
@@ -132,7 +133,14 @@ impl Service {
 			.expect("Storage not initialized - this is a bug")
 	}
 
-	/// Uploads a file.
+	/// Uploads a file, with content-based deduplication.
+	///
+	/// Files with identical content are stored only once in the storage backend.
+	/// Deduplication is based on SHA-256 content hash. The storage backend is
+	/// checked with `exists()` before uploading — this avoids a race condition
+	/// where concurrent uploads of the same file would all see refcount=0.
+	/// If two concurrent uploads both pass the exists() check, the S3 PUT is
+	/// idempotent (same key, same bytes → same object), so no corruption occurs.
 	pub async fn create(
 		&self,
 		mxc: &Mxc<'_>,
@@ -141,7 +149,13 @@ impl Service {
 		content_type: Option<&str>,
 		file: &[u8],
 	) -> Result {
-		// Width, Height = 0 if it's not a thumbnail
+		// 1. Compute SHA-256 hash of the file content (= storage key)
+		let content_hash: [u8; 32] = sha2::Sha256::digest(file).into();
+		let hash_hex: String = content_hash.iter().map(|b| format!("{b:02x}")).collect();
+
+		trace!(?mxc, "Dedup: file size={} hash={}", file.len(), &hash_hex[..16]);
+
+		// 2. Register MXC metadata in the database (unchanged behaviour)
 		let key = self.db.create_file_metadata(
 			mxc,
 			user,
@@ -150,27 +164,73 @@ impl Service {
 			content_type,
 		)?;
 
-		// Use storage trait to save file
-		self.get_storage().create(&key, file).await?;
+		// 3. Store the hash → db-key mapping so delete() can find the hash
+		self.db.set_media_hash(&key, &content_hash);
+
+		// 4. Increment the reference count for this content hash
+		self.db.increment_sha256_ref(&content_hash)?;
+
+		// 5. Check storage backend to decide whether to upload.
+		//    Using exists() avoids a race condition: refcount is not atomic
+		//    across concurrent async tasks. If the file already exists in
+		//    storage, skip the upload (dedup hit). If two concurrent uploads
+		//    both see exists()==false, the PUT is idempotent (same key, same
+		//    bytes), so at worst we upload twice but end up with one object.
+		let already_stored = self
+			.get_storage()
+			.exists(&content_hash)
+			.await
+			.unwrap_or(false);
+
+		trace!(?mxc, "Dedup: exists={} hash={}", already_stored, &hash_hex[..16]);
+
+		if already_stored {
+			debug!(?mxc, "Dedup: SKIP upload — file already in storage (hash={})", &hash_hex[..16]);
+		} else {
+			debug!(?mxc, "Dedup: UPLOAD — new unique file (hash={})", &hash_hex[..16]);
+			self.get_storage().create(&content_hash, file).await?;
+		}
 
 		Ok(())
 	}
 
-	/// Deletes a file in the database and from the media directory via an MXC
+
+	/// Deletes a file in the database and from the storage backend via an MXC.
+	///
+	/// Due to content-based deduplication, the physical file is only removed
+	/// from storage when the reference count drops to zero (i.e. no other MXC
+	/// URIs point to the same content).
 	pub async fn delete(&self, mxc: &Mxc<'_>) -> Result {
 		match self.db.search_mxc_metadata_prefix(mxc).await {
 			| Ok(keys) => {
-				for key in keys {
+				for key in &keys {
 					trace!(?mxc, "MXC Key: {key:?}");
-					debug_info!(?mxc, "Deleting from storage");
 
-					if let Err(e) = self.get_storage().delete(&key).await {
-						debug_error!(?mxc, "Failed to delete from storage: {e}");
+					// Look up the content hash stored at upload time
+					if let Some(hash) = self.db.get_media_hash(key) {
+						let remaining = self.db.decrement_sha256_ref(&hash)?;
+						if remaining == 0 {
+							// Last reference gone — physically delete from storage
+							debug_info!(?mxc, "Last reference removed — deleting from storage");
+							if let Err(e) = self.get_storage().delete(&hash).await {
+								debug_error!(?mxc, "Failed to delete from storage: {e}");
+							}
+						} else {
+							debug_info!(?mxc, "Still {remaining} reference(s) remaining — keeping file in storage");
+						}
+						self.db.remove_media_hash(key);
+					} else {
+						// No hash found — legacy file (uploaded before dedup was added).
+						// Fall back to deleting by the DB key directly.
+						debug_info!(?mxc, "No content hash found for key — using legacy delete path");
+						if let Err(e) = self.get_storage().delete(key).await {
+							debug_error!(?mxc, "Failed to delete from storage (legacy): {e}");
+						}
 					}
-
-					debug_info!(?mxc, "Deleting from database");
-					self.db.delete_file_mxc(mxc).await;
 				}
+
+				debug_info!(?mxc, "Deleting from database");
+				self.db.delete_file_mxc(mxc).await;
 
 				Ok(())
 			},
@@ -218,8 +278,15 @@ impl Service {
 			.await
 		{
 			| Ok(Metadata { content_disposition, content_type, key }) => {
+				// Get the content hash for this file, or fallback to the legacy db key
+				let storage_key = self
+					.db
+					.get_media_hash(&key)
+					.map(|hash| hash.to_vec())
+					.unwrap_or(key);
+
 				// Use storage trait to read file
-				match self.get_storage().read(&key).await? {
+				match self.get_storage().read(&storage_key).await? {
 					Some(bytes) => Ok(Some(FileMeta {
 						content: Some(bytes.to_vec()),
 						content_type,
