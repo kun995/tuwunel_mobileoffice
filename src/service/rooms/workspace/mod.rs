@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use futures::Stream;
 use ruma::{OwnedRoomId, RoomId};
-use tuwunel_core::{Result, implement, utils::stream::TryIgnore};
+use tuwunel_core::{Result, implement, err, error, utils::stream::TryIgnore};
 use tuwunel_core::utils::stream::ReadyExt;
 use tuwunel_database::{Deserialized, Map};
 
@@ -66,11 +66,16 @@ pub fn set_space_room_id(&self, workspace_id: &str, space_room_id: &RoomId) {
 /// Lookup: workspaceId → spaceRoomId
 #[implement(Service)]
 pub async fn get_space_room_id(&self, workspace_id: &str) -> Result<OwnedRoomId> {
-	self.db
+	let bytes = self
+		.db
 		.workspaceid_spaceroomid
 		.get(workspace_id.as_bytes())
-		.await
-		.deserialized()
+		.await?;
+	
+	let s = std::str::from_utf8(&bytes)
+		.map_err(|e| err!(Database(error!("Invalid UTF-8 for space room id: {e}"))))?;
+	OwnedRoomId::parse(s)
+		.map_err(|e| err!(Database(error!("Invalid RoomId for space room id: {e}"))))
 }
 
 // ─── Room / Workspace mapping ─────────────────────────────────────────────────
@@ -90,11 +95,15 @@ pub fn set_workspace_id(&self, room_id: &RoomId, workspace_id: &str) {
 /// Lookup: roomId → workspaceId
 #[implement(Service)]
 pub async fn get_workspace_id(&self, room_id: &RoomId) -> Result<String> {
-	self.db
+	let bytes = self
+		.db
 		.roomid_workspaceid
 		.get(room_id.as_bytes())
-		.await
-		.deserialized()
+		.await?;
+	
+	std::str::from_utf8(&bytes)
+		.map(|s| s.to_owned())
+		.map_err(|e| err!(Database(error!("Invalid UTF-8 for workspace_id: {e}"))))
 }
 
 /// Stream tất cả roomId thuộc workspace từ RocksDB index (source of truth).
