@@ -7,7 +7,7 @@ use tuwunel_core::{Err, Result, err, matrix::pdu::PduBuilder, utils};
 
 use crate::Ruma;
 
-const CALL_KIND_FIELD: &str = "org.tuwunel.call.kind";
+const CALL_KIND_FIELD: &str = "call_kind";
 
 fn derive_call_kind_from_invite(content: &JsonValue) -> Option<&'static str> {
 	let sdp = content.get("offer")?.get("sdp")?.as_str()?;
@@ -184,7 +184,7 @@ mod tests {
 				"type": "offer",
 				"sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
 			},
-			"org.tuwunel.call.kind": "voice"
+			"call_kind": "voice"
 		});
 
 		enrich_call_invite_kind(&mut content);

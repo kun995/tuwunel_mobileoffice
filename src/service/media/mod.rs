@@ -520,7 +520,7 @@ impl Service {
 		// Using the hash of the base64 key as the filename
 		// This is to prevent the total length of the path from exceeding the maximum
 		// length in most filesystems
-		let digest = <sha2::Sha256 as sha2::Digest>::digest(key);
+		let digest = <sha2::Sha256 as Digest>::digest(key);
 		let encoded = encode_key(&digest);
 		r.push(encoded);
 		r

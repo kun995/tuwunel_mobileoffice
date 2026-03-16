@@ -1,4 +1,4 @@
-use axum::extract::State;
+use axum::{extract::State, http::Uri};
 use axum_client_ip::InsecureClientIp;
 use futures::{FutureExt, join};
 use ruma::{api::client::membership::invite_user, events::room::member::MembershipState};
@@ -7,6 +7,42 @@ use tuwunel_core::{Err, Result};
 use super::banned_room_check;
 use crate::{Ruma, client::utils::invite_check};
 
+fn parse_invite_batch_id(uri: &Uri) -> Option<String> {
+	let batch_id = uri
+		.query()
+		.and_then(|q| {
+			q.split('&')
+				.find_map(|part| part.strip_prefix("batch_id="))
+		})
+		.filter(|value| !value.is_empty() && value.len() <= 128)?;
+
+	Some(batch_id.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::parse_invite_batch_id;
+	use axum::http::Uri;
+
+	#[test]
+	fn parses_batch_id_from_query() {
+		let uri: Uri = "/_matrix/client/v3/rooms/!r:hs/invite?batch_id=batch-1&x=1"
+			.parse()
+			.expect("valid uri");
+
+		assert_eq!(parse_invite_batch_id(&uri), Some("batch-1".to_owned()));
+	}
+
+	#[test]
+	fn rejects_empty_batch_id() {
+		let uri: Uri = "/_matrix/client/v3/rooms/!r:hs/invite?batch_id="
+			.parse()
+			.expect("valid uri");
+
+		assert_eq!(parse_invite_batch_id(&uri), None);
+	}
+}
+
 /// # `POST /_matrix/client/r0/rooms/{roomId}/invite`
 ///
 /// Tries to send an invite event into the room.
@@ -14,9 +50,11 @@ use crate::{Ruma, client::utils::invite_check};
 pub(crate) async fn invite_user_route(
 	State(services): State<crate::State>,
 	InsecureClientIp(client): InsecureClientIp,
+	uri: Uri,
 	body: Ruma<invite_user::v3::Request>,
 ) -> Result<invite_user::v3::Response> {
 	let sender_user = body.sender_user();
+	let invite_batch_id = parse_invite_batch_id(&uri);
 
 	let room_id = &body.room_id;
 
@@ -91,7 +129,14 @@ pub(crate) async fn invite_user_route(
 
 	services
 		.membership
-		.invite(sender_user, user_id, room_id, body.reason.as_ref(), false)
+		.invite(
+			sender_user,
+			user_id,
+			room_id,
+			body.reason.as_ref(),
+			false,
+			invite_batch_id.as_deref(),
+		)
 		.boxed()
 		.await?;
 

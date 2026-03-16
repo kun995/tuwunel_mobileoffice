@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use futures::Stream;
 use ruma::{OwnedRoomId, RoomId};
-use tuwunel_core::{Result, implement, err, error, utils::stream::TryIgnore};
+use tuwunel_core::{Result, implement, err, utils::stream::TryIgnore};
 use tuwunel_core::utils::stream::ReadyExt;
-use tuwunel_database::{Deserialized, Map};
+use tuwunel_database::Map;
 
 pub struct Service {
 	db: Data,

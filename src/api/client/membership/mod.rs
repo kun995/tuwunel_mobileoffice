@@ -12,6 +12,7 @@ use std::net::IpAddr;
 
 use axum::extract::State;
 use futures::{FutureExt, StreamExt};
+use http::Uri;
 use ruma::{RoomId, RoomOrAliasId, UserId, api::client::membership::joined_rooms};
 use tuwunel_core::{Err, Result, result::LogErr, warn};
 use tuwunel_service::Services;
@@ -36,7 +37,7 @@ use crate::{Ruma, RumaResponse};
 /// Lists all rooms the user has joined, with optional workspace_id filter.
 pub(crate) async fn joined_rooms_route(
 	State(services): State<crate::State>,
-	uri: axum::http::Uri,
+	uri: Uri,
 	body: Ruma<joined_rooms::v3::Request>,
 ) -> Result<RumaResponse<joined_rooms::v3::Response>> {
 	use tuwunel_core::utils::stream::BroadbandExt;

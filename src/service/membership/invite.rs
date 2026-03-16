@@ -1,14 +1,47 @@
+use std::collections::BTreeMap;
+
 use futures::FutureExt;
 use ruma::{
 	OwnedServerName, RoomId, UserId,
 	api::federation::membership::create_invite,
-	events::room::member::{MembershipState, RoomMemberEventContent},
+	events::{StateEventContent, room::member::{MembershipState, RoomMemberEventContent}},
 };
+use serde_json::Value as JsonValue;
 use tuwunel_core::{
 	Err, Result, at, err, implement, matrix::event::gen_event_id_canonical_json, pdu::PduBuilder,
+	utils,
 };
 
-use super::Service;
+use super::{AUTO_INVITE_BATCH_WINDOW, InviteBatchState, Service};
+
+const INVITE_BATCH_ID_FIELD: &str = "membership_batch_id";
+
+fn invite_unsigned(batch_id: Option<&str>) -> Option<BTreeMap<String, JsonValue>> {
+	let batch_id = batch_id.filter(|value| !value.is_empty())?;
+	let mut unsigned = BTreeMap::new();
+	unsigned.insert(INVITE_BATCH_ID_FIELD.to_owned(), JsonValue::String(batch_id.to_owned()));
+	Some(unsigned)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{INVITE_BATCH_ID_FIELD, invite_unsigned};
+	use serde_json::Value as JsonValue;
+
+	#[test]
+	fn includes_batch_id_when_present() {
+		let unsigned = invite_unsigned(Some("batch-abc")).expect("has unsigned data");
+		assert_eq!(
+			unsigned.get(INVITE_BATCH_ID_FIELD),
+			Some(&JsonValue::String("batch-abc".to_owned()))
+		);
+	}
+
+	#[test]
+	fn returns_none_for_empty_batch_id() {
+		assert!(invite_unsigned(Some("")).is_none());
+	}
+}
 
 #[implement(Service)]
 #[tracing::instrument(
@@ -23,18 +56,69 @@ pub async fn invite(
 	room_id: &RoomId,
 	reason: Option<&String>,
 	is_direct: bool,
+	batch_id: Option<&str>,
 ) -> Result {
+	let resolved_batch_id = self
+		.resolve_invite_batch_id(sender_user, room_id, batch_id)
+		.await;
+
 	if self.services.globals.user_is_local(user_id) {
-		self.local_invite(sender_user, user_id, room_id, reason, is_direct)
+		self.local_invite(
+			sender_user,
+			user_id,
+			room_id,
+			reason,
+			is_direct,
+			Some(resolved_batch_id.as_str()),
+		)
 			.boxed()
 			.await?;
 	} else {
-		self.remote_invite(sender_user, user_id, room_id, reason, is_direct)
+		self.remote_invite(
+			sender_user,
+			user_id,
+			room_id,
+			reason,
+			is_direct,
+			Some(resolved_batch_id.as_str()),
+		)
 			.boxed()
 			.await?;
 	}
 
 	Ok(())
+}
+
+#[implement(Service)]
+async fn resolve_invite_batch_id(
+	&self,
+	sender_user: &UserId,
+	room_id: &RoomId,
+	provided_batch_id: Option<&str>,
+) -> String {
+	let key = (sender_user.to_owned(), room_id.to_owned());
+	let now = std::time::Instant::now();
+	let mut batches = self.invite_batches.lock().await;
+
+	batches.retain(|_, state| now.duration_since(state.updated_at) <= AUTO_INVITE_BATCH_WINDOW);
+
+	let batch_id = if let Some(batch_id) = provided_batch_id.filter(|value| !value.is_empty()) {
+		batch_id.to_owned()
+	} else if let Some(state) = batches.get(&key) {
+		state.batch_id.clone()
+	} else {
+		format!("auto_{}", utils::random_string(12))
+	};
+
+	batches.insert(
+		key,
+		InviteBatchState {
+			batch_id: batch_id.clone(),
+			updated_at: now,
+		},
+	);
+
+	batch_id
 }
 
 #[implement(Service)]
@@ -46,6 +130,7 @@ async fn remote_invite(
 	room_id: &RoomId,
 	reason: Option<&String>,
 	is_direct: bool,
+	batch_id: Option<&str>,
 ) -> Result {
 	let (pdu, pdu_json, invite_room_state) = {
 		let state_lock = self.services.state.mutex.lock(room_id).await;
@@ -67,7 +152,15 @@ async fn remote_invite(
 			.services
 			.timeline
 			.create_hash_and_sign_event(
-				PduBuilder::state(user_id.to_string(), &content),
+				PduBuilder {
+					event_type: content.event_type().into(),
+					state_key: Some(user_id.to_string().into()),
+					content: serde_json::value::to_raw_value(&content).expect(
+						"Invite membership content must serialize to RawValue"
+					),
+					unsigned: invite_unsigned(batch_id),
+					..Default::default()
+				},
 				sender_user,
 				room_id,
 				&state_lock,
@@ -163,6 +256,7 @@ async fn local_invite(
 	room_id: &RoomId,
 	reason: Option<&String>,
 	is_direct: bool,
+	batch_id: Option<&str>,
 ) -> Result {
 	if !self
 		.services
@@ -194,7 +288,14 @@ async fn local_invite(
 	self.services
 		.timeline
 		.build_and_append_pdu(
-			PduBuilder::state(user_id.to_string(), &content),
+			PduBuilder {
+				event_type: content.event_type().into(),
+				state_key: Some(user_id.to_string().into()),
+				content: serde_json::value::to_raw_value(&content)
+					.expect("Invite membership content must serialize to RawValue"),
+				unsigned: invite_unsigned(batch_id),
+				..Default::default()
+			},
 			sender_user,
 			room_id,
 			&state_lock,

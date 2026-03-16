@@ -412,7 +412,7 @@ pub(crate) async fn create_room_route(
 
 			if let Err(e) = services
 				.membership
-				.invite(sender_user, user_id, &room_id, None, body.is_direct)
+				.invite(sender_user, user_id, &room_id, None, body.is_direct, None)
 				.boxed()
 				.await
 			{

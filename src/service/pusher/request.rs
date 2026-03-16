@@ -10,7 +10,7 @@ use tuwunel_core::{
 	Err, Result, debug, err, implement, trace, utils::string_from_bytes, warn,
 };
 
-const CALL_KIND_FIELD: &str = "org.tuwunel.call.kind";
+const CALL_KIND_FIELD: &str = "call_kind";
 
 fn add_top_level_call_kind(body: &mut BytesMut) {
 	let Ok(mut payload) = serde_json::from_slice::<JsonValue>(body.as_ref()) else {
@@ -177,7 +177,7 @@ mod tests {
 	#[test]
 	fn promotes_call_kind_for_call_invite() {
 		let mut body = BytesMut::from(
-			r#"{"notification":{"type":"m.call.invite","content":{"org.tuwunel.call.kind":"video"}}}"#,
+			r#"{"notification":{"type":"m.call.invite","content":{"call_kind":"video"}}}"#,
 		);
 
 		add_top_level_call_kind(&mut body);
@@ -192,7 +192,7 @@ mod tests {
 	#[test]
 	fn ignores_non_call_invite_events() {
 		let mut body = BytesMut::from(
-			r#"{"notification":{"type":"m.room.message","content":{"org.tuwunel.call.kind":"voice"}}}"#,
+			r#"{"notification":{"type":"m.room.message","content":{"call_kind":"voice"}}}"#,
 		);
 
 		add_top_level_call_kind(&mut body);
