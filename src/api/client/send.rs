@@ -2,10 +2,51 @@ use std::collections::BTreeMap;
 
 use axum::extract::State;
 use ruma::{api::client::message::send_message_event, events::MessageLikeEventType};
-use serde_json::from_str;
+use serde_json::{Value as JsonValue, from_str, value::to_raw_value};
 use tuwunel_core::{Err, Result, err, matrix::pdu::PduBuilder, utils};
 
 use crate::Ruma;
+
+const CALL_KIND_FIELD: &str = "org.tuwunel.call.kind";
+
+fn derive_call_kind_from_invite(content: &JsonValue) -> Option<&'static str> {
+	let sdp = content.get("offer")?.get("sdp")?.as_str()?;
+
+	let mut has_audio = false;
+	let mut has_video = false;
+
+	for line in sdp.lines() {
+		let media = line.trim_start();
+
+		if media.starts_with("m=audio ") {
+			has_audio = true;
+		} else if media.starts_with("m=video ") {
+			has_video = true;
+		}
+	}
+
+	if has_video {
+		Some("video")
+	} else if has_audio {
+		Some("voice")
+	} else {
+		None
+	}
+}
+
+fn enrich_call_invite_kind(content: &mut JsonValue) {
+	if content.get(CALL_KIND_FIELD).is_some() {
+		return;
+	}
+
+	let Some(kind) = derive_call_kind_from_invite(content) else {
+		return;
+	};
+
+	if let Some(object) = content.as_object_mut() {
+		object.insert(CALL_KIND_FIELD.to_owned(), kind.into());
+	}
+}
 
 /// # `PUT /_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}`
 ///
@@ -65,7 +106,14 @@ pub(crate) async fn send_message_event_route(
 	let mut unsigned = BTreeMap::new();
 	unsigned.insert("transaction_id".to_owned(), body.txn_id.to_string().into());
 
-	let content = from_str(body.body.body.json().get())
+	let mut content = from_str(body.body.body.json().get())
+		.map_err(|e| err!(Request(BadJson("Invalid JSON body: {e}"))))?;
+
+	if body.event_type == MessageLikeEventType::CallInvite {
+		enrich_call_invite_kind(&mut content);
+	}
+
+	let content = to_raw_value(&content)
 		.map_err(|e| err!(Request(BadJson("Invalid JSON body: {e}"))))?;
 
 	let event_id = services
@@ -94,4 +142,53 @@ pub(crate) async fn send_message_event_route(
 	drop(state_lock);
 
 	Ok(send_message_event::v3::Response { event_id })
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{CALL_KIND_FIELD, enrich_call_invite_kind};
+	use serde_json::json;
+
+	#[test]
+	fn adds_voice_call_kind_for_audio_only_invite() {
+		let mut content = json!({
+			"offer": {
+				"type": "offer",
+				"sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+			}
+		});
+
+		enrich_call_invite_kind(&mut content);
+
+		assert_eq!(content[CALL_KIND_FIELD], "voice");
+	}
+
+	#[test]
+	fn adds_video_call_kind_when_video_media_exists() {
+		let mut content = json!({
+			"offer": {
+				"type": "offer",
+				"sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
+			}
+		});
+
+		enrich_call_invite_kind(&mut content);
+
+		assert_eq!(content[CALL_KIND_FIELD], "video");
+	}
+
+	#[test]
+	fn keeps_existing_call_kind() {
+		let mut content = json!({
+			"offer": {
+				"type": "offer",
+				"sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
+			},
+			"org.tuwunel.call.kind": "voice"
+		});
+
+		enrich_call_invite_kind(&mut content);
+
+		assert_eq!(content[CALL_KIND_FIELD], "voice");
+	}
 }
