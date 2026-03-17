@@ -245,6 +245,7 @@ where
 
 /// Encode a key (hash digest) to a string for use as S3 key
 #[cfg(feature = "s3_storage")]
+#[allow(dead_code)]
 fn encode_key(key: &[u8]) -> String {
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 	URL_SAFE_NO_PAD.encode(key)

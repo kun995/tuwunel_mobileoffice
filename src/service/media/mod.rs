@@ -460,6 +460,7 @@ impl Service {
 		Ok(fs::create_dir_all(dir).await?)
 	}
 
+	#[allow(dead_code)]
 	async fn remove_media_file(&self, key: &[u8]) -> Result {
 		let path = self.get_media_file(key);
 		let legacy = self.get_media_file_b64(key);
@@ -477,6 +478,7 @@ impl Service {
 		Ok(file_rm?)
 	}
 
+	#[allow(dead_code)]
 	async fn create_media_file(&self, key: &[u8]) -> Result<fs::File> {
 		let path = self.get_media_file(key);
 		debug!(?key, ?path, "Creating media file");

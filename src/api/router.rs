@@ -212,6 +212,10 @@ pub fn build(router: Router<State>, server: &Server) -> Router<State> {
 		.route(
 			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/delete_events",
 			post(client::delete_events_route),
+		)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/send_batch",
+			post(client::send_batch_events_route),
 		);
 
 	// SS endpoint not related to federation

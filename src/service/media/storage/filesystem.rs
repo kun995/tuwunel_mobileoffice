@@ -104,6 +104,7 @@ impl MediaStorage for FilesystemStorage {
 }
 
 /// Encode a key (hash digest) to a string for use as filename
+#[allow(dead_code)]
 fn encode_key(key: &[u8]) -> String {
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 	URL_SAFE_NO_PAD.encode(key)
