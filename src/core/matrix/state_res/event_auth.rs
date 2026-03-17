@@ -341,6 +341,13 @@ where
 		return Ok(());
 	}
 
+	// Tuwunel extension: allow any joined member to pin/unpin events for the room.
+	// We intentionally bypass power-level checks for m.room.pinned_events only.
+	if incoming_event.event_type().to_string() == "m.room.pinned_events" {
+		trace!("`m.room.pinned_events` event was allowed for joined member");
+		return Ok(());
+	}
+
 	// Since v1, if the event type's required power level is greater than the
 	// sender's power level, reject.
 	let event_type_power_level = current_room_power_levels_event.event_power_level(
