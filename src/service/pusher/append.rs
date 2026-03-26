@@ -114,7 +114,7 @@ pub(crate) async fn append_pdu(&self, pdu_id: RawPduId, pdu: &Pdu) -> Result {
 
 		join(increment_notify, increment_highlight).await;
 
-		if notify || highlight {
+		if notify || highlight || self.services.config.push_everything {
 			let id: PduId = pdu_id.into();
 			let notified = Notified {
 				ts: now_millis(),
@@ -130,7 +130,8 @@ pub(crate) async fn append_pdu(&self, pdu_id: RawPduId, pdu: &Pdu) -> Result {
 			}
 		}
 
-		if notify || highlight || self.services.config.push_everything {
+		let is_reaction = *pdu.kind() == TimelineEventType::Reaction;
+		if notify || highlight || is_reaction || self.services.config.push_everything {
 			self.services
 				.pusher
 				.get_pushkeys(user)

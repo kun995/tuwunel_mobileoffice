@@ -60,7 +60,9 @@ where
 		notify = Some(n);
 	}
 
-	if notify == Some(true) || self.services.config.push_everything {
+	let is_reaction = *event.kind() == TimelineEventType::Reaction;
+
+	if notify == Some(true) || is_reaction || self.services.config.push_everything {
 		let unread: UInt = self
 			.services
 			.pusher

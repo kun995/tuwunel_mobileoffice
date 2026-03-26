@@ -216,6 +216,11 @@ pub fn build(router: Router<State>, server: &Server) -> Router<State> {
 		.route(
 			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/send_batch",
 			post(client::send_batch_events_route),
+		)
+		// Returns the first unread event ID in a room for the authenticated user
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/first_unread_event",
+			get(client::get_first_unread_event_route),
 		);
 
 	// SS endpoint not related to federation

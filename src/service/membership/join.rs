@@ -27,7 +27,7 @@ use ruma::{
 };
 use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
-	Err, Result, debug, debug_error, debug_info, debug_warn, err, error, implement, info,
+	Err, Event, Result, debug, debug_error, debug_info, debug_warn, err, error, implement, info,
 	matrix::{event::gen_event_id_canonical_json, room_version},
 	pdu::{PduBuilder, format::from_incoming_federation},
 	state_res, trace,
@@ -112,6 +112,20 @@ pub async fn join(
 		|| servers.is_empty()
 		|| (servers.len() == 1 && self.services.globals.server_is_ours(&servers[0]));
 
+	let mut is_direct = None;
+	let mut inviter_id = None;
+	if let Ok(prev_member_pdu) = self
+		.services
+		.state_accessor
+		.room_state_get(room_id, &StateEventType::RoomMember, sender_user.as_str())
+		.await
+	{
+		if let Ok(prev_member) = prev_member_pdu.get_content::<RoomMemberEventContent>() {
+			is_direct = prev_member.is_direct;
+		}
+		inviter_id = Some(prev_member_pdu.sender.clone());
+	}
+
 	if local_join {
 		self.join_local(sender_user, room_id, reason, &servers, state_lock)
 			.boxed()
@@ -121,6 +135,12 @@ pub async fn join(
 		self.join_remote(sender_user, room_id, reason, &servers, state_lock)
 			.boxed()
 			.await?;
+	}
+
+	if let Some(true) = is_direct {
+		if let Some(inviter) = inviter_id {
+			self.update_m_direct_on_join(sender_user, &inviter, room_id).await;
+		}
 	}
 
 	Ok(())
@@ -571,12 +591,27 @@ pub async fn join_local(
 	)
 	.await;
 
+	let mut is_direct = None;
+	if let Ok(prev_member) = self
+		.services
+		.state_accessor
+		.room_state_get_content::<RoomMemberEventContent>(
+			room_id,
+			&StateEventType::RoomMember,
+			sender_user.as_str(),
+		)
+		.await
+	{
+		is_direct = prev_member.is_direct;
+	}
+
 	let content = RoomMemberEventContent {
 		displayname,
 		avatar_url,
 		blurhash,
 		reason: reason.clone(),
 		join_authorized_via_users_server,
+		is_direct,
 		..RoomMemberEventContent::new(MembershipState::Join)
 	};
 
@@ -715,6 +750,20 @@ async fn create_join_event(
 
 	let (displayname, avatar_url, blurhash) = join3(displayname, avatar_url, blurhash).await;
 
+	let mut is_direct = None;
+	if let Ok(prev_member) = self
+		.services
+		.state_accessor
+		.room_state_get_content::<RoomMemberEventContent>(
+			room_id,
+			&StateEventType::RoomMember,
+			sender_user.as_str(),
+		)
+		.await
+	{
+		is_direct = prev_member.is_direct;
+	}
+
 	event.insert(
 		"content".into(),
 		to_canonical_value(RoomMemberEventContent {
@@ -723,6 +772,7 @@ async fn create_join_event(
 			blurhash,
 			reason,
 			join_authorized_via_users_server: join_authorized_via_users_server.clone(),
+			is_direct,
 			..RoomMemberEventContent::new(MembershipState::Join)
 		})?,
 	);
@@ -855,6 +905,46 @@ async fn make_join_request(
 	}
 
 	make_join_response_and_server
+}
+
+#[implement(Service)]
+pub(crate) async fn update_m_direct_on_join(
+	&self,
+	sender_user: &UserId,
+	inviter_id: &UserId,
+	room_id: &RoomId,
+) {
+	let mut direct_content: std::collections::BTreeMap<
+		OwnedUserId,
+		Vec<ruma::OwnedRoomId>,
+	> = self
+		.services
+		.account_data
+		.get_global(sender_user, ruma::events::GlobalAccountDataEventType::Direct)
+		.await
+		.unwrap_or_default();
+
+	let entry = direct_content.entry(inviter_id.to_owned()).or_default();
+	if !entry.contains(&room_id.to_owned()) {
+		entry.push(room_id.to_owned());
+
+		if let Err(e) = self
+			.services
+			.account_data
+			.update(
+				None,
+				sender_user,
+				ruma::events::RoomAccountDataEventType::from("m.direct"),
+				&serde_json::json!({
+					"type": "m.direct",
+					"content": direct_content,
+				}),
+			)
+			.await
+		{
+			warn!(%e, "Failed to update m.direct account data for joining user");
+		}
+	}
 }
 
 pub(super) async fn get_servers_for_room(

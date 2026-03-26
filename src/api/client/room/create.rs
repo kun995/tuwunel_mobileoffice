@@ -503,37 +503,74 @@ pub(crate) async fn create_room_route(
 
 			// Bước B: Gửi m.space.child event vào Space (best-effort, Matrix spec compliance)
 			// Nếu lỗi → chỉ warn, không ảnh hưởng tính đúng đắn vì filter dùng RocksDB index.
-			if let Ok(space_room_id) = services.workspace.get_space_room_id(wid).await {
-				let server_name = services.globals.server_name().to_owned();
-				let space_lock = services.state.mutex.lock(&space_room_id).await;
-				let child_content = SpaceChildEventContent {
-					via: vec![server_name],
-					suggested: false,
-					order: None,
-				};
-				if let Err(e) = services
-					.timeline
-					.build_and_append_pdu(
-						PduBuilder {
-							event_type: TimelineEventType::SpaceChild,
-							content: to_raw_value(&child_content)?,
-							state_key: Some(room_id.as_str().into()),
-							..Default::default()
-						},
-						sender_user,
-						&space_room_id,
-						&space_lock,
-					)
-					.boxed()
-					.await
-				{
-					// Best-effort: room đã được ghi vào RocksDB index rồi,
-					// filter vẫn hoạt động đúng. Space child chỉ phục vụ Matrix clients khác.
-					warn!(%e, %room_id, %space_room_id, "Failed to send m.space.child event (best-effort); workspace DB index is intact");
+			// Bỏ qua nếu là phòng 1-1 để tránh client nhầm lẫn là group chat
+			if !body.is_direct {
+				if let Ok(space_room_id) = services.workspace.get_space_room_id(wid).await {
+					let server_name = services.globals.server_name().to_owned();
+					let space_lock = services.state.mutex.lock(&space_room_id).await;
+					let child_content = SpaceChildEventContent {
+						via: vec![server_name],
+						suggested: false,
+						order: None,
+					};
+					if let Err(e) = services
+						.timeline
+						.build_and_append_pdu(
+							PduBuilder {
+								event_type: TimelineEventType::SpaceChild,
+								content: to_raw_value(&child_content)?,
+								state_key: Some(room_id.as_str().into()),
+								..Default::default()
+							},
+							sender_user,
+							&space_room_id,
+							&space_lock,
+						)
+						.boxed()
+						.await
+					{
+						// Best-effort: room đã được ghi vào RocksDB index rồi,
+						// filter vẫn hoạt động đúng. Space child chỉ phục vụ Matrix clients khác.
+						warn!(%e, %room_id, %space_room_id, "Failed to send m.space.child event (best-effort); workspace DB index is intact");
+					}
+				} else {
+					warn!(%room_id, workspace_id = %wid, "workspace_id provided but no Space room found for this workspace; skipping m.space.child");
 				}
-			} else {
-				warn!(%room_id, workspace_id = %wid, "workspace_id provided but no Space room found for this workspace; skipping m.space.child");
 			}
+		}
+	}
+
+	if body.is_direct {
+		let mut direct_content: std::collections::BTreeMap<
+			ruma::OwnedUserId,
+			Vec<ruma::OwnedRoomId>,
+		> = services
+			.account_data
+			.get_global(sender_user, ruma::events::GlobalAccountDataEventType::Direct)
+			.await
+			.unwrap_or_default();
+
+		for user_id in &body.invite {
+			let entry = direct_content.entry(user_id.clone()).or_default();
+			if !entry.contains(&room_id) {
+				entry.push(room_id.clone());
+			}
+		}
+
+		if let Err(e) = services
+			.account_data
+			.update(
+				None,
+				sender_user,
+				ruma::events::RoomAccountDataEventType::from("m.direct"),
+				&serde_json::json!({
+					"type": "m.direct",
+					"content": direct_content,
+				}),
+			)
+			.await
+		{
+			warn!(%e, "Failed to update m.direct account data for room creator");
 		}
 	}
 
