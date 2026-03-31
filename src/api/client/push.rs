@@ -343,7 +343,9 @@ pub(crate) async fn set_pushrule_route(
 		.account_data
 		.get_global(sender_user, GlobalAccountDataEventType::PushRules)
 		.await
-		.map_err(|_| err!(Request(NotFound("PushRules event not found."))))?;
+		.unwrap_or_else(|_| PushRulesEvent {
+			content: PushRulesEventContent { global: Ruleset::server_default(sender_user) },
+		});
 
 	if let Err(error) = account_data.content.global.insert(
 		body.rule.clone(),
@@ -433,7 +435,9 @@ pub(crate) async fn set_pushrule_actions_route(
 		.account_data
 		.get_global(sender_user, GlobalAccountDataEventType::PushRules)
 		.await
-		.map_err(|_| err!(Request(NotFound("PushRules event not found."))))?;
+		.unwrap_or_else(|_| PushRulesEvent {
+			content: PushRulesEventContent { global: Ruleset::server_default(sender_user) },
+		});
 
 	if account_data
 		.content
@@ -500,7 +504,9 @@ pub(crate) async fn set_pushrule_enabled_route(
 		.account_data
 		.get_global(sender_user, GlobalAccountDataEventType::PushRules)
 		.await
-		.map_err(|_| err!(Request(NotFound("PushRules event not found."))))?;
+		.unwrap_or_else(|_| PushRulesEvent {
+			content: PushRulesEventContent { global: Ruleset::server_default(sender_user) },
+		});
 
 	if account_data
 		.content
@@ -533,7 +539,9 @@ pub(crate) async fn delete_pushrule_route(
 		.account_data
 		.get_global(sender_user, GlobalAccountDataEventType::PushRules)
 		.await
-		.map_err(|_| err!(Request(NotFound("PushRules event not found."))))?;
+		.unwrap_or_else(|_| PushRulesEvent {
+			content: PushRulesEventContent { global: Ruleset::server_default(sender_user) },
+		});
 
 	if let Err(error) = account_data
 		.content

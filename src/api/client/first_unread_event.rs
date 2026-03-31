@@ -7,7 +7,7 @@ use axum_extra::{
 	headers::{Authorization, authorization::Bearer},
 };
 use ruma::{RoomId, api::client::error::ErrorKind};
-use tuwunel_core::{Err, Error, Result, err};
+use tuwunel_core::{Err, Error, Result};
 
 /// # `GET /_matrix/client/unstable/org.tuwunel/rooms/{roomId}/first_unread_event`
 ///

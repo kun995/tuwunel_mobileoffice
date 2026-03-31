@@ -383,6 +383,36 @@ pub(crate) async fn create_room_route(
 			.await?;
 	}
 
+	// 7.9 Send a non-state "room created" timeline event so the client has a
+	// fresh origin_server_ts to sort this room to the top of the room list.
+	// All previous creation events are state events and get moved to the `state`
+	// section on subsequent syncs — leaving new rooms without messages at the
+	// bottom of the list. This timeline event fixes that.
+	{
+		let mut created_content = serde_json::Map::new();
+		if let Some(ref name) = body.name {
+			created_content.insert("room_name".to_owned(), serde_json::Value::String(name.clone()));
+		}
+		if let Err(e) = services
+			.timeline
+			.build_and_append_pdu(
+				PduBuilder {
+					event_type: TimelineEventType::from("im.tuwunel.room.created"),
+					content: to_raw_value(&created_content)?,
+					state_key: None, // non-state: stays in timeline across syncs
+					..Default::default()
+				},
+				sender_user,
+				&room_id,
+				&state_lock,
+			)
+			.boxed()
+			.await
+		{
+			warn!(%e, %room_id, "Failed to send im.tuwunel.room.created event (non-fatal)");
+		}
+	}
+
 	drop(next_count);
 	drop(state_lock);
 
@@ -541,9 +571,9 @@ pub(crate) async fn create_room_route(
 	}
 
 	if body.is_direct {
-		let mut direct_content: std::collections::BTreeMap<
-			ruma::OwnedUserId,
-			Vec<ruma::OwnedRoomId>,
+		let mut direct_content: BTreeMap<
+			OwnedUserId,
+			Vec<OwnedRoomId>,
 		> = services
 			.account_data
 			.get_global(sender_user, ruma::events::GlobalAccountDataEventType::Direct)
@@ -652,6 +682,15 @@ async fn create_create_event(
 		}
 	}
 
+	// Embed room name into the create event so clients can display
+	// "UserA created the group «Room name»" as a single system message.
+	if let Some(ref name) = body.name {
+		create_content.insert(
+			"room_name".into(),
+			json!(name).try_into()?,
+		);
+	}
+
 	// 1. The room create event, using a placeholder room_id
 	let room_id = ruma::room_id!("!thiswillbereplaced").to_owned();
 	let state_lock = services.state.mutex.lock(&room_id).await;
@@ -698,7 +737,7 @@ async fn create_create_event_legacy(
 		.get_or_create_shortroomid(&room_id)
 		.await;
 
-	let create_content = match &body.creation_content {
+	let mut create_content = match &body.creation_content {
 		| Some(content) => {
 			use RoomVersionId::*;
 
@@ -763,6 +802,15 @@ async fn create_create_event_legacy(
 			content
 		},
 	};
+
+	// Embed room name into the create event so clients can display
+	// "UserA created the group «Room name»" as a single system message.
+	if let Some(ref name) = body.name {
+		create_content.insert(
+			"room_name".into(),
+			json!(name).try_into()?,
+		);
+	}
 
 	// 1. The room create event
 	services
@@ -834,6 +882,17 @@ fn default_power_levels_content(
 			.map_err(|e| err!(Request(BadJson("Invalid power_level_content_override: {e:?}"))))?;
 
 		for (key, value) in json {
+			// Deep-merge "users" and "events" sub-objects instead of replacing them
+			// wholesale. A shallow replace would wipe out the creator's power level
+			// (set above) and the security-hardened event defaults.
+			if (key == "users" || key == "events") && value.is_object() {
+				if let Some(existing) = power_levels_content[key.as_str()].as_object_mut() {
+					for (sub_key, sub_val) in value.as_object().expect("checked above") {
+						existing.insert(sub_key.clone(), sub_val.clone());
+					}
+					continue;
+				}
+			}
 			power_levels_content[key] = value;
 		}
 	}
