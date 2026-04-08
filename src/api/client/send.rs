@@ -1,13 +1,27 @@
 use std::collections::BTreeMap;
 
 use axum::extract::State;
-use ruma::{api::client::message::send_message_event, events::MessageLikeEventType};
+use ruma::{
+	UserId,
+	api::client::message::send_message_event,
+	events::MessageLikeEventType,
+};
 use serde_json::{Value as JsonValue, from_str, value::to_raw_value};
 use tuwunel_core::{Err, Result, err, matrix::pdu::PduBuilder, utils};
+use tuwunel_service::Services;
 
 use crate::Ruma;
 
 const CALL_KIND_FIELD: &str = "call_kind";
+
+/// Custom event type for system-level activity notifications.
+/// Clients should render this as a system message (not a regular chat bubble).
+/// - Sender sees `self_text`.
+/// - Everyone else sees `other_text` (with `{sender_display}` already expanded by server).
+pub(crate) const ACTIVITY_EVENT_TYPE: &str = "im.tuwunel.activity";
+
+/// Placeholder inside `other_text` that the server expands to the sender's display name.
+const ACTIVITY_SENDER_PLACEHOLDER: &str = "{sender_display}";
 
 fn derive_call_kind_from_invite(content: &JsonValue) -> Option<&'static str> {
 	let sdp = content.get("offer")?.get("sdp")?.as_str()?;
@@ -113,6 +127,10 @@ pub(crate) async fn send_message_event_route(
 		enrich_call_invite_kind(&mut content);
 	}
 
+	if body.event_type.to_string() == ACTIVITY_EVENT_TYPE {
+		enrich_activity_message(&services, sender_user, &mut content).await;
+	}
+
 	let content = to_raw_value(&content)
 		.map_err(|e| err!(Request(BadJson("Invalid JSON body: {e}"))))?;
 
@@ -142,6 +160,31 @@ pub(crate) async fn send_message_event_route(
 	drop(state_lock);
 
 	Ok(send_message_event::v3::Response { event_id })
+}
+
+/// Expand the `{sender_display}` placeholder in the `other_text` field of an
+/// `im.tuwunel.activity` event with the actual display name (or MXID) of the sender.
+///
+/// This is done server-side so that any Matrix client — even one that has no knowledge
+/// of this custom event type — will display a meaningful, fully-resolved string.
+async fn enrich_activity_message(
+	services: &Services,
+	sender_user: &UserId,
+	content: &mut JsonValue,
+) {
+	// Resolve the sender's display name; fall back gracefully to the full MXID.
+	let display_name = services
+		.users
+		.displayname(sender_user)
+		.await
+		.unwrap_or_else(|_| sender_user.to_string());
+
+	if let Some(other_text) = content.get_mut("other_text") {
+		if let Some(s) = other_text.as_str() {
+			let expanded = s.replace(ACTIVITY_SENDER_PLACEHOLDER, &display_name);
+			*other_text = JsonValue::String(expanded);
+		}
+	}
 }
 
 #[cfg(test)]

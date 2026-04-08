@@ -257,10 +257,12 @@ where
 		return true;
 	}
 
-	if IGNORED_MESSAGE_TYPES
-		.binary_search(event.kind())
-		.is_err()
-	{
+	// `im.tuwunel.activity` events (custom system notifications) must also obey the
+	// sender-ignore rules, just like standard message types in IGNORED_MESSAGE_TYPES.
+	// We cannot add a runtime string to the sorted const array, so we check separately.
+	let is_activity = event.kind().to_cow_str() == super::send::ACTIVITY_EVENT_TYPE;
+
+	if !is_activity && IGNORED_MESSAGE_TYPES.binary_search(event.kind()).is_err() {
 		return false;
 	}
 

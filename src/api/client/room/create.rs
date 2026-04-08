@@ -571,36 +571,41 @@ pub(crate) async fn create_room_route(
 	}
 
 	if body.is_direct {
-		let mut direct_content: BTreeMap<
-			OwnedUserId,
-			Vec<OwnedRoomId>,
-		> = services
+		// Load the current m.direct global account data (userId → [roomId] map).
+		// m.direct is a *global* account data event, not room-scoped.
+		let mut direct_map: BTreeMap<OwnedUserId, Vec<OwnedRoomId>> = services
 			.account_data
 			.get_global(sender_user, ruma::events::GlobalAccountDataEventType::Direct)
 			.await
 			.unwrap_or_default();
 
+		// Add this new room under each invited user's entry.
 		for user_id in &body.invite {
-			let entry = direct_content.entry(user_id.clone()).or_default();
+			let entry = direct_map.entry(user_id.clone()).or_default();
 			if !entry.contains(&room_id) {
 				entry.push(room_id.clone());
 			}
 		}
 
+		// Persist using GlobalAccountDataEventType so the event is stored and
+		// delivered via sync under global account_data (not per-room).
+		// The update() API requires the full Matrix event envelope {type, content}.
 		if let Err(e) = services
 			.account_data
 			.update(
-				None,
+				None, // None = global (not room-scoped)
 				sender_user,
-				ruma::events::RoomAccountDataEventType::from("m.direct"),
+				ruma::events::GlobalAccountDataEventType::Direct
+					.to_string()
+					.into(),
 				&serde_json::json!({
 					"type": "m.direct",
-					"content": direct_content,
+					"content": direct_map,
 				}),
 			)
 			.await
 		{
-			warn!(%e, "Failed to update m.direct account data for room creator");
+			warn!(%e, "Failed to update m.direct global account data for room creator");
 		}
 	}
 
