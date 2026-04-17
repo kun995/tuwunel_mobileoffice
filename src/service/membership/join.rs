@@ -914,36 +914,13 @@ pub(crate) async fn update_m_direct_on_join(
 	inviter_id: &UserId,
 	room_id: &RoomId,
 ) {
-	let mut direct_content: std::collections::BTreeMap<
-		OwnedUserId,
-		Vec<ruma::OwnedRoomId>,
-	> = self
+	if let Err(e) = self
 		.services
 		.account_data
-		.get_global(sender_user, ruma::events::GlobalAccountDataEventType::Direct)
+		.add_direct_room_for_user(sender_user, inviter_id, room_id)
 		.await
-		.unwrap_or_default();
-
-	let entry = direct_content.entry(inviter_id.to_owned()).or_default();
-	if !entry.contains(&room_id.to_owned()) {
-		entry.push(room_id.to_owned());
-
-		if let Err(e) = self
-			.services
-			.account_data
-			.update(
-				None,
-				sender_user,
-				ruma::events::RoomAccountDataEventType::from("m.direct"),
-				&serde_json::json!({
-					"type": "m.direct",
-					"content": direct_content,
-				}),
-			)
-			.await
-		{
-			warn!(%e, "Failed to update m.direct account data for joining user");
-		}
+	{
+		warn!(%e, "Failed to merge m.direct account data for joining user");
 	}
 }
 

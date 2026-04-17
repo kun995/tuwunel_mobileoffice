@@ -1,11 +1,7 @@
 use std::collections::BTreeMap;
 
 use axum::extract::State;
-use ruma::{
-	UserId,
-	api::client::message::send_message_event,
-	events::MessageLikeEventType,
-};
+use ruma::{UserId, api::client::message::send_message_event, events::MessageLikeEventType};
 use serde_json::{Value as JsonValue, from_str, value::to_raw_value};
 use tuwunel_core::{Err, Result, err, matrix::pdu::PduBuilder, utils};
 use tuwunel_service::Services;
@@ -13,6 +9,9 @@ use tuwunel_service::Services;
 use crate::Ruma;
 
 const CALL_KIND_FIELD: &str = "call_kind";
+const EMAIL_PAYLOAD_KEY: &str = "emailPayload";
+const EMAIL_PAYLOAD_KIND: &str = "large_payload_ref";
+const EMAIL_PAYLOAD_STORAGE_MXC: &str = "mxc";
 
 /// Custom event type for system-level activity notifications.
 /// Clients should render this as a system message (not a regular chat bubble).
@@ -60,6 +59,81 @@ fn enrich_call_invite_kind(content: &mut JsonValue) {
 	if let Some(object) = content.as_object_mut() {
 		object.insert(CALL_KIND_FIELD.to_owned(), kind.into());
 	}
+}
+
+fn validate_email_payload_stub(content: &JsonValue) -> Result {
+	let Some(stub) = content.get(EMAIL_PAYLOAD_KEY) else {
+		return Ok(());
+	};
+
+	let Some(stub) = stub.as_object() else {
+		return Err!(Request(InvalidParam("`emailPayload` must be a JSON object.")));
+	};
+
+	let kind = stub
+		.get("kind")
+		.and_then(JsonValue::as_str)
+		.ok_or_else(|| err!(Request(InvalidParam("`emailPayload.kind` is required."))))?;
+
+	if kind != EMAIL_PAYLOAD_KIND {
+		return Err!(Request(InvalidParam("`emailPayload.kind` must be `large_payload_ref`.")));
+	}
+
+	let storage = stub
+		.get("storage")
+		.and_then(JsonValue::as_str)
+		.ok_or_else(|| err!(Request(InvalidParam("`emailPayload.storage` is required."))))?;
+
+	if storage != EMAIL_PAYLOAD_STORAGE_MXC {
+		return Err!(Request(InvalidParam("`emailPayload.storage` must be `mxc`.")));
+	}
+
+	let uri = stub
+		.get("uri")
+		.and_then(JsonValue::as_str)
+		.ok_or_else(|| err!(Request(InvalidParam("`emailPayload.uri` is required."))))?;
+
+	if !is_valid_mxc_uri(uri) {
+		return Err!(Request(InvalidParam("`emailPayload.uri` must be a valid mxc:// URI.")));
+	}
+
+	if let Some(version) = stub.get("v")
+		&& version.as_u64().is_none_or(|v| v == 0)
+	{
+		return Err!(Request(InvalidParam("`emailPayload.v` must be a positive integer.")));
+	}
+
+	if let Some(size) = stub.get("size")
+		&& size.as_u64().is_none_or(|v| v == 0)
+	{
+		return Err!(Request(InvalidParam("`emailPayload.size` must be a positive integer.")));
+	}
+
+	if let Some(sha256) = stub.get("sha256")
+		&& sha256
+			.as_str()
+			.is_none_or(|value| value.trim().is_empty())
+	{
+		return Err!(Request(InvalidParam("`emailPayload.sha256` must be a non-empty string.")));
+	}
+
+	Ok(())
+}
+
+fn is_valid_mxc_uri(uri: &str) -> bool {
+	let Some(rest) = uri.strip_prefix("mxc://") else {
+		return false;
+	};
+
+	let mut parts = rest.split('/');
+	let Some(server_name) = parts.next() else {
+		return false;
+	};
+	let Some(media_id) = parts.next() else {
+		return false;
+	};
+
+	!server_name.is_empty() && !media_id.is_empty() && parts.next().is_none()
 }
 
 /// # `PUT /_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}`
@@ -131,8 +205,10 @@ pub(crate) async fn send_message_event_route(
 		enrich_activity_message(&services, sender_user, &mut content).await;
 	}
 
-	let content = to_raw_value(&content)
-		.map_err(|e| err!(Request(BadJson("Invalid JSON body: {e}"))))?;
+	validate_email_payload_stub(&content)?;
+
+	let content =
+		to_raw_value(&content).map_err(|e| err!(Request(BadJson("Invalid JSON body: {e}"))))?;
 
 	let event_id = services
 		.timeline
@@ -189,7 +265,9 @@ async fn enrich_activity_message(
 
 #[cfg(test)]
 mod tests {
-	use super::{CALL_KIND_FIELD, enrich_call_invite_kind};
+	use super::{
+		CALL_KIND_FIELD, EMAIL_PAYLOAD_KEY, enrich_call_invite_kind, validate_email_payload_stub,
+	};
 	use serde_json::json;
 
 	#[test]
@@ -233,5 +311,49 @@ mod tests {
 		enrich_call_invite_kind(&mut content);
 
 		assert_eq!(content[CALL_KIND_FIELD], "voice");
+	}
+
+	#[test]
+	fn accepts_valid_email_payload_stub() {
+		let content = json!({
+			"msgtype": "m.text",
+			"body": "hello",
+			"emailPayload": {
+				"v": 1,
+				"kind": "large_payload_ref",
+				"storage": "mxc",
+				"uri": "mxc://example.org/abc123",
+				"size": 100,
+				"sha256": "hash"
+			}
+		});
+
+		assert!(validate_email_payload_stub(&content).is_ok());
+	}
+
+	#[test]
+	fn rejects_invalid_email_payload_uri() {
+		let content = json!({
+			"msgtype": "m.text",
+			"body": "hello",
+			"emailPayload": {
+				"kind": "large_payload_ref",
+				"storage": "mxc",
+				"uri": "https://example.org/file.json"
+			}
+		});
+
+		assert!(validate_email_payload_stub(&content).is_err());
+	}
+
+	#[test]
+	fn accepts_content_without_email_payload_stub() {
+		let content = json!({
+			"msgtype": "m.text",
+			"body": "plain message"
+		});
+
+		assert!(content.get(EMAIL_PAYLOAD_KEY).is_none());
+		assert!(validate_email_payload_stub(&content).is_ok());
 	}
 }
