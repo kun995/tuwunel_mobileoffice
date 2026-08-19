@@ -21,7 +21,9 @@ impl crate::Service for Service {
 		}))
 	}
 
-	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
+	fn name(&self) -> &str {
+		crate::service::make_name(std::module_path!())
+	}
 }
 
 impl Service {
@@ -42,6 +44,10 @@ impl Service {
 	/// Returns `true` if the given event has been deleted by the given user.
 	pub async fn is_deleted(&self, user_id: &UserId, event_id: &EventId) -> bool {
 		let key = (user_id, event_id);
-		self.db.usereventsid_deleted.qry(&key).await.is_ok()
+		self.db
+			.usereventsid_deleted
+			.qry(&key)
+			.await
+			.is_ok()
 	}
 }

@@ -52,7 +52,9 @@ impl crate::Service for Service {
 		}))
 	}
 
-	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
+	fn name(&self) -> &str {
+		crate::service::make_name(std::module_path!())
+	}
 }
 
 #[implement(Service)]
@@ -108,6 +110,15 @@ pub async fn search_pdus<'a>(
 		})
 		.ready_filter(|pdu| !pdu.is_redacted())
 		.ready_filter(move |pdu| filter.matches(pdu))
+		.wide_filter_map(async |pdu| {
+			let user_id = query.user_id?;
+			(!self
+				.services
+				.deleted_events
+				.is_deleted(user_id, pdu.event_id())
+				.await)
+				.then_some(pdu)
+		})
 		.wide_filter_map(async |pdu| {
 			self.services
 				.state_accessor

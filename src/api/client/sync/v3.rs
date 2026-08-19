@@ -129,13 +129,11 @@ pub(crate) async fn sync_events_route(
 	uri: Uri,
 	body: Ruma<sync_events::v3::Request>,
 ) -> Result<sync_events::v3::Response> {
-	let workspace_id: Option<String> = uri
-		.query()
-		.and_then(|q| {
-			q.split('&')
-				.find(|p| p.starts_with("workspace_id="))
-				.map(|p| p.trim_start_matches("workspace_id=").to_owned())
-		});
+	let workspace_id: Option<String> = uri.query().and_then(|q| {
+		q.split('&')
+			.find(|p| p.starts_with("workspace_id="))
+			.map(|p| p.trim_start_matches("workspace_id=").to_owned())
+	});
 	let sender_user = body.sender_user();
 	let sender_device = body.sender_device.as_deref();
 
@@ -299,9 +297,16 @@ async fn check_workspace_filter_with_state<S>(
 
 /// Kiểm tra xem phòng DM có chưa có tin nhắn nào không.
 /// Trả về `true` nếu cần ẩn phòng (là DM + chưa có message event).
-async fn is_empty_direct_room(services: &Services, sender_user: &UserId, room_id: &OwnedRoomId) -> bool {
+async fn is_empty_direct_room(
+	services: &Services,
+	sender_user: &UserId,
+	room_id: &OwnedRoomId,
+) -> bool {
 	// Chỉ áp dụng cho phòng được đánh dấu là direct chat trong account data của user
-	let is_dm = services.account_data.is_direct(sender_user, room_id).await;
+	let is_dm = services
+		.account_data
+		.is_direct(sender_user, room_id)
+		.await;
 	if !is_dm {
 		return false;
 	}
@@ -353,9 +358,15 @@ async fn build_sync_events(
 		.rooms_joined(sender_user)
 		.ready_filter(|&room_id| filter.room.matches(room_id))
 		.map(ToOwned::to_owned)
-		.broad_filter_map(|room_id| {
-			check_workspace_filter(services, workspace_id, room_id)
+		.broad_filter_map(|room_id| async move {
+			services
+				.deleted_rooms
+				.should_hide_room(sender_user, &room_id)
+				.await
+				.eq(&false)
+				.then_some(room_id)
 		})
+		.broad_filter_map(|room_id| check_workspace_filter(services, workspace_id, room_id))
 		.broad_filter_map(|room_id| {
 			// Khi initial sync (since==0), ẩn các phòng DM chưa có tin nhắn
 			check_empty_direct_filter(services, sender_user, since, room_id)

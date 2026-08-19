@@ -140,12 +140,13 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	trace!("Performing soft-fail check");
 	let soft_fail = match incoming_pdu.redacts_id(room_version) {
 		| None => false,
-		| Some(redact_id) =>
+		| Some(redact_id) => {
 			!self
 				.services
 				.state_accessor
 				.user_can_redact(&redact_id, incoming_pdu.sender(), incoming_pdu.room_id(), true)
-				.await?,
+				.await?
+		},
 	};
 
 	// 13. Use state resolution to find new room state

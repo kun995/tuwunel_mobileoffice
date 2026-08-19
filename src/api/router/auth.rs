@@ -88,7 +88,9 @@ pub(super) async fn auth(
 	let token = match find_token(services, token).await? {
 		| User((user_id, device_id, expires_at))
 			if expires_at.is_some_and(is_less_than!(SystemTime::now())) =>
-			Expired((user_id, device_id)),
+		{
+			Expired((user_id, device_id))
+		},
 
 		| token => token,
 	};
@@ -108,8 +110,9 @@ pub(super) async fn auth(
 			Ok(Auth::default())
 		},
 
-		| (_, Invalid) =>
-			Err(BadRequest(UnknownToken { soft_logout: false }, "Unknown access token.")),
+		| (_, Invalid) => {
+			Err(BadRequest(UnknownToken { soft_logout: false }, "Unknown access token."))
+		},
 
 		| (_, Expired((user_id, device_id))) => {
 			services
@@ -137,7 +140,9 @@ pub(super) async fn auth(
 		| (AccessToken | AppserviceToken, Token::None) => match metadata {
 			| &get_turn_server_info::v3::Request::METADATA
 				if services.server.config.turn_allow_guests =>
-				Ok(Auth::default()),
+			{
+				Ok(Auth::default())
+			},
 
 			| _ => Err!(Request(MissingToken("Missing access token."))),
 		},
@@ -160,8 +165,9 @@ pub(super) async fn auth(
 			..Auth::default()
 		}),
 
-		| (AccessTokenOptional | AppserviceTokenOptional | AuthScheme::None, Token::None) =>
-			Ok(Auth::default()),
+		| (AccessTokenOptional | AppserviceTokenOptional | AuthScheme::None, Token::None) => {
+			Ok(Auth::default())
+		},
 	}
 }
 
@@ -182,23 +188,27 @@ fn check_auth_still_required(services: &Services, metadata: &Metadata, token: &T
 				.server
 				.config
 				.require_auth_for_profile_requests =>
+		{
 			match token {
 				| Token::Appservice(_) | Token::User(_) => Ok(()),
 				| Token::None | Token::Expired(_) | Token::Invalid => {
 					Err!(Request(MissingToken("Missing or invalid access token.")))
 				},
-			},
+			}
+		},
 		| &get_public_rooms::v3::Request::METADATA
 			if !services
 				.server
 				.config
 				.allow_public_room_directory_without_auth =>
+		{
 			match token {
 				| Token::Appservice(_) | Token::User(_) => Ok(()),
 				| Token::None | Token::Expired(_) | Token::Invalid => {
 					Err!(Request(MissingToken("Missing or invalid access token.")))
 				},
-			},
+			}
+		},
 		| _ => Ok(()),
 	}
 }

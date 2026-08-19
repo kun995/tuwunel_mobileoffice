@@ -77,7 +77,9 @@ pub(crate) async fn get_login_types_route(
 			.filter(|login_type| match login_type {
 				| LoginType::Sso(SsoLoginType { identity_providers })
 					if list_idps && identity_providers.is_empty() =>
-					false,
+				{
+					false
+				},
 
 				| _ => true,
 			})
@@ -110,8 +112,9 @@ pub(crate) async fn login_route(
 		| LoginInfo::Password(info) => password::handle_login(&services, &body, info).await?,
 		| LoginInfo::Token(info) => token::handle_login(&services, &body, info).await?,
 		| LoginInfo::Jwt(info) => jwt::handle_login(&services, &body, info).await?,
-		| LoginInfo::ApplicationService(info) =>
-			appservice::handle_login(&services, &body, info)?,
+		| LoginInfo::ApplicationService(info) => {
+			appservice::handle_login(&services, &body, info)?
+		},
 		| _ => {
 			return Err!(Request(Unknown(debug_warn!(
 				?body.login_info,

@@ -26,11 +26,18 @@ pub(crate) async fn delete_event_route(
 		.find_from_token(token.token())
 		.await
 		.map_err(|_| {
-			Error::BadRequest(ErrorKind::UnknownToken { soft_logout: false }, "Unknown access token.")
+			Error::BadRequest(
+				ErrorKind::UnknownToken { soft_logout: false },
+				"Unknown access token.",
+			)
 		})?;
 
 	// Verify the user is in the room
-	if !services.state_cache.is_joined(&sender_user, &room_id).await {
+	if !services
+		.state_cache
+		.is_joined(&sender_user, &room_id)
+		.await
+	{
 		return Err!(Request(Forbidden("You are not a member of this room.")));
 	}
 
@@ -45,7 +52,9 @@ pub(crate) async fn delete_event_route(
 		return Err!(Request(NotFound("Event not found in this room.")));
 	}
 
-	services.deleted_events.delete_event(&sender_user, &event_id);
+	services
+		.deleted_events
+		.delete_event(&sender_user, &event_id);
 
 	Ok(Json(serde_json::json!({})))
 }
@@ -72,11 +81,18 @@ pub(crate) async fn delete_events_route(
 		.find_from_token(token.token())
 		.await
 		.map_err(|_| {
-			Error::BadRequest(ErrorKind::UnknownToken { soft_logout: false }, "Unknown access token.")
+			Error::BadRequest(
+				ErrorKind::UnknownToken { soft_logout: false },
+				"Unknown access token.",
+			)
 		})?;
 
 	// Verify the user is in the room
-	if !services.state_cache.is_joined(&sender_user, &room_id).await {
+	if !services
+		.state_cache
+		.is_joined(&sender_user, &room_id)
+		.await
+	{
 		return Err!(Request(Forbidden("You are not a member of this room.")));
 	}
 
@@ -85,7 +101,9 @@ pub(crate) async fn delete_events_route(
 	}
 
 	let event_id_refs: Vec<&EventId> = body.event_ids.iter().map(AsRef::as_ref).collect();
-	services.deleted_events.delete_events(&sender_user, &event_id_refs);
+	services
+		.deleted_events
+		.delete_events(&sender_user, &event_id_refs);
 
 	Ok(Json(serde_json::json!({})))
 }

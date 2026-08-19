@@ -70,8 +70,25 @@ pub(crate) async fn get_room_event_route(
 	}
 
 	let mut event = event?;
+	let event_count = services
+		.timeline
+		.get_pdu_count(event_id)
+		.await
+		.ok();
 
-	if !visible || is_ignored_pdu(&services, &event, body.sender_user()).await {
+	let hidden_by_checkpoint = if let Some(event_count) = event_count {
+		services
+			.deleted_rooms
+			.is_deleted_pdu(sender_user, event.room_id(), event_count)
+			.await
+	} else {
+		false
+	};
+
+	if hidden_by_checkpoint
+		|| !visible
+		|| is_ignored_pdu(&services, &event, body.sender_user()).await
+	{
 		return Err!(Request(Forbidden("You don't have permission to view this event.")));
 	}
 

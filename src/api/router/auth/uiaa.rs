@@ -37,10 +37,7 @@ where
 		.transpose()?
 	{
 		| Some(AuthData::Jwt(Jwt { ref token, .. })) => {
-			let sender_user = jwt::validate_user(services, token)?;
-			if !services.users.exists(&sender_user).await {
-				return Err!(Request(NotFound("User {sender_user} is not registered.")));
-			}
+			let sender_user = jwt::validate_user(services, token).await?;
 
 			// Success!
 			Ok(sender_user)

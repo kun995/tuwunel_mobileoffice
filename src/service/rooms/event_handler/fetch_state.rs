@@ -29,10 +29,13 @@ pub(super) async fn fetch_state(
 	let res = self
 		.services
 		.federation
-		.execute(origin, get_room_state_ids::v1::Request {
-			room_id: room_id.to_owned(),
-			event_id: event_id.to_owned(),
-		})
+		.execute(
+			origin,
+			get_room_state_ids::v1::Request {
+				room_id: room_id.to_owned(),
+				event_id: event_id.to_owned(),
+			},
+		)
 		.await
 		.inspect_err(|e| debug_warn!("Fetching state for event failed: {e}"))?;
 

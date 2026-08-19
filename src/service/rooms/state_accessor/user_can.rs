@@ -52,12 +52,13 @@ pub async fn user_can_redact(
 		| Ok(power_levels) => Ok(power_levels.user_can_redact_event_of_other(sender)
 			|| power_levels.user_can_redact_own_event(sender)
 				&& match redacting_event {
-					| Ok(redacting_event) =>
+					| Ok(redacting_event) => {
 						if federation {
 							redacting_event.sender().server_name() == sender.server_name()
 						} else {
 							redacting_event.sender() == sender
-						},
+						}
+					},
 					| _ => false,
 				}),
 		| _ => {
@@ -108,20 +109,23 @@ pub async fn user_can_see_event(
 		| HistoryVisibility::WorldReadable => true,
 
 		// Allow if any member on requesting server was AT LEAST invited, else deny
-		| HistoryVisibility::Invited =>
+		| HistoryVisibility::Invited => {
 			self.user_was_invited(shortstatehash, user_id)
-				.await,
+				.await
+		},
 
 		// Allow if any member on requested server was joined, else deny
-		| HistoryVisibility::Joined =>
+		| HistoryVisibility::Joined => {
 			self.user_was_joined(shortstatehash, user_id)
-				.await,
+				.await
+		},
 
-		| HistoryVisibility::Shared | _ =>
+		| HistoryVisibility::Shared | _ => {
 			self.services
 				.state_cache
 				.is_joined(user_id, room_id)
-				.await,
+				.await
+		},
 	}
 }
 
@@ -149,17 +153,19 @@ pub async fn user_can_see_state_events(&self, user_id: &UserId, room_id: &RoomId
 	match history_visibility {
 		| HistoryVisibility::WorldReadable => true,
 
-		| HistoryVisibility::Invited =>
+		| HistoryVisibility::Invited => {
 			self.services
 				.state_cache
 				.is_invited(user_id, room_id)
-				.await,
+				.await
+		},
 
-		| HistoryVisibility::Shared =>
+		| HistoryVisibility::Shared => {
 			self.services
 				.state_cache
 				.once_joined(user_id, room_id)
-				.await,
+				.await
+		},
 
 		| _ => false,
 	}
@@ -207,10 +213,13 @@ pub async fn user_can_tombstone(
 	self.services
 		.timeline
 		.create_hash_and_sign_event(
-			PduBuilder::state(StateKey::new(), &RoomTombstoneEventContent {
-				replacement_room: room_id.into(), // placeholder,
-				body: "Not a valid m.room.tombstone.".into(),
-			}),
+			PduBuilder::state(
+				StateKey::new(),
+				&RoomTombstoneEventContent {
+					replacement_room: room_id.into(), // placeholder,
+					body: "Not a valid m.room.tombstone.".into(),
+				},
+			),
 			user_id,
 			room_id,
 			state_lock,

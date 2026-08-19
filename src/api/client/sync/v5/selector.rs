@@ -33,6 +33,14 @@ pub(super) async fn selector(
 		.state_cache
 		.user_memberships(sender_user, Some(&[Join, Invite, Knock]))
 		.map(|(membership, room_id)| (room_id.to_owned(), Some(membership)))
+		.broad_filter_map(|(room_id, membership)| async move {
+			services
+				.deleted_rooms
+				.should_hide_room(sender_user, &room_id)
+				.await
+				.eq(&false)
+				.then_some((room_id, membership))
+		})
 		.broad_filter_map(|(room_id, membership)| matcher(sync_info, conn, room_id, membership))
 		.collect::<Vec<_>>()
 		.await;
@@ -208,6 +216,14 @@ where
 		.iter()
 		.stream()
 		.broad_filter_map(async |(room_id, _)| {
+			if services
+				.deleted_rooms
+				.should_hide_room(sender_user, room_id)
+				.await
+			{
+				return None;
+			}
+
 			filter_room_meta(sync_info, room_id)
 				.await
 				.into_option()?;
@@ -245,4 +261,6 @@ where
 		})
 }
 
-fn room_sort(a: &WindowRoom, b: &WindowRoom) -> Ordering { b.last_count.cmp(&a.last_count) }
+fn room_sort(a: &WindowRoom, b: &WindowRoom) -> Ordering {
+	b.last_count.cmp(&a.last_count)
+}

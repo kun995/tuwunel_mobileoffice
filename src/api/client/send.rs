@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use axum::extract::State;
 use ruma::{UserId, api::client::message::send_message_event, events::MessageLikeEventType};
 use serde_json::{Value as JsonValue, from_str, value::to_raw_value};
-use tuwunel_core::{Err, Result, err, matrix::pdu::PduBuilder, utils};
+use tuwunel_core::{Err, Result, err, info, matrix::pdu::PduBuilder, utils};
 use tuwunel_service::Services;
 
 use crate::Ruma;
@@ -12,6 +12,7 @@ const CALL_KIND_FIELD: &str = "call_kind";
 const EMAIL_PAYLOAD_KEY: &str = "emailPayload";
 const EMAIL_PAYLOAD_KIND: &str = "large_payload_ref";
 const EMAIL_PAYLOAD_STORAGE_MXC: &str = "mxc";
+const CALL_EVENT_PREFIX: &str = "m.call.";
 
 /// Custom event type for system-level activity notifications.
 /// Clients should render this as a system message (not a regular chat bubble).
@@ -59,6 +60,42 @@ fn enrich_call_invite_kind(content: &mut JsonValue) {
 	if let Some(object) = content.as_object_mut() {
 		object.insert(CALL_KIND_FIELD.to_owned(), kind.into());
 	}
+}
+
+fn is_call_event(event_type: &MessageLikeEventType) -> bool {
+	event_type == &MessageLikeEventType::CallInvite
+		|| event_type
+			.to_string()
+			.starts_with(CALL_EVENT_PREFIX)
+}
+
+fn call_id_from_content(content: &JsonValue) -> Option<&str> {
+	content
+		.get("call_id")
+		.and_then(JsonValue::as_str)
+		.filter(|call_id| !call_id.is_empty())
+}
+
+fn string_field<'a>(content: &'a JsonValue, field: &str) -> Option<&'a str> {
+	content
+		.get(field)
+		.and_then(JsonValue::as_str)
+		.filter(|value| !value.is_empty())
+}
+
+fn nested_string_field<'a>(content: &'a JsonValue, parent: &str, field: &str) -> Option<&'a str> {
+	content
+		.get(parent)
+		.and_then(|parent| parent.get(field))
+		.and_then(JsonValue::as_str)
+		.filter(|value| !value.is_empty())
+}
+
+fn candidates_count(content: &JsonValue) -> usize {
+	content
+		.get("candidates")
+		.and_then(JsonValue::as_array)
+		.map_or(0, Vec::len)
 }
 
 fn validate_email_payload_stub(content: &JsonValue) -> Result {
@@ -184,11 +221,22 @@ pub(crate) async fn send_message_event_route(
 			)));
 		}
 
-		return Ok(send_message_event::v3::Response {
-			event_id: utils::string_from_bytes(&response)
-				.map(TryInto::try_into)
-				.map_err(|e| err!(Database("Invalid event_id in txnid data: {e:?}")))??,
-		});
+		let event_id = utils::string_from_bytes(&response)
+			.map(TryInto::try_into)
+			.map_err(|e| err!(Database("Invalid event_id in txnid data: {e:?}")))??;
+
+		if is_call_event(&body.event_type) {
+			info!(
+				event_type = %body.event_type,
+				room_id = %body.room_id,
+				sender = %sender_user,
+				txn_id = %body.txn_id,
+				%event_id,
+				"Returned existing Matrix call event for duplicate txn"
+			);
+		}
+
+		return Ok(send_message_event::v3::Response { event_id });
 	}
 
 	let mut unsigned = BTreeMap::new();
@@ -196,6 +244,38 @@ pub(crate) async fn send_message_event_route(
 
 	let mut content = from_str(body.body.body.json().get())
 		.map_err(|e| err!(Request(BadJson("Invalid JSON body: {e}"))))?;
+
+	let is_call_event = is_call_event(&body.event_type);
+	if is_call_event {
+		let call_id = call_id_from_content(&content).unwrap_or("<missing>");
+		let party_id = string_field(&content, "party_id").unwrap_or("<missing>");
+		let call_kind = string_field(&content, CALL_KIND_FIELD).unwrap_or("<missing>");
+		let reason = string_field(&content, "reason").unwrap_or("<none>");
+		let version = content.get("version").and_then(JsonValue::as_u64);
+		let lifetime = content
+			.get("lifetime")
+			.and_then(JsonValue::as_u64);
+		let has_offer_sdp = nested_string_field(&content, "offer", "sdp").is_some();
+		let has_answer_sdp = nested_string_field(&content, "answer", "sdp").is_some();
+		let candidates_count = candidates_count(&content);
+
+		info!(
+			event_type = %body.event_type,
+			room_id = %body.room_id,
+			sender = %sender_user,
+			txn_id = %body.txn_id,
+			call_id,
+			party_id,
+			call_kind,
+			reason,
+			?version,
+			?lifetime,
+			has_offer_sdp,
+			has_answer_sdp,
+			candidates_count,
+			"Received Matrix call event send request"
+		);
+	}
 
 	if body.event_type == MessageLikeEventType::CallInvite {
 		enrich_call_invite_kind(&mut content);
@@ -225,6 +305,17 @@ pub(crate) async fn send_message_event_route(
 			&state_lock,
 		)
 		.await?;
+
+	if is_call_event {
+		info!(
+			event_type = %body.event_type,
+			room_id = %body.room_id,
+			sender = %sender_user,
+			txn_id = %body.txn_id,
+			%event_id,
+			"Stored Matrix call event"
+		);
+	}
 
 	services.transaction_ids.add_txnid(
 		sender_user,

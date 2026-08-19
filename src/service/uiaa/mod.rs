@@ -42,7 +42,20 @@ impl crate::Service for Service {
 		}))
 	}
 
-	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
+	fn name(&self) -> &str {
+		crate::service::make_name(std::module_path!())
+	}
+}
+
+#[implement(Service)]
+pub fn clear_user_requests(&self, user_id: &UserId) -> usize {
+	let mut requests = self
+		.userdevicesessionid_uiaarequest
+		.write()
+		.expect("locked for writing");
+	let before = requests.len();
+	requests.retain(|(request_user, ..), _| request_user.as_str() != user_id.as_str());
+	before.saturating_sub(requests.len())
 }
 
 /// Creates a new Uiaa session. Make sure the session token is unique.

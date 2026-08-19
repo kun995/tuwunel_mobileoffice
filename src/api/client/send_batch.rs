@@ -46,10 +46,17 @@ pub(crate) async fn send_batch_events_route(
 		.find_from_token(token.token())
 		.await
 		.map_err(|_| {
-			Error::BadRequest(ErrorKind::UnknownToken { soft_logout: false }, "Unknown access token.")
+			Error::BadRequest(
+				ErrorKind::UnknownToken { soft_logout: false },
+				"Unknown access token.",
+			)
 		})?;
 
-	if !services.state_cache.is_joined(&sender_user, &room_id).await {
+	if !services
+		.state_cache
+		.is_joined(&sender_user, &room_id)
+		.await
+	{
 		return Err!(Request(Forbidden("You are not a member of this room.")));
 	}
 
@@ -80,10 +87,7 @@ pub(crate) async fn send_batch_events_route(
 			"transaction_id".to_owned(),
 			format!("batch:{}:{index}", sender_device).into(),
 		);
-		unsigned.insert(
-			MESSAGE_BATCH_ID_FIELD.to_owned(),
-			JsonValue::String(batch_id.clone()),
-		);
+		unsigned.insert(MESSAGE_BATCH_ID_FIELD.to_owned(), JsonValue::String(batch_id.clone()));
 
 		let event_id = services
 			.timeline
@@ -111,16 +115,17 @@ pub(crate) async fn send_batch_events_route(
 	})))
 }
 
-fn normalize_content(mut content: JsonValue, message: Option<&str>, batch_id: &str) -> Result<JsonValue> {
+fn normalize_content(
+	mut content: JsonValue,
+	message: Option<&str>,
+	batch_id: &str,
+) -> Result<JsonValue> {
 	let object = content
 		.as_object_mut()
 		.ok_or_else(|| err!(Request(BadJson("Event content must be a JSON object"))))?;
 
 	if object.get(MESSAGE_BATCH_ID_FIELD).is_none() {
-		object.insert(
-			MESSAGE_BATCH_ID_FIELD.to_owned(),
-			JsonValue::String(batch_id.to_owned()),
-		);
+		object.insert(MESSAGE_BATCH_ID_FIELD.to_owned(), JsonValue::String(batch_id.to_owned()));
 	}
 
 	if let Some(message) = message
@@ -135,7 +140,9 @@ fn normalize_content(mut content: JsonValue, message: Option<&str>, batch_id: &s
 }
 
 fn resolve_batch_id(provided_batch_id: Option<&str>) -> String {
-	if let Some(batch_id) = provided_batch_id.filter(|value| !value.is_empty() && value.len() <= 128) {
+	if let Some(batch_id) =
+		provided_batch_id.filter(|value| !value.is_empty() && value.len() <= 128)
+	{
 		batch_id.to_owned()
 	} else {
 		format!("msg_{}", utils::random_string(12))

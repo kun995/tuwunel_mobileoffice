@@ -18,7 +18,7 @@ use aws_sdk_s3::{
 #[cfg(feature = "s3_storage")]
 use bytes::Bytes;
 #[cfg(feature = "s3_storage")]
-use tuwunel_core::{err, trace, Result};
+use tuwunel_core::{Result, err, trace};
 
 #[cfg(feature = "s3_storage")]
 use super::{MediaStorage, StorageMetadata};
@@ -60,15 +60,54 @@ impl S3Storage {
 		}
 
 		let client = Client::from_conf(s3_config_builder.build());
-
-		Ok(Self {
+		let storage = Self {
 			client,
 			bucket: config.bucket.clone(),
 			prefix: config.prefix.clone(),
-		})
+		};
+
+		storage.ensure_bucket_exists().await?;
+
+		Ok(storage)
 	}
 
+	async fn ensure_bucket_exists(&self) -> Result<()> {
+		match self
+			.client
+			.head_bucket()
+			.bucket(&self.bucket)
+			.send()
+			.await
+		{
+			| Ok(_) => Ok(()),
+			| Err(err) if is_bucket_not_found_error(&err) => {
+				trace!("S3 bucket missing, creating bucket={}", self.bucket);
 
+				match self
+					.client
+					.create_bucket()
+					.bucket(&self.bucket)
+					.send()
+					.await
+				{
+					| Ok(_) => Ok(()),
+					| Err(err) if is_bucket_already_exists_error(&err) => Ok(()),
+					| Err(err) => Err(err!(Config(
+						"media_storage.s3",
+						"Failed to create bucket {}: {}",
+						self.bucket,
+						err
+					))),
+				}
+			},
+			| Err(err) => Err(err!(Config(
+				"media_storage.s3",
+				"Failed to access bucket {}: {}",
+				self.bucket,
+				err
+			))),
+		}
+	}
 
 	/// Build the S3 object key from raw SHA-256 content hash bytes.
 	///
@@ -84,15 +123,13 @@ impl S3Storage {
 			.collect();
 
 		let final_key = match &self.prefix {
-			Some(prefix) => format!("{prefix}/{hex}"),
-			None => hex,
+			| Some(prefix) => format!("{prefix}/{hex}"),
+			| None => hex,
 		};
 
 		// Remove leading slash if somehow present (S3 best practice)
 		final_key.trim_start_matches('/').to_string()
 	}
-
-
 }
 
 #[cfg(feature = "s3_storage")]
@@ -111,19 +148,17 @@ impl MediaStorage for S3Storage {
 			.map_err(|e| {
 				use aws_sdk_s3::error::SdkError;
 				let error_details = match &e {
-					SdkError::ServiceError(se) => {
+					| SdkError::ServiceError(se) => {
 						format!("HTTP {}: {:?}", se.raw().status(), se.err())
 					},
-					SdkError::ConstructionFailure(cf) => format!("Construction: {:?}", cf),
-					SdkError::TimeoutError(_) => "Timeout".to_string(),
-					SdkError::DispatchFailure(df) => format!("Dispatch: {:?}", df),
-					_ => format!("{:?}", e),
+					| SdkError::ConstructionFailure(cf) => format!("Construction: {:?}", cf),
+					| SdkError::TimeoutError(_) => "Timeout".to_string(),
+					| SdkError::DispatchFailure(df) => format!("Dispatch: {:?}", df),
+					| _ => format!("{:?}", e),
 				};
 				err!(Database(error!(
 					"S3 put_object failed: bucket={}, key={}, details={}",
-					self.bucket,
-					s3_key,
-					error_details
+					self.bucket, s3_key, error_details
 				)))
 			})?;
 
@@ -141,7 +176,7 @@ impl MediaStorage for S3Storage {
 			.send()
 			.await
 		{
-			Ok(output) => {
+			| Ok(output) => {
 				let bytes = output
 					.body
 					.collect()
@@ -150,7 +185,7 @@ impl MediaStorage for S3Storage {
 					.into_bytes();
 				Ok(Some(bytes))
 			},
-			Err(e) => {
+			| Err(e) => {
 				// Check if it's a 404 Not Found error
 				if is_not_found_error(&e) {
 					Ok(None)
@@ -188,18 +223,17 @@ impl MediaStorage for S3Storage {
 			.send()
 			.await
 		{
-			Ok(_) => {
+			| Ok(_) => {
 				trace!("S3 exists: YES key={}", s3_key);
 				Ok(true)
 			},
-			Err(e) if is_not_found_error(&e) => {
+			| Err(e) if is_not_found_error(&e) => {
 				trace!("S3 exists: NO (404) key={}", s3_key);
 				Ok(false)
 			},
-			Err(e) => Err(err!(Database(error!("S3 head_object failed: {}", e)))),
+			| Err(e) => Err(err!(Database(error!("S3 head_object failed: {}", e)))),
 		}
 	}
-
 
 	async fn metadata(&self, key: &[u8]) -> Result<Option<StorageMetadata>> {
 		let s3_key = self.get_s3_key(key);
@@ -212,7 +246,7 @@ impl MediaStorage for S3Storage {
 			.send()
 			.await
 		{
-			Ok(output) => {
+			| Ok(output) => {
 				let size = output.content_length().unwrap_or(0) as u64;
 				let modified = output
 					.last_modified()
@@ -221,8 +255,8 @@ impl MediaStorage for S3Storage {
 
 				Ok(Some(StorageMetadata { size, modified }))
 			},
-			Err(e) if is_not_found_error(&e) => Ok(None),
-			Err(e) => Err(err!(Database(error!("S3 head_object failed: {}", e)))),
+			| Err(e) if is_not_found_error(&e) => Ok(None),
+			| Err(e) => Err(err!(Database(error!("S3 head_object failed: {}", e)))),
 		}
 	}
 
@@ -243,10 +277,30 @@ where
 	matches!(err, SdkError::ServiceError(e) if e.raw().status().as_u16() == 404)
 }
 
+#[cfg(feature = "s3_storage")]
+fn is_bucket_not_found_error<E>(err: &aws_sdk_s3::error::SdkError<E>) -> bool
+where
+	E: std::error::Error + 'static,
+{
+	use aws_sdk_s3::error::SdkError;
+
+	matches!(err, SdkError::ServiceError(e) if e.raw().status().as_u16() == 404)
+}
+
+#[cfg(feature = "s3_storage")]
+fn is_bucket_already_exists_error<E>(err: &aws_sdk_s3::error::SdkError<E>) -> bool
+where
+	E: std::error::Error + 'static,
+{
+	use aws_sdk_s3::error::SdkError;
+
+	matches!(err, SdkError::ServiceError(e) if e.raw().status().as_u16() == 409)
+}
+
 /// Encode a key (hash digest) to a string for use as S3 key
 #[cfg(feature = "s3_storage")]
 #[allow(dead_code)]
 fn encode_key(key: &[u8]) -> String {
-	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+	use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 	URL_SAFE_NO_PAD.encode(key)
 }

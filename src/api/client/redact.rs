@@ -1,7 +1,6 @@
 use axum::extract::State;
 use ruma::{
-	MilliSecondsSinceUnixEpoch,
-	api::client::redact::redact_event,
+	MilliSecondsSinceUnixEpoch, api::client::redact::redact_event,
 	events::room::redaction::RoomRedactionEventContent,
 };
 use tuwunel_core::{Err, Result, matrix::pdu::PduBuilder};
@@ -25,10 +24,7 @@ pub(crate) async fn redact_event_route(
 	let body = &body.body;
 
 	// Lấy PDU gốc để kiểm tra thời gian gửi
-	let original_pdu = services
-		.timeline
-		.get_pdu(&body.event_id)
-		.await?;
+	let original_pdu = services.timeline.get_pdu(&body.event_id).await?;
 
 	// Tính tuổi sự kiện theo milliseconds (dùng i128 như pdu/unsigned.rs)
 	let now_ms: i128 = MilliSecondsSinceUnixEpoch::now().get().into();
@@ -36,9 +32,7 @@ pub(crate) async fn redact_event_route(
 	let age_ms = now_ms.saturating_sub(event_ts_ms);
 
 	if age_ms > REDACT_MAX_AGE_MS as i128 {
-		return Err!(Request(Forbidden(
-			"Không thể thu hồi tin nhắn đã gửi quá 24h"
-		)));
+		return Err!(Request(Forbidden("Không thể thu hồi tin nhắn đã gửi quá 24h")));
 	}
 
 	let state_lock = services.state.mutex.lock(&body.room_id).await;

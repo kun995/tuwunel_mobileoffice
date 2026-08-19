@@ -34,17 +34,27 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 		.save_original_pdu(event_id, &pdu, state_lock)
 		.await;
 
-	let body = pdu["content"]
-		.as_object()
-		.unwrap()
-		.get("body")
-		.and_then(|body| body.as_str());
+	let content = pdu["content"].as_object().unwrap();
+	let body = content.get("body").and_then(|body| body.as_str());
+	let filename = content
+		.get("filename")
+		.and_then(|filename| filename.as_str());
 
 	if let Some(body) = body {
 		self.services
 			.search
 			.deindex_pdu(shortroomid, &pdu_id, body);
 	}
+	if let Some(filename) = filename {
+		self.services
+			.search
+			.deindex_pdu(shortroomid, &pdu_id, filename);
+	}
+
+	// Remove from link index; no-op if this PDU had no link
+	self.db
+		.roomid_haslink_pduid
+		.remove(pdu_id.as_bytes());
 
 	let room_id = RoomId::parse(pdu["room_id"].as_str().unwrap()).unwrap();
 
@@ -60,12 +70,38 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 		)))
 	})?;
 
+	let message_batch_id = pdu
+		.get("content")
+		.and_then(|c| c.as_object())
+		.and_then(|c| c.get("message_batch_id"))
+		.cloned();
+
+	let message_batch_sequence = pdu
+		.get("content")
+		.and_then(|c| c.as_object())
+		.and_then(|c| c.get("message_batch_sequence"))
+		.cloned();
+
 	redact_in_place(
 		&mut pdu,
 		&room_version_rules.redaction,
 		Some(RedactedBecause::from_json(reason.to_canonical_object())),
 	)
 	.map_err(|err| err!("invalid event: {err}"))?;
+
+	if message_batch_id.is_some() || message_batch_sequence.is_some() {
+		if let Some(content) = pdu
+			.get_mut("content")
+			.and_then(|c| c.as_object_mut())
+		{
+			if let Some(batch_id) = message_batch_id {
+				content.insert("message_batch_id".into(), batch_id);
+			}
+			if let Some(batch_seq) = message_batch_sequence {
+				content.insert("message_batch_sequence".into(), batch_seq);
+			}
+		}
+	}
 
 	self.replace_pdu(&pdu_id, &pdu).await
 }

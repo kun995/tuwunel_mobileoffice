@@ -11,7 +11,9 @@ pub(super) type Maps = BTreeMap<MapsKey, MapsVal>;
 pub(super) type MapsKey = &'static str;
 pub(super) type MapsVal = Arc<Map>;
 
-pub(super) fn open(engine: &Arc<Engine>) -> Result<Maps> { open_list(engine, MAPS) }
+pub(super) fn open(engine: &Arc<Engine>) -> Result<Maps> {
+	open_list(engine, MAPS)
+}
 
 #[tracing::instrument(name = "maps", level = "debug", skip_all)]
 pub(super) fn open_list(engine: &Arc<Engine>, maps: &[Descriptor]) -> Result<Maps> {
@@ -263,6 +265,12 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM
 	},
 	Descriptor {
+		name: "roomid_haslink_pduid",
+		key_size_hint: Some(16),
+		val_size_hint: Some(0),
+		..descriptor::SEQUENTIAL
+	},
+	Descriptor {
 		name: "roomuserid_knockedcount",
 		val_size_hint: Some(8),
 		..descriptor::RANDOM_SMALL
@@ -403,6 +411,18 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		name: "reminderid_reminder",
+		..descriptor::RANDOM
+	},
+	Descriptor {
+		name: "remindertime_reminderid",
+		..descriptor::SEQUENTIAL_SMALL
+	},
+	Descriptor {
+		name: "roomid_reminderids",
+		..descriptor::RANDOM
+	},
+	Descriptor {
 		name: "workspaceid_roomids",
 		..descriptor::RANDOM_SMALL
 	},
@@ -502,6 +522,24 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "userroomid_highlightcount",
+		..descriptor::RANDOM
+	},
+	Descriptor {
+		name: "userid_workspaceids",
+		..descriptor::RANDOM
+	},
+	Descriptor {
+		name: "workspaceid_userids",
+		..descriptor::RANDOM
+	},
+	Descriptor {
+		name: "userroomid_deletedbefore",
+		val_size_hint: Some(8),
+		..descriptor::RANDOM
+	},
+	Descriptor {
+		name: "userroomid_clearedbefore",
+		val_size_hint: Some(8),
 		..descriptor::RANDOM
 	},
 	Descriptor {

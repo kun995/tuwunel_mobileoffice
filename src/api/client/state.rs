@@ -1,28 +1,31 @@
 use axum::extract::State;
 use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use ruma::{
-	OwnedEventId, RoomId, UserId,
+	Int, OwnedEventId, OwnedUserId, RoomId, UserId,
 	api::client::state::{get_state_event_for_key, get_state_events, send_state_event},
 	events::{
-		AnyStateEventContent, StateEventType,
+		AnyStateEventContent, StateEventType, TimelineEventType,
 		room::{
 			canonical_alias::RoomCanonicalAliasEventContent,
 			history_visibility::{HistoryVisibility, RoomHistoryVisibilityEventContent},
 			join_rules::{JoinRule, RoomJoinRulesEventContent},
 			member::{MembershipState, RoomMemberEventContent},
+			power_levels::RoomPowerLevelsEventContent,
 			server_acl::RoomServerAclEventContent,
 		},
 	},
 	serde::Raw,
 };
-use serde_json::json;
+use serde_json::{json, value::to_raw_value};
 use tuwunel_core::{
 	Err, Result, err, is_false,
 	matrix::{Event, pdu::PduBuilder},
 	utils::BoolExt,
+	warn,
 };
-use tuwunel_service::Services;
+use tuwunel_service::{Services, rooms::timeline::RoomMutexGuard};
 
+use super::send::ACTIVITY_EVENT_TYPE;
 use crate::{Ruma, RumaResponse};
 
 /// # `PUT /_matrix/client/*/rooms/{roomId}/state/{eventType}/{stateKey}`
@@ -180,6 +183,8 @@ async fn send_state_event_for_key_helper(
 	timestamp: Option<ruma::MilliSecondsSinceUnixEpoch>,
 ) -> Result<OwnedEventId> {
 	allowed_to_send_state_event(services, room_id, event_type, state_key, json).await?;
+	let role_promotions =
+		room_role_promotions(services, sender, room_id, event_type, state_key, json).await;
 	let state_lock = services.state.mutex.lock(room_id).await;
 	let event_id = services
 		.timeline
@@ -198,7 +203,250 @@ async fn send_state_event_for_key_helper(
 		.boxed()
 		.await?;
 
+	for new_leader in role_promotions.leaders {
+		if let Err(e) = send_room_leader_assignment_message(
+			services,
+			sender,
+			room_id,
+			&new_leader,
+			&state_lock,
+		)
+		.await
+		{
+			warn!(%e, %room_id, %sender, %new_leader, "Failed to send room leader assignment activity");
+		}
+	}
+
+	for new_administrator in role_promotions.administrators {
+		if let Err(e) = send_room_administrator_assignment_message(
+			services,
+			sender,
+			room_id,
+			&new_administrator,
+			&state_lock,
+		)
+		.await
+		{
+			warn!(
+				%e,
+				%room_id,
+				%sender,
+				%new_administrator,
+				"Failed to send room administrator assignment activity"
+			);
+		}
+	}
+
 	Ok(event_id)
+}
+
+#[derive(Debug, Default)]
+struct RoomRolePromotions {
+	leaders: Vec<OwnedUserId>,
+	administrators: Vec<OwnedUserId>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum AssignedRoomRole {
+	Leader,
+	Administrator,
+}
+
+fn newly_assigned_room_role(old_power: Int, new_power: Int) -> Option<AssignedRoomRole> {
+	let administrator_power = Int::from(50);
+	let leader_power = Int::from(100);
+
+	if new_power >= leader_power && old_power < leader_power {
+		Some(AssignedRoomRole::Leader)
+	} else if new_power >= administrator_power
+		&& new_power < leader_power
+		&& old_power < administrator_power
+	{
+		Some(AssignedRoomRole::Administrator)
+	} else {
+		None
+	}
+}
+
+async fn room_role_promotions(
+	services: &Services,
+	sender: &UserId,
+	room_id: &RoomId,
+	event_type: &StateEventType,
+	state_key: &str,
+	json: &Raw<AnyStateEventContent>,
+) -> RoomRolePromotions {
+	if *event_type != StateEventType::RoomPowerLevels || !state_key.is_empty() {
+		return RoomRolePromotions::default();
+	}
+
+	let Ok(new_power_levels) = json.deserialize_as_unchecked::<RoomPowerLevelsEventContent>()
+	else {
+		return RoomRolePromotions::default();
+	};
+
+	let old_power_levels = services
+		.state_accessor
+		.get_power_levels(room_id)
+		.await
+		.ok();
+	let mut promotions = RoomRolePromotions::default();
+	for (user_id, new_power) in &new_power_levels.users {
+		let user_id_ref: &UserId = user_id.as_ref();
+		if user_id_ref == sender {
+			continue;
+		}
+
+		let old_power = old_power_levels
+			.as_ref()
+			.map_or_else(|| Int::from(0), |old| old.for_user(user_id_ref));
+		match newly_assigned_room_role(old_power, *new_power) {
+			| Some(AssignedRoomRole::Leader) => promotions.leaders.push(user_id.to_owned()),
+			| Some(AssignedRoomRole::Administrator) => {
+				promotions.administrators.push(user_id.to_owned());
+			},
+			| None => {},
+		}
+	}
+
+	promotions
+}
+
+async fn send_room_leader_assignment_message(
+	services: &Services,
+	sender: &UserId,
+	room_id: &RoomId,
+	new_leader: &UserId,
+	state_lock: &RoomMutexGuard,
+) -> Result {
+	let old_leader_display = services
+		.users
+		.displayname(sender)
+		.await
+		.unwrap_or_else(|_| sender.to_string());
+	let new_leader_display = services
+		.users
+		.displayname(new_leader)
+		.await
+		.unwrap_or_else(|_| new_leader.to_string());
+
+	let self_text = format!(
+		"[Bạn - {old_leader_display}] đã bổ nhiệm [{new_leader_display}] làm trưởng nhóm"
+	);
+	let other_text =
+		format!("[{old_leader_display}] đã bổ nhiệm [{new_leader_display}] làm trưởng nhóm");
+
+	let content = json!({
+		"activity_type": "room_leader_assigned",
+		"body": other_text,
+		"msgtype": "m.notice",
+		"self_text": self_text,
+		"other_text": other_text,
+		"old_leader_user_id": sender,
+		"new_leader_user_id": new_leader,
+	});
+
+	services
+		.timeline
+		.build_and_append_pdu(
+			PduBuilder {
+				event_type: TimelineEventType::from(ACTIVITY_EVENT_TYPE),
+				content: to_raw_value(&content)?,
+				..Default::default()
+			},
+			sender,
+			room_id,
+			state_lock,
+		)
+		.boxed()
+		.await?;
+
+	Ok(())
+}
+
+async fn send_room_administrator_assignment_message(
+	services: &Services,
+	sender: &UserId,
+	room_id: &RoomId,
+	new_administrator: &UserId,
+	state_lock: &RoomMutexGuard,
+) -> Result {
+	let assigner_display = services
+		.users
+		.displayname(sender)
+		.await
+		.unwrap_or_else(|_| sender.to_string());
+	let administrator_display = services
+		.users
+		.displayname(new_administrator)
+		.await
+		.unwrap_or_else(|_| new_administrator.to_string());
+
+	let self_text = format!(
+		"[Bạn - {assigner_display}] đã bổ nhiệm [{administrator_display}] làm quản trị viên"
+	);
+	let other_text =
+		format!("[{assigner_display}] đã bổ nhiệm [{administrator_display}] làm quản trị viên");
+
+	let content = json!({
+		"activity_type": "room_administrator_assigned",
+		"body": other_text,
+		"msgtype": "m.notice",
+		"self_text": self_text,
+		"other_text": other_text,
+		"assigned_by_user_id": sender,
+		"new_administrator_user_id": new_administrator,
+	});
+
+	services
+		.timeline
+		.build_and_append_pdu(
+			PduBuilder {
+				event_type: TimelineEventType::from(ACTIVITY_EVENT_TYPE),
+				content: to_raw_value(&content)?,
+				..Default::default()
+			},
+			sender,
+			room_id,
+			state_lock,
+		)
+		.boxed()
+		.await?;
+
+	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{AssignedRoomRole, newly_assigned_room_role};
+	use ruma::Int;
+
+	#[test]
+	fn detects_new_room_role_assignments() {
+		assert_eq!(
+			newly_assigned_room_role(Int::from(0), Int::from(50)),
+			Some(AssignedRoomRole::Administrator)
+		);
+		assert_eq!(
+			newly_assigned_room_role(Int::from(49), Int::from(99)),
+			Some(AssignedRoomRole::Administrator)
+		);
+		assert_eq!(
+			newly_assigned_room_role(Int::from(50), Int::from(100)),
+			Some(AssignedRoomRole::Leader)
+		);
+		assert_eq!(
+			newly_assigned_room_role(Int::from(0), Int::from(100)),
+			Some(AssignedRoomRole::Leader)
+		);
+	}
+
+	#[test]
+	fn ignores_existing_roles_and_leader_demotion() {
+		assert_eq!(newly_assigned_room_role(Int::from(50), Int::from(75)), None);
+		assert_eq!(newly_assigned_room_role(Int::from(100), Int::from(100)), None);
+		assert_eq!(newly_assigned_room_role(Int::from(100), Int::from(50)), None);
+	}
 }
 
 async fn allowed_to_send_state_event(
@@ -271,21 +519,24 @@ async fn allowed_to_send_state_event(
 		},
 		| StateEventType::RoomEncryption =>
 		// Forbid m.room.encryption if encryption is disabled
+		{
 			if !services.config.allow_encryption {
 				return Err!(Request(Forbidden("Encryption is disabled on this homeserver.")));
-			},
+			}
+		},
 		| StateEventType::RoomJoinRules => {
 			// admin room is a sensitive room, it should not ever be made public
 			if let Ok(admin_room_id) = services.admin.get_admin_room().await
 				&& admin_room_id == room_id
 			{
 				match json.deserialize_as_unchecked::<RoomJoinRulesEventContent>() {
-					| Ok(join_rule) =>
+					| Ok(join_rule) => {
 						if join_rule.join_rule == JoinRule::Public {
 							return Err!(Request(Forbidden(
 								"Admin room is a sensitive room, it cannot be made public"
 							)));
-						},
+						}
+					},
 					| Err(e) => {
 						return Err!(Request(BadJson(debug_warn!(
 							"Room join rules event is invalid: {e}"

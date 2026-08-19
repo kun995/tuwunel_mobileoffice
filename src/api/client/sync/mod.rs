@@ -20,6 +20,13 @@ async fn load_timeline(
 	next_batch: Option<PduCount>,
 	limit: usize,
 ) -> Result<(Vec<(PduCount, PduEvent)>, bool, PduCount), Error> {
+	let roomsincecount = services
+		.deleted_rooms
+		.deleted_before(sender_user, room_id)
+		.await
+		.map(PduCount::Normal)
+		.map_or(roomsincecount, |deleted_before| roomsincecount.max(deleted_before));
+
 	let last_timeline_count = services
 		.timeline
 		.last_timeline_count(Some(sender_user), room_id, next_batch)

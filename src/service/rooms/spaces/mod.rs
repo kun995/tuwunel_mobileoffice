@@ -88,7 +88,9 @@ impl crate::Service for Service {
 			.clear();
 	}
 
-	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
+	fn name(&self) -> &str {
+		crate::service::make_name(std::module_path!())
+	}
 }
 
 /// Gets the summary of a space using either local or remote (federation)
@@ -420,22 +422,25 @@ where
 		| JoinRuleSummary::Public
 		| JoinRuleSummary::Knock
 		| JoinRuleSummary::KnockRestricted(_) => true,
-		| JoinRuleSummary::Restricted(_) =>
+		| JoinRuleSummary::Restricted(_) => {
 			allowed_rooms
 				.stream()
 				.any(async |room| match identifier {
-					| Identifier::UserId(user) =>
+					| Identifier::UserId(user) => {
 						self.services
 							.state_cache
 							.is_joined(user, room)
-							.await,
-					| Identifier::ServerName(server) =>
+							.await
+					},
+					| Identifier::ServerName(server) => {
 						self.services
 							.state_cache
 							.server_in_room(server, room)
-							.await,
+							.await
+					},
 				})
-				.await,
+				.await
+		},
 
 		// Invite only, Private, or Custom join rule
 		| _ => false,

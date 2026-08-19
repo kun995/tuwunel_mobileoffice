@@ -102,3 +102,4 @@ tests/complement/logs.jsonl
 # Editor crashfiles
 *.save
 *.swp
+.gitnexus

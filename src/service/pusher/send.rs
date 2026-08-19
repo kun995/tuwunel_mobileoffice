@@ -14,6 +14,9 @@ use ruma::{
 };
 use tuwunel_core::{Err, Result, err, implement, matrix::Event};
 
+const REMINDER_CREATED_EVENT_TYPE: &str = "im.tuwunel.reminder.created";
+const REMINDER_DUE_EVENT_TYPE: &str = "im.tuwunel.reminder.due";
+
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn send_push_notice<E>(
@@ -60,6 +63,10 @@ where
 		notify = Some(n);
 	}
 
+	if is_reminder_push_event(event.kind()) {
+		notify = Some(true);
+	}
+
 	let is_reaction = *event.kind() == TimelineEventType::Reaction;
 
 	if notify == Some(true) || is_reaction || self.services.config.push_everything {
@@ -76,6 +83,13 @@ where
 	}
 
 	Ok(())
+}
+
+fn is_reminder_push_event(kind: &TimelineEventType) -> bool {
+	matches!(
+		kind.to_cow_str().as_ref(),
+		REMINDER_CREATED_EVENT_TYPE | REMINDER_DUE_EVENT_TYPE
+	)
 }
 
 #[implement(super::Service)]
@@ -128,6 +142,12 @@ async fn send_notice<Pdu: Event>(
 
 			let d = vec![device];
 			let mut notify = Notification::new(d);
+			let workspace_id = self
+				.services
+				.workspace
+				.get_workspace_id(event.room_id())
+				.await
+				.ok();
 
 			notify.event_id = Some(event.event_id().to_owned());
 			notify.room_id = Some(event.room_id().to_owned());
@@ -183,8 +203,12 @@ async fn send_notice<Pdu: Event>(
 					.ok();
 			}
 
-			self.send_request(&http.url, send_event_notification::v1::Request::new(notify))
-				.await?;
+			self.send_request(
+				&http.url,
+				send_event_notification::v1::Request::new(notify),
+				workspace_id.as_deref(),
+			)
+			.await?;
 
 			Ok(())
 		},

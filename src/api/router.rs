@@ -10,7 +10,7 @@ use std::str::FromStr;
 use axum::{
 	Router,
 	response::{IntoResponse, Redirect},
-	routing::{any, delete, get, post},
+	routing::{any, delete, get, post, put},
 };
 use http::{Uri, uri};
 use tuwunel_core::{Server, err};
@@ -214,8 +214,70 @@ pub fn build(router: Router<State>, server: &Server) -> Router<State> {
 			post(client::delete_events_route),
 		)
 		.route(
+			"/_matrix/client/v3/rooms/{room_id}/tuwunel/links",
+			get(client::get_message_links_route),
+		)
+		.route(
 			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/send_batch",
 			post(client::send_batch_events_route),
+		)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/send_message_pair",
+			post(client::send_message_pair_route),
+		)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/send_message_pair/{event_id}",
+			delete(client::delete_message_pair_route),
+		)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/dissolve",
+			post(client::dissolve_room_route),
+		)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/delete_conversation",
+			post(client::delete_direct_conversation_route),
+		)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/clear_history",
+			post(client::clear_room_history_route),
+		)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/reminders",
+			get(client::list_reminders_route).post(client::create_reminder_route),
+		)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/reminders/{reminder_id}",
+			get(client::get_reminder_route)
+				.put(client::update_reminder_route)
+				.delete(client::cancel_reminder_route),
+		)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/user/workspaces",
+			get(client::get_user_workspaces_route).put(client::update_user_workspaces_route),
+		)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/users/{user_id}",
+			get(client::get_user_info_admin_route).delete(client::purge_user_route),
+		)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/users",
+			delete(client::bulk_purge_users_route),
+		)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/users/{user_id}/workspaces",
+			get(client::get_user_workspaces_admin_route),
+		)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/workspaces/{workspace_id}/users",
+			put(client::update_workspace_users_route),
+		)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/users/displaynames",
+			put(client::update_user_displaynames_route),
+		)
+		.route(
+			"/_matrix/client/unstable/org.tuwunel/users/bulk_create",
+			post(client::bulk_create_users_route),
 		)
 		// Returns the first unread event ID in a room for the authenticated user
 		.route(

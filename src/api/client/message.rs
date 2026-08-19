@@ -167,6 +167,99 @@ pub(crate) async fn get_message_events_route(
 	})
 }
 
+pub(crate) async fn get_message_links_route(
+	State(services): State<crate::State>,
+	body: Ruma<get_message_events::v3::Request>,
+) -> Result<crate::router::RumaResponse<get_message_events::v3::Response>> {
+	debug_assert!(IGNORED_MESSAGE_TYPES.is_sorted(), "IGNORED_MESSAGE_TYPES is not sorted");
+	let sender_user = body.sender_user();
+	let sender_device = body.sender_device.as_deref();
+	let room_id = &body.room_id;
+	let filter = &body.filter;
+
+	if !services.metadata.exists(room_id).await {
+		return Err!(Request(Forbidden("Room does not exist to this server")));
+	}
+
+	let from: PduCount = body
+		.from
+		.as_deref()
+		.map(str::parse)
+		.transpose()?
+		.unwrap_or_else(|| match body.dir {
+			| Direction::Forward => PduCount::min(),
+			| Direction::Backward => PduCount::max(),
+		});
+
+	let to: Option<PduCount> = body.to.as_deref().map(str::parse).flat_ok();
+
+	let limit: usize = body
+		.limit
+		.try_into()
+		.unwrap_or(LIMIT_DEFAULT)
+		.min(LIMIT_MAX);
+
+	let it = match body.dir {
+		| Direction::Forward => {
+			return Err!(Request(InvalidParam("Forward direction not supported for links API")));
+		},
+		| Direction::Backward => services
+			.timeline
+			.pdus_links_rev(Some(sender_user), room_id, Some(from))
+			.ignore_err(),
+	};
+
+	let events: Vec<_> = it
+		.ready_take_while(|(count, _)| Some(*count) != to)
+		.ready_filter_map(|item| event_filter(item, filter))
+		.wide_filter_map(|item| ignored_filter(&services, item, sender_user))
+		.wide_filter_map(|item| visibility_filter(&services, item, sender_user))
+		.take(limit)
+		.collect()
+		.await;
+
+	let lazy_loading_context = lazy_loading::Context {
+		user_id: sender_user,
+		device_id: sender_device,
+		room_id,
+		token: Some(from.into_unsigned()),
+		options: Some(&filter.lazy_load_options),
+	};
+
+	let witness = filter
+		.lazy_load_options
+		.is_enabled()
+		.then_async(|| lazy_loading_witness(&services, &lazy_loading_context, events.iter()));
+
+	let state = witness
+		.map(Option::into_iter)
+		.map(|option| option.flat_map(Witness::into_iter))
+		.map(IterStream::stream)
+		.into_stream()
+		.flatten()
+		.broad_filter_map(async |user_id| get_member_event(&services, room_id, &user_id).await)
+		.collect()
+		.await;
+
+	let next_token = events
+		.last()
+		.map(|&(count, _)| count)
+		.map(|count| count.to_string());
+
+	let processed_events = events
+		.into_iter()
+		.map(at!(1))
+		.map(Event::into_format)
+		.collect();
+
+	Ok(crate::router::RumaResponse(get_message_events::v3::Response {
+		start: from.to_string(),
+		end: next_token,
+		chunk: processed_events,
+		state,
+	}))
+}
+
 pub(crate) async fn lazy_loading_witness<'a, I>(
 	services: &Services,
 	lazy_loading_context: &lazy_loading::Context<'_>,
@@ -234,7 +327,15 @@ pub(crate) async fn ignored_filter(
 	item: PdusIterItem,
 	user_id: &UserId,
 ) -> Option<PdusIterItem> {
-	let (_, ref pdu) = item;
+	let (count, ref pdu) = item;
+
+	if services
+		.deleted_rooms
+		.is_deleted_pdu(user_id, pdu.room_id(), count)
+		.await
+	{
+		return None;
+	}
 
 	is_ignored_pdu(services, pdu, user_id)
 		.await
@@ -257,12 +358,17 @@ where
 		return true;
 	}
 
-	// `im.tuwunel.activity` events (custom system notifications) must also obey the
-	// sender-ignore rules, just like standard message types in IGNORED_MESSAGE_TYPES.
+	// `im.tuwunel.activity` events (custom system notifications) must also obey
+	// persisted per-user deletes, just like standard message types in
+	// IGNORED_MESSAGE_TYPES.
 	// We cannot add a runtime string to the sorted const array, so we check separately.
 	let is_activity = event.kind().to_cow_str() == super::send::ACTIVITY_EVENT_TYPE;
 
-	if !is_activity && IGNORED_MESSAGE_TYPES.binary_search(event.kind()).is_err() {
+	if !is_activity
+		&& IGNORED_MESSAGE_TYPES
+			.binary_search(event.kind())
+			.is_err()
+	{
 		return false;
 	}
 
@@ -272,10 +378,6 @@ where
 		.is_match(event.sender().server_name().host());
 
 	ignored_server
-		|| services
-			.users
-			.user_is_ignored(event.sender(), user_id)
-			.await
 		|| services
 			.deleted_events
 			.is_deleted(user_id, event.event_id())

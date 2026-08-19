@@ -344,7 +344,9 @@ pub(crate) async fn set_pushrule_route(
 		.get_global(sender_user, GlobalAccountDataEventType::PushRules)
 		.await
 		.unwrap_or_else(|_| PushRulesEvent {
-			content: PushRulesEventContent { global: Ruleset::server_default(sender_user) },
+			content: PushRulesEventContent {
+				global: Ruleset::server_default(sender_user),
+			},
 		});
 
 	if let Err(error) = account_data.content.global.insert(
@@ -436,7 +438,9 @@ pub(crate) async fn set_pushrule_actions_route(
 		.get_global(sender_user, GlobalAccountDataEventType::PushRules)
 		.await
 		.unwrap_or_else(|_| PushRulesEvent {
-			content: PushRulesEventContent { global: Ruleset::server_default(sender_user) },
+			content: PushRulesEventContent {
+				global: Ruleset::server_default(sender_user),
+			},
 		});
 
 	if account_data
@@ -505,7 +509,9 @@ pub(crate) async fn set_pushrule_enabled_route(
 		.get_global(sender_user, GlobalAccountDataEventType::PushRules)
 		.await
 		.unwrap_or_else(|_| PushRulesEvent {
-			content: PushRulesEventContent { global: Ruleset::server_default(sender_user) },
+			content: PushRulesEventContent {
+				global: Ruleset::server_default(sender_user),
+			},
 		});
 
 	if account_data
@@ -540,7 +546,9 @@ pub(crate) async fn delete_pushrule_route(
 		.get_global(sender_user, GlobalAccountDataEventType::PushRules)
 		.await
 		.unwrap_or_else(|_| PushRulesEvent {
-			content: PushRulesEventContent { global: Ruleset::server_default(sender_user) },
+			content: PushRulesEventContent {
+				global: Ruleset::server_default(sender_user),
+			},
 		});
 
 	if let Err(error) = account_data
@@ -553,8 +561,9 @@ pub(crate) async fn delete_pushrule_route(
 				ErrorKind::InvalidParam,
 				"Cannot delete a server-default pushrule.",
 			),
-			| RemovePushRuleError::NotFound =>
-				Error::BadRequest(ErrorKind::NotFound, "Push rule not found."),
+			| RemovePushRuleError::NotFound => {
+				Error::BadRequest(ErrorKind::NotFound, "Push rule not found.")
+			},
 			| _ => Error::BadRequest(ErrorKind::InvalidParam, "Invalid data."),
 		};
 

@@ -31,7 +31,7 @@ use tuwunel_core::{
 	utils::{
 		MutexMap, MutexMapGuard,
 		result::{LogErr, NotFound},
-		stream::{TryIgnore, TryReadyExt},
+		stream::{TryIgnore, TryReadyExt, WidebandExt},
 	},
 	warn,
 };
@@ -49,6 +49,7 @@ struct Data {
 	eventid_outlierpdu: Arc<Map>,
 	eventid_pduid: Arc<Map>,
 	pduid_pdu: Arc<Map>,
+	roomid_haslink_pduid: Arc<Map>,
 	db: Arc<Database>,
 }
 
@@ -72,6 +73,7 @@ struct ExtractRelatesToEventId {
 #[derive(Deserialize)]
 struct ExtractBody {
 	body: Option<String>,
+	filename: Option<String>,
 }
 
 type RoomMutexMap = MutexMap<OwnedRoomId, ()>;
@@ -87,6 +89,7 @@ impl crate::Service for Service {
 				eventid_outlierpdu: args.db["eventid_outlierpdu"].clone(),
 				eventid_pduid: args.db["eventid_pduid"].clone(),
 				pduid_pdu: args.db["pduid_pdu"].clone(),
+				roomid_haslink_pduid: args.db["roomid_haslink_pduid"].clone(),
 				db: args.db.clone(),
 			},
 			mutex_insert: RoomMutexMap::new(),
@@ -100,7 +103,9 @@ impl crate::Service for Service {
 		Ok(())
 	}
 
-	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
+	fn name(&self) -> &str {
+		crate::service::make_name(std::module_path!())
+	}
 }
 
 /// Removes a pdu and creates a new one with the same id.
@@ -376,6 +381,38 @@ pub fn pdus_rev<'a>(
 				.rev_raw_stream_from(&current)
 				.ready_try_take_while(move |(key, _)| Ok(key.starts_with(&prefix)))
 				.ready_and_then(move |item| Self::each_pdu(item, user_id))
+		})
+		.try_flatten_stream()
+}
+
+/// Returns an iterator over all events with links and their tokens in a room that
+/// happened before the event with id `until` in reverse-order.
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "debug")]
+pub fn pdus_links_rev<'a>(
+	&'a self,
+	user_id: Option<&'a UserId>,
+	room_id: &'a RoomId,
+	until: Option<PduCount>,
+) -> impl Stream<Item = Result<PdusIterItem>> + Send + 'a {
+	let until = until.unwrap_or_else(PduCount::max);
+	self.count_to_id(room_id, until, Direction::Backward)
+		.map_ok(move |current| {
+			let prefix = current.shortroomid();
+			self.db
+				.roomid_haslink_pduid
+				.rev_raw_stream_from(&current)
+				.ready_try_take_while(move |(key, _)| Ok(key.starts_with(&prefix)))
+				.wide_then(move |res| {
+					// Parse the RawPduId synchronously. The KeyVal slice points to RocksDB's
+					// cursor buffer which gets overwritten concurrently when yielding next items.
+					let pdu_id = res.map(|(key, _)| RawPduId::from(key));
+					async move {
+						let pdu_id = pdu_id?;
+						let pdu_val = self.db.pduid_pdu.get(&pdu_id).await?;
+						Self::each_pdu((pdu_id.as_bytes(), &pdu_val), user_id)
+					}
+				})
 		})
 		.try_flatten_stream()
 }

@@ -51,9 +51,13 @@ impl crate::Service for Service {
 		}))
 	}
 
-	async fn clear_cache(&self) { self.db.authchainkey_authchain.clear().await; }
+	async fn clear_cache(&self) {
+		self.db.authchainkey_authchain.clear().await;
+	}
 
-	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
+	fn name(&self) -> &str {
+		crate::service::make_name(std::module_path!())
+	}
 }
 
 #[implement(Service)]

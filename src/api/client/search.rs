@@ -16,7 +16,11 @@ use tuwunel_core::{
 	Err, Result, at, is_true,
 	matrix::Event,
 	result::FlatOk,
-	utils::{IterStream, option::OptionExt, stream::{BroadbandExt, ReadyExt}},
+	utils::{
+		IterStream,
+		option::OptionExt,
+		stream::{BroadbandExt, ReadyExt},
+	},
 };
 use tuwunel_service::{Services, rooms::search::RoomQuery};
 
@@ -44,20 +48,24 @@ pub(crate) async fn search_events_route(
 	let next_batch = body.next_batch.as_deref();
 
 	// Parse optional workspace_id from query string (?workspace_id=xxx)
-	let workspace_id: Option<String> = uri
-		.query()
-		.and_then(|q| {
-			q.split('&')
-				.find(|p| p.starts_with("workspace_id="))
-				.map(|p| p.trim_start_matches("workspace_id=").to_owned())
-		});
+	let workspace_id: Option<String> = uri.query().and_then(|q| {
+		q.split('&')
+			.find(|p| p.starts_with("workspace_id="))
+			.map(|p| p.trim_start_matches("workspace_id=").to_owned())
+	});
 
 	let room_events = body
 		.search_categories
 		.room_events
 		.as_ref()
 		.map_async(|criteria| {
-			category_room_events(&services, sender_user, next_batch, criteria, workspace_id.as_deref())
+			category_room_events(
+				&services,
+				sender_user,
+				next_batch,
+				criteria,
+				workspace_id.as_deref(),
+			)
 		})
 		.await
 		.transpose()?;

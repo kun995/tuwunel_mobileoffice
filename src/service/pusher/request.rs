@@ -6,13 +6,12 @@ use ruma::api::{
 	IncomingResponse, MatrixVersion, OutgoingRequest, SendAccessToken, SupportedVersions,
 };
 use serde_json::Value as JsonValue;
-use tuwunel_core::{
-	Err, Result, debug, err, implement, trace, utils::string_from_bytes, warn,
-};
+use tuwunel_core::{Err, Result, debug, err, implement, trace, utils::string_from_bytes, warn};
 
 const CALL_KIND_FIELD: &str = "call_kind";
+const WORKSPACE_ID_FIELD: &str = "workspaceId";
 
-fn add_top_level_call_kind(body: &mut BytesMut) {
+fn add_push_gateway_extensions(body: &mut BytesMut, workspace_id: Option<&str>) {
 	let Ok(mut payload) = serde_json::from_slice::<JsonValue>(body.as_ref()) else {
 		return;
 	};
@@ -27,29 +26,46 @@ fn add_top_level_call_kind(body: &mut BytesMut) {
 	let event_type = notification
 		.get("type")
 		.and_then(JsonValue::as_str)
-		.or_else(|| notification.get("event_type").and_then(JsonValue::as_str));
+		.or_else(|| {
+			notification
+				.get("event_type")
+				.and_then(JsonValue::as_str)
+		});
 
-	if event_type != Some("m.call.invite") {
-		return;
+	let mut changed = false;
+
+	if event_type == Some("m.call.invite")
+		&& let Some(call_kind) = notification
+			.get("content")
+			.and_then(|content| content.get(CALL_KIND_FIELD))
+			.cloned()
+	{
+		notification.insert(CALL_KIND_FIELD.to_owned(), call_kind);
+		changed = true;
 	}
 
-	let call_kind = notification
-		.get("content")
-		.and_then(|content| content.get(CALL_KIND_FIELD))
-		.cloned();
+	if let Some(workspace_id) = workspace_id
+		.map(str::trim)
+		.filter(|workspace_id| !workspace_id.is_empty())
+	{
+		notification
+			.insert(WORKSPACE_ID_FIELD.to_owned(), JsonValue::String(workspace_id.to_owned()));
+		changed = true;
+	}
 
-	if let Some(call_kind) = call_kind {
-		notification.insert(CALL_KIND_FIELD.to_owned(), call_kind);
-
-		if let Ok(serialized) = serde_json::to_vec(&payload) {
-			*body = BytesMut::from(serialized.as_slice());
-		}
+	if changed && let Ok(serialized) = serde_json::to_vec(&payload) {
+		*body = BytesMut::from(serialized.as_slice());
 	}
 }
 
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip_all)]
-pub(super) async fn send_request<T>(&self, dest: &str, request: T) -> Result<T::IncomingResponse>
+pub(super) async fn send_request<T>(
+	&self,
+	dest: &str,
+	request: T,
+	workspace_id: Option<&str>,
+) -> Result<T::IncomingResponse>
 where
 	T: OutgoingRequest + Debug + Send,
 {
@@ -68,10 +84,9 @@ where
 			err!(BadServerResponse(warn!(
 				"Failed to find destination {dest} for push gateway: {e}"
 			)))
-		})?
-	;
+		})?;
 
-	add_top_level_call_kind(http_request.body_mut());
+	add_push_gateway_extensions(http_request.body_mut(), workspace_id);
 
 	let http_request = http_request.map(BytesMut::freeze);
 
@@ -146,7 +161,7 @@ where
 				));
 			}
 
-				warn!(
+			warn!(
 				"Push gateway {dest} returned successful HTTP response: {status} | request body: {req_body_str}"
 			);
 
@@ -171,7 +186,7 @@ where
 
 #[cfg(test)]
 mod tests {
-	use super::{CALL_KIND_FIELD, add_top_level_call_kind};
+	use super::{CALL_KIND_FIELD, WORKSPACE_ID_FIELD, add_push_gateway_extensions};
 	use bytes::BytesMut;
 
 	#[test]
@@ -180,7 +195,7 @@ mod tests {
 			r#"{"notification":{"type":"m.call.invite","content":{"call_kind":"video"}}}"#,
 		);
 
-		add_top_level_call_kind(&mut body);
+		add_push_gateway_extensions(&mut body, None);
 
 		let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("valid json");
 		assert_eq!(
@@ -195,9 +210,40 @@ mod tests {
 			r#"{"notification":{"type":"m.room.message","content":{"call_kind":"voice"}}}"#,
 		);
 
-		add_top_level_call_kind(&mut body);
+		add_push_gateway_extensions(&mut body, None);
 
 		let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("valid json");
-		assert!(value["notification"].get(CALL_KIND_FIELD).is_none());
+		assert!(
+			value["notification"]
+				.get(CALL_KIND_FIELD)
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn adds_workspace_id_when_present() {
+		let mut body = BytesMut::from(r#"{"notification":{"type":"m.room.message"}}"#);
+
+		add_push_gateway_extensions(&mut body, Some(" workspace-1 "));
+
+		let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("valid json");
+		assert_eq!(
+			value["notification"][WORKSPACE_ID_FIELD],
+			serde_json::Value::String("workspace-1".to_owned())
+		);
+	}
+
+	#[test]
+	fn ignores_empty_workspace_id() {
+		let mut body = BytesMut::from(r#"{"notification":{"type":"m.room.message"}}"#);
+
+		add_push_gateway_extensions(&mut body, Some("   "));
+
+		let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("valid json");
+		assert!(
+			value["notification"]
+				.get(WORKSPACE_ID_FIELD)
+				.is_none()
+		);
 	}
 }

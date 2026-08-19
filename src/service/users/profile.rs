@@ -43,16 +43,19 @@ pub async fn update_displayname(
 		.iter()
 		.try_stream()
 		.and_then(async |room_id: &OwnedRoomId| {
-			let pdu = PduBuilder::state(user_id.to_string(), &RoomMemberEventContent {
-				displayname: displayname.map(ToOwned::to_owned),
-				membership: MembershipState::Join,
-				avatar_url: avatar_url.clone(),
-				blurhash: blurhash.clone(),
-				join_authorized_via_users_server: None,
-				reason: None,
-				is_direct: None,
-				third_party_invite: None,
-			});
+			let pdu = PduBuilder::state(
+				user_id.to_string(),
+				&RoomMemberEventContent {
+					displayname: displayname.map(ToOwned::to_owned),
+					membership: MembershipState::Join,
+					avatar_url: avatar_url.clone(),
+					blurhash: blurhash.clone(),
+					join_authorized_via_users_server: None,
+					reason: None,
+					is_direct: None,
+					third_party_invite: None,
+				},
+			);
 
 			Ok((pdu, room_id))
 		})
@@ -119,16 +122,19 @@ pub async fn update_avatar_url(
 		.iter()
 		.try_stream()
 		.and_then(async |room_id: &OwnedRoomId| {
-			let pdu = PduBuilder::state(user_id.to_string(), &RoomMemberEventContent {
-				avatar_url: avatar_url.map(ToOwned::to_owned),
-				blurhash: blurhash.map(ToOwned::to_owned),
-				membership: MembershipState::Join,
-				displayname: current_displayname.clone(),
-				join_authorized_via_users_server: None,
-				reason: None,
-				is_direct: None,
-				third_party_invite: None,
-			});
+			let pdu = PduBuilder::state(
+				user_id.to_string(),
+				&RoomMemberEventContent {
+					avatar_url: avatar_url.map(ToOwned::to_owned),
+					blurhash: blurhash.map(ToOwned::to_owned),
+					membership: MembershipState::Join,
+					displayname: current_displayname.clone(),
+					join_authorized_via_users_server: None,
+					reason: None,
+					is_direct: None,
+					third_party_invite: None,
+				},
+			);
 
 			Ok((pdu, room_id))
 		})

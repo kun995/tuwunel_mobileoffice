@@ -65,10 +65,13 @@ where
 				.rev()
 				.stream()
 				.ready_filter(|(next_id, _)| {
-					let backed_off = self.is_backed_off(next_id, Range {
-						start: Duration::from_secs(5 * 60),
-						end: Duration::from_secs(60 * 60 * 24),
-					});
+					let backed_off = self.is_backed_off(
+						next_id,
+						Range {
+							start: Duration::from_secs(5 * 60),
+							end: Duration::from_secs(60 * 60 * 24),
+						},
+					);
 
 					!backed_off
 				})
@@ -134,10 +137,13 @@ async fn fetch_auth_chain(
 			continue;
 		}
 
-		if self.is_backed_off(&next_id, Range {
-			start: Duration::from_secs(2 * 60),
-			end: Duration::from_secs(60 * 60 * 8),
-		}) {
+		if self.is_backed_off(
+			&next_id,
+			Range {
+				start: Duration::from_secs(2 * 60),
+				end: Duration::from_secs(60 * 60 * 8),
+			},
+		) {
 			debug_warn!("Backed off from {next_id}");
 			continue;
 		}

@@ -630,9 +630,12 @@ pub(crate) async fn claim_keys_helper(
 				server,
 				services
 					.federation
-					.execute(server, federation::keys::claim_keys::v1::Request {
-						one_time_keys: one_time_keys_input_fed,
-					})
+					.execute(
+						server,
+						federation::keys::claim_keys::v1::Request {
+							one_time_keys: one_time_keys_input_fed,
+						},
+					)
 					.await,
 			)
 		})

@@ -5,7 +5,7 @@ use base64::{Engine as _, engine::general_purpose};
 use hmac::{Hmac, Mac};
 use ruma::{SecondsSinceUnixEpoch, UserId, api::client::voip::get_turn_server_info};
 use sha1::Sha1;
-use tuwunel_core::{Err, Result, utils};
+use tuwunel_core::{Err, Result, info, utils};
 
 use crate::Ruma;
 
@@ -22,10 +22,16 @@ pub(crate) async fn turn_server_route(
 ) -> Result<get_turn_server_info::v3::Response> {
 	// MSC4166: return M_NOT_FOUND 404 if no TURN URIs are specified in any way
 	if services.server.config.turn_uris.is_empty() {
+		info!("TURN server info requested but no TURN URIs are configured");
 		return Err!(Request(NotFound("Not Found")));
 	}
 
 	let turn_secret = &services.globals.turn_secret;
+	let requested_by = body
+		.sender_user
+		.as_deref()
+		.map(ToString::to_string)
+		.unwrap_or_else(|| "<guest-or-unknown>".to_owned());
 
 	let (username, password) = if let Some(turn_secret) = turn_secret {
 		let expiry = SecondsSinceUnixEpoch::from_system_time(
@@ -55,6 +61,14 @@ pub(crate) async fn turn_server_route(
 	} else {
 		(services.config.turn_username.clone(), services.config.turn_password.clone())
 	};
+
+	info!(
+		requested_by,
+		ttl_seconds = services.config.turn_ttl,
+		uris_count = services.config.turn_uris.len(),
+		uses_shared_secret = turn_secret.is_some(),
+		"Returning TURN server info"
+	);
 
 	Ok(get_turn_server_info::v3::Response {
 		username,

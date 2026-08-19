@@ -31,7 +31,11 @@ pub(crate) async fn join_room_by_id_route(
 	banned_room_check(&services, sender_user, room_id, None, client).await?;
 
 	// Check room member limit
-	if let Ok(current_count) = services.state_cache.room_joined_count(room_id).await {
+	if let Ok(current_count) = services
+		.state_cache
+		.room_joined_count(room_id)
+		.await
+	{
 		// Try to get member limit from room state
 		if let Ok(limit_data) = services
 			.state_accessor
@@ -39,18 +43,18 @@ pub(crate) async fn join_room_by_id_route(
 			.await
 		{
 			// Parse the limit from state event content
-			if let Ok(limit_event) = serde_json::from_str::<serde_json::Value>(limit_data.content.get()) {
+			if let Ok(limit_event) =
+				serde_json::from_str::<serde_json::Value>(limit_data.content.get())
+			{
 				if let Some(limit) = limit_event.get("limit").and_then(|v| v.as_u64()) {
 					if current_count >= limit {
-					use ruma::api::client::error::ErrorKind;
-					return Err(tuwunel_core::Error::Request(
-						ErrorKind::LimitExceeded {
-							retry_after: None,
-						},
-						"Room has reached maximum member limit".into(),
-						http::StatusCode::BAD_REQUEST,
-					));
-				}
+						use ruma::api::client::error::ErrorKind;
+						return Err(tuwunel_core::Error::Request(
+							ErrorKind::LimitExceeded { retry_after: None },
+							"Room has reached maximum member limit".into(),
+							http::StatusCode::BAD_REQUEST,
+						));
+					}
 				}
 			}
 		}
@@ -115,7 +119,11 @@ pub(crate) async fn join_room_by_id_or_alias_route(
 		.await?;
 
 	// Check room member limit
-	if let Ok(current_count) = services.state_cache.room_joined_count(&room_id).await {
+	if let Ok(current_count) = services
+		.state_cache
+		.room_joined_count(&room_id)
+		.await
+	{
 		// Try to get member limit from room state
 		if let Ok(limit_data) = services
 			.state_accessor
@@ -123,14 +131,14 @@ pub(crate) async fn join_room_by_id_or_alias_route(
 			.await
 		{
 			// Parse the limit from state event content
-			if let Ok(limit_event) = serde_json::from_str::<serde_json::Value>(limit_data.content.get()) {
+			if let Ok(limit_event) =
+				serde_json::from_str::<serde_json::Value>(limit_data.content.get())
+			{
 				if let Some(limit) = limit_event.get("limit").and_then(|v| v.as_u64()) {
 					if current_count >= limit {
 						use ruma::api::client::error::ErrorKind;
 						return Err(tuwunel_core::Error::Request(
-							ErrorKind::LimitExceeded {
-								retry_after: None,
-							},
+							ErrorKind::LimitExceeded { retry_after: None },
 							"Room has reached maximum member limit".into(),
 							http::StatusCode::BAD_REQUEST,
 						));

@@ -24,6 +24,9 @@ use tuwunel_database::Json;
 use super::{ExtractBody, ExtractRelatesTo, ExtractRelatesToEventId, RoomMutexGuard};
 use crate::rooms::{short::ShortRoomId, state_compressor::CompressedState};
 
+static LINK_REGEX: std::sync::LazyLock<regex::Regex> =
+	std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)((https?:\/\/|www\.)\S+)").unwrap());
+
 /// Append the incoming event setting the state snapshot to the state from
 /// the server that sent the event.
 #[implement(super::Service)]
@@ -238,7 +241,7 @@ async fn append_pdu_effects(
 					.await?;
 			}
 		},
-		| TimelineEventType::SpaceChild =>
+		| TimelineEventType::SpaceChild => {
 			if let Some(_state_key) = pdu.state_key() {
 				self.services
 					.spaces
@@ -246,7 +249,8 @@ async fn append_pdu_effects(
 					.lock()
 					.await
 					.remove(pdu.room_id());
-			},
+			}
+		},
 		| TimelineEventType::RoomMember => {
 			if let Some(state_key) = pdu.state_key() {
 				// if the state_key fails
@@ -284,10 +288,25 @@ async fn append_pdu_effects(
 		},
 		| TimelineEventType::RoomMessage => {
 			let content: ExtractBody = pdu.get_content()?;
+			if let Some(filename) = content.filename.as_deref() {
+				self.services
+					.search
+					.index_pdu(shortroomid, &pdu_id, filename);
+			}
+
 			if let Some(body) = content.body {
 				self.services
 					.search
 					.index_pdu(shortroomid, &pdu_id, &body);
+
+				if body.contains("http://") || body.contains("https://") || body.contains("www.")
+				{
+					if LINK_REGEX.is_match(&body) {
+						self.db
+							.roomid_haslink_pduid
+							.raw_put(pdu_id.as_bytes(), b"");
+					}
+				}
 
 				if self
 					.services

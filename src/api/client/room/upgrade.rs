@@ -121,7 +121,7 @@ pub(crate) async fn upgrade_room_route(
 
 	let id_format = version_rules.room_id_format;
 	let (replacement_room, state_lock) = match id_format {
-		| RoomIdFormatVersion::V2 =>
+		| RoomIdFormatVersion::V2 => {
 			upgrade_room_create(
 				&services,
 				sender_user,
@@ -131,9 +131,10 @@ pub(crate) async fn upgrade_room_route(
 				predecessor,
 				body.additional_creators.clone(),
 			)
-			.await,
+			.await
+		},
 
-		| RoomIdFormatVersion::V1 =>
+		| RoomIdFormatVersion::V1 => {
 			upgrade_room_create_legacy(
 				&services,
 				sender_user,
@@ -142,7 +143,8 @@ pub(crate) async fn upgrade_room_route(
 				&version_rules,
 				predecessor,
 			)
-			.await,
+			.await
+		},
 	}
 	.inspect_err(|e| error!(?body, "Upgrade m.room.create event failed: {e}"))?;
 
@@ -276,8 +278,9 @@ async fn upgrade_room_create_legacy(
 	{
 		use RoomVersionId::*;
 		match new_version {
-			| V1 | V2 | V3 | V4 | V5 | V6 | V7 | V8 | V9 | V10 =>
-				content.insert("creator".into(), json!(&sender_user).try_into()?),
+			| V1 | V2 | V3 | V4 | V5 | V6 | V7 | V8 | V9 | V10 => {
+				content.insert("creator".into(), json!(&sender_user).try_into()?)
+			},
 			| _ => content.remove("creator"),
 		}
 	};
@@ -347,10 +350,13 @@ async fn move_joined_member(&self) -> Result<OwnedEventId> {
 	self.services
 		.timeline
 		.build_and_append_pdu(
-			PduBuilder::state(self.sender_user.as_str(), &RoomMemberEventContent {
-				membership: MembershipState::Join,
-				..old_content
-			}),
+			PduBuilder::state(
+				self.sender_user.as_str(),
+				&RoomMemberEventContent {
+					membership: MembershipState::Join,
+					..old_content
+				},
+			),
 			self.sender_user,
 			self.new_room_id,
 			self.new_state_lock,
@@ -473,10 +479,13 @@ async fn tombstone_old_room(&self) -> Result<OwnedEventId> {
 	self.services
 		.timeline
 		.build_and_append_pdu(
-			PduBuilder::state(StateKey::new(), &RoomTombstoneEventContent {
-				body: "This room has been upgraded.".to_owned(),
-				replacement_room: self.new_room_id.to_owned(),
-			}),
+			PduBuilder::state(
+				StateKey::new(),
+				&RoomTombstoneEventContent {
+					body: "This room has been upgraded.".to_owned(),
+					replacement_room: self.new_room_id.to_owned(),
+				},
+			),
 			self.sender_user,
 			self.old_room_id,
 			self.old_state_lock,
@@ -511,11 +520,14 @@ async fn lockdown_old_room(&self) -> Result<OwnedEventId> {
 	self.services
 		.timeline
 		.build_and_append_pdu(
-			PduBuilder::state(StateKey::new(), &RoomPowerLevelsEventContent {
-				events_default: new_level,
-				invite: new_level,
-				..old_content
-			}),
+			PduBuilder::state(
+				StateKey::new(),
+				&RoomPowerLevelsEventContent {
+					events_default: new_level,
+					invite: new_level,
+					..old_content
+				},
+			),
 			self.sender_user,
 			self.old_room_id,
 			self.old_state_lock,

@@ -1,5 +1,6 @@
 use axum::extract::State;
 use futures::{FutureExt, StreamExt, pin_mut};
+use http::Uri;
 use ruma::{
 	UserId,
 	api::client::user_directory::search_users::{self},
@@ -28,12 +29,19 @@ const LIMIT_DEFAULT: usize = 10;
 ///   have the join rule set to public) and don't share a room with the sender
 pub(crate) async fn search_users_route(
 	State(services): State<crate::State>,
+	uri: Uri,
 	body: Ruma<search_users::v3::Request>,
 ) -> Result<search_users::v3::Response> {
 	let sender_user = body.sender_user();
 	let limit = usize::try_from(body.limit)
 		.unwrap_or(LIMIT_DEFAULT)
 		.min(LIMIT_MAX);
+
+	let workspace_id: Option<String> = uri.query().and_then(|q| {
+		q.split('&')
+			.find(|p| p.starts_with("workspace_id="))
+			.map(|p| p.trim_start_matches("workspace_id=").to_owned())
+	});
 
 	let search_term = body.search_term.to_lowercase();
 	let users = services
@@ -42,6 +50,15 @@ pub(crate) async fn search_users_route(
 		.ready_filter(|&user_id| user_id != sender_user)
 		.map(ToOwned::to_owned)
 		.broad_filter_map(async |user_id| {
+			if let Some(workspace_id) = workspace_id.as_deref()
+				&& !services
+					.workspace
+					.user_in_workspace(&user_id, workspace_id)
+					.await
+			{
+				return None;
+			}
+
 			let display_name = services.users.displayname(&user_id).await.ok();
 
 			should_show_user(
@@ -50,6 +67,7 @@ pub(crate) async fn search_users_route(
 				&user_id,
 				display_name.as_deref(),
 				&search_term,
+				workspace_id.is_some(),
 			)
 			.await
 			.then_async(async || search_users::v3::User {
@@ -73,6 +91,7 @@ async fn should_show_user(
 	target_user: &UserId,
 	target_display_name: Option<&str>,
 	search_term: &str,
+	skip_visibility_check: bool,
 ) -> bool {
 	let user_id_matches = target_user
 		.as_str()
@@ -85,6 +104,10 @@ async fn should_show_user(
 
 	if !user_id_matches && !display_name_matches {
 		return false;
+	}
+
+	if skip_visibility_check {
+		return true;
 	}
 
 	if services

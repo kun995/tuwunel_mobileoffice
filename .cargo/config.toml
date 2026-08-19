@@ -1,2 +1,7 @@
 [env]
 RUMA_UNSTABLE_EXHAUSTIVE_TYPES = "true"
+
+[net]
+# Use the system Git client for Git dependencies and nested submodules.
+# This avoids Cargo's libgit2 TLS/proxy failures in container builds.
+git-fetch-with-cli = true

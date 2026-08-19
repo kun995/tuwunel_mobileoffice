@@ -102,14 +102,16 @@ pub(crate) async fn create_room_route(
 
 	// 1. Create the create event.
 	let (room_id, state_lock) = match version_rules.room_id_format {
-		| RoomIdFormatVersion::V1 =>
-			create_create_event_legacy(&services, &body, room_version, &version_rules).await?,
-		| RoomIdFormatVersion::V2 =>
+		| RoomIdFormatVersion::V1 => {
+			create_create_event_legacy(&services, &body, room_version, &version_rules).await?
+		},
+		| RoomIdFormatVersion::V2 => {
 			create_create_event(&services, &body, &preset, room_version, &version_rules)
 				.await
 				.map_err(|e| {
 					err!(Request(InvalidParam("Error while creating m.room.create event: {e}")))
-				})?,
+				})?
+		},
 	};
 
 	// 2. Let the room creator join
@@ -117,13 +119,16 @@ pub(crate) async fn create_room_route(
 	services
 		.timeline
 		.build_and_append_pdu(
-			PduBuilder::state(sender_user.to_string(), &RoomMemberEventContent {
-				displayname: services.users.displayname(sender_user).await.ok(),
-				avatar_url: services.users.avatar_url(sender_user).await.ok(),
-				blurhash: services.users.blurhash(sender_user).await.ok(),
-				is_direct: Some(body.is_direct),
-				..RoomMemberEventContent::new(MembershipState::Join)
-			}),
+			PduBuilder::state(
+				sender_user.to_string(),
+				&RoomMemberEventContent {
+					displayname: services.users.displayname(sender_user).await.ok(),
+					avatar_url: services.users.avatar_url(sender_user).await.ok(),
+					blurhash: services.users.blurhash(sender_user).await.ok(),
+					is_direct: Some(body.is_direct),
+					..RoomMemberEventContent::new(MembershipState::Join)
+				},
+			),
 			sender_user,
 			&room_id,
 			&state_lock,
@@ -173,6 +178,7 @@ pub(crate) async fn create_room_route(
 		body.power_level_content_override.as_ref(),
 		&body.visibility,
 		users,
+		sender_user,
 	)?;
 
 	services
@@ -196,10 +202,13 @@ pub(crate) async fn create_room_route(
 		services
 			.timeline
 			.build_and_append_pdu(
-				PduBuilder::state(String::new(), &RoomCanonicalAliasEventContent {
-					alias: Some(room_alias_id.to_owned()),
-					alt_aliases: vec![],
-				}),
+				PduBuilder::state(
+					String::new(),
+					&RoomCanonicalAliasEventContent {
+						alias: Some(room_alias_id.to_owned()),
+						alt_aliases: vec![],
+					},
+				),
 				sender_user,
 				&room_id,
 				&state_lock,
@@ -350,10 +359,13 @@ pub(crate) async fn create_room_route(
 		services
 			.timeline
 			.build_and_append_pdu(
-				PduBuilder::state(String::new(), &RoomTopicEventContent {
-					topic: topic.clone(),
-					topic_block: TopicContentBlock::default(),
-				}),
+				PduBuilder::state(
+					String::new(),
+					&RoomTopicEventContent {
+						topic: topic.clone(),
+						topic_block: TopicContentBlock::default(),
+					},
+				),
 				sender_user,
 				&room_id,
 				&state_lock,
@@ -391,7 +403,8 @@ pub(crate) async fn create_room_route(
 	{
 		let mut created_content = serde_json::Map::new();
 		if let Some(ref name) = body.name {
-			created_content.insert("room_name".to_owned(), serde_json::Value::String(name.clone()));
+			created_content
+				.insert("room_name".to_owned(), serde_json::Value::String(name.clone()));
 		}
 		if let Err(e) = services
 			.timeline
@@ -499,7 +512,9 @@ pub(crate) async fn create_room_route(
 		if is_space {
 			// Case 1: Tạo Space/workspace → lưu mapping workspaceId → spaceRoomId
 			// Đây là thao tác atomic với RocksDB, luôn thành công trừ khi disk lỗi.
-			services.workspace.set_space_room_id(wid, &room_id);
+			services
+				.workspace
+				.set_space_room_id(wid, &room_id);
 			info!("Workspace {wid:?} mapped to Space room {room_id}");
 		} else {
 			// Case 2: Tạo room thường trong workspace
@@ -670,10 +685,7 @@ async fn create_create_event(
 	// Embed room name into the create event so clients can display
 	// "UserA created the group «Room name»" as a single system message.
 	if let Some(ref name) = body.name {
-		create_content.insert(
-			"room_name".into(),
-			json!(name).try_into()?,
-		);
+		create_content.insert("room_name".into(), json!(name).try_into()?);
 	}
 
 	// 1. The room create event, using a placeholder room_id
@@ -771,8 +783,9 @@ async fn create_create_event_legacy(
 			use RoomVersionId::*;
 
 			let content = match room_version {
-				| V1 | V2 | V3 | V4 | V5 | V6 | V7 | V8 | V9 | V10 =>
-					RoomCreateEventContent::new_v1(body.sender_user().to_owned()),
+				| V1 | V2 | V3 | V4 | V5 | V6 | V7 | V8 | V9 | V10 => {
+					RoomCreateEventContent::new_v1(body.sender_user().to_owned())
+				},
 				| _ => RoomCreateEventContent::new_v11(),
 			};
 
@@ -791,10 +804,7 @@ async fn create_create_event_legacy(
 	// Embed room name into the create event so clients can display
 	// "UserA created the group «Room name»" as a single system message.
 	if let Some(ref name) = body.name {
-		create_content.insert(
-			"room_name".into(),
-			json!(name).try_into()?,
-		);
+		create_content.insert("room_name".into(), json!(name).try_into()?);
 	}
 
 	// 1. The room create event
@@ -823,6 +833,7 @@ fn default_power_levels_content(
 	power_level_content_override: Option<&Raw<RoomPowerLevelsEventContent>>,
 	visibility: &room::Visibility,
 	users: BTreeMap<OwnedUserId, Int>,
+	creator_user_id: &ruma::UserId,
 ) -> Result<serde_json::Value> {
 	use serde_json::to_value;
 
@@ -879,6 +890,20 @@ fn default_power_levels_content(
 				}
 			}
 			power_levels_content[key] = value;
+		}
+	}
+
+	// Bảo vệ: đảm bảo creator luôn giữ quyền ít nhất 100 dù có power_level_content_override
+	if !version_rules
+		.authorization
+		.explicitly_privilege_room_creators
+	{
+		let creator_key = creator_user_id.to_string();
+		let current = power_levels_content["users"][&creator_key]
+			.as_i64()
+			.unwrap_or(0);
+		if current < 100 {
+			power_levels_content["users"][creator_key] = serde_json::json!(100);
 		}
 	}
 

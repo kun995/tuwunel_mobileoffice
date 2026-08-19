@@ -48,12 +48,16 @@ pub async fn create_device(
 	}
 
 	let notify = true;
-	self.put_device_metadata(user_id, notify, &Device {
-		device_id: device_id.clone(),
-		display_name: initial_device_display_name.map(Into::into),
-		last_seen_ip: client_ip.map(Into::into),
-		last_seen_ts: Some(MilliSecondsSinceUnixEpoch::now()),
-	});
+	self.put_device_metadata(
+		user_id,
+		notify,
+		&Device {
+			device_id: device_id.clone(),
+			display_name: initial_device_display_name.map(Into::into),
+			last_seen_ip: client_ip.map(Into::into),
+			last_seen_ts: Some(MilliSecondsSinceUnixEpoch::now()),
+		},
+	);
 
 	if let Some(access_token) = access_token {
 		self.set_access_token(user_id, &device_id, access_token, expires_in, refresh_token)

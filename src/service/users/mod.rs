@@ -20,7 +20,7 @@ use tuwunel_core::{
 	utils::{self, ReadyExt, stream::TryIgnore},
 	warn,
 };
-use tuwunel_database::{Deserialized, Json, Map};
+use tuwunel_database::{Database, Deserialized, Json, Map, SEP};
 
 pub use self::{keys::parse_master_key, register::Register};
 
@@ -30,6 +30,7 @@ pub struct Service {
 }
 
 struct Data {
+	database: Arc<Database>,
 	keychangeid_userid: Arc<Map>,
 	keyid_key: Arc<Map>,
 	onetimekeyid_onetimekeys: Arc<Map>,
@@ -60,6 +61,7 @@ impl crate::Service for Service {
 		Ok(Arc::new(Self {
 			services: args.services.clone(),
 			db: Data {
+				database: args.db.clone(),
 				keychangeid_userid: args.db["keychangeid_userid"].clone(),
 				keyid_key: args.db["keyid_key"].clone(),
 				onetimekeyid_onetimekeys: args.db["onetimekeyid_onetimekeys"].clone(),
@@ -87,7 +89,9 @@ impl crate::Service for Service {
 		}))
 	}
 
-	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
+	fn name(&self) -> &str {
+		crate::service::make_name(std::module_path!())
+	}
 }
 
 impl Service {
@@ -179,9 +183,129 @@ impl Service {
 		self.services.globals.user_is_local(user_id) && self.is_active(user_id).await
 	}
 
+	/// Removes recreatable account state after the user has been fully
+	/// deactivated. Room timeline events are intentionally preserved because
+	/// they are part of the Matrix room DAG.
+	pub async fn purge_account_records(&self, user_id: &UserId) -> usize {
+		const USER_PREFIX_MAPS: &[&str] = &[
+			"backupid_algorithm",
+			"backupid_etag",
+			"backupkeyid_backup",
+			"keyid_key",
+			"lazyloadedids",
+			"onetimekeyid_onetimekeys",
+			"senderkey_pusher",
+			"todeviceid_events",
+			"userdeviceconnid_conn",
+			"userdeviceid_metadata",
+			"userdeviceid_refresh",
+			"userdeviceid_token",
+			"userdevicesessionid_uiaainfo",
+			"userdevicetxnid_response",
+			"usereventsid_deleted",
+			"userfilterid_filter",
+			"userid_avatarurl",
+			"userid_blurhash",
+			"userid_dehydrateddevice",
+			"userid_devicelistversion",
+			"userid_displayname",
+			"userid_lastonetimekeyupdate",
+			"userid_masterkeyid",
+			"userid_oauthid",
+			"userid_origin",
+			"userid_presenceid",
+			"userid_selfsigningkeyid",
+			"userid_usersigningkeyid",
+			"userid_workspaceids",
+			"useridcount_notification",
+			"useridprofilekey_value",
+			"userroomid_clearedbefore",
+			"userroomid_deletedbefore",
+			"userroomid_highlightcount",
+			"userroomid_invitestate",
+			"userroomid_joined",
+			"userroomid_knockedstate",
+			"userroomid_leftstate",
+			"userroomid_notificationcount",
+		];
+		const USER_REVERSE_KEY_MAPS: &[&str] = &[
+			"presenceid_presence",
+			"roomuserdataid_accountdata",
+			"roomusertype_roomuserdataid",
+			"roomuserid_invitecount",
+			"roomuserid_joined",
+			"roomuserid_knockedcount",
+			"roomuserid_lastnotificationread",
+			"roomuserid_lastprivatereadupdate",
+			"roomuserid_leftcount",
+			"roomuserid_privateread",
+			"workspaceid_userids",
+		];
+		const USER_VALUE_MAPS: &[&str] = &[
+			"keychangeid_userid",
+			"logintoken_expiresatuserid",
+			"openidtoken_expiresatuserid",
+			"token_userdeviceid",
+		];
+
+		// Deactivation normally removes these through service APIs. Repeat the
+		// cleanup here to cover stale rows left by interrupted older operations.
+		let pushkeys = self
+			.services
+			.pusher
+			.get_pushkeys(user_id)
+			.map(ToOwned::to_owned)
+			.collect::<Vec<_>>()
+			.await;
+		for pushkey in &pushkeys {
+			self.services
+				.pusher
+				.delete_pusher(user_id, pushkey)
+				.await;
+		}
+		self.services
+			.oauth
+			.delete_user_sessions(user_id)
+			.await;
+		self.services
+			.presence
+			.remove_presence(user_id)
+			.await;
+		let reminder_count = self
+			.services
+			.reminders
+			.purge_user_reminders(user_id)
+			.await;
+		let uiaa_request_count = self.services.uiaa.clear_user_requests(user_id);
+
+		let _cork = self.db.database.cork_and_flush();
+		let mut removed = pushkeys.len() + reminder_count + uiaa_request_count;
+		for map_name in USER_PREFIX_MAPS {
+			removed += remove_user_prefix_rows(&self.db.database[*map_name], user_id).await;
+		}
+		for map_name in USER_REVERSE_KEY_MAPS {
+			removed += remove_user_keyed_rows(&self.db.database[*map_name], user_id).await;
+		}
+		for map_name in USER_VALUE_MAPS {
+			removed += remove_user_value_rows(&self.db.database[*map_name], user_id).await;
+		}
+
+		// The existence check and all registration paths use userid_password as
+		// the source of truth. Remove it last so a failed cleanup remains safely
+		// deactivated and can be retried instead of being recreated too early.
+		if self.db.userid_password.get(user_id).await.is_ok() {
+			self.db.userid_password.remove(user_id);
+			removed += 1;
+		}
+
+		removed
+	}
+
 	/// Returns the number of users registered on this server.
 	#[inline]
-	pub async fn count(&self) -> usize { self.db.userid_password.count().await }
+	pub async fn count(&self) -> usize {
+		self.db.userid_password.count().await
+	}
 
 	/// Returns an iterator over all users on this homeserver.
 	pub fn stream(&self) -> impl Stream<Item = &UserId> + Send {
@@ -403,4 +527,70 @@ impl Service {
 			}
 		}
 	}
+}
+
+fn serialized_component_matches(bytes: &[u8], user_id: &UserId) -> bool {
+	let user = user_id.as_bytes();
+	bytes == user
+		|| bytes
+			.split(|byte| *byte == SEP)
+			.any(|component| component == user)
+}
+
+async fn remove_user_keyed_rows(map: &Arc<Map>, user_id: &UserId) -> usize {
+	let keys = map
+		.raw_keys()
+		.ignore_err()
+		.ready_filter_map(|key: &[u8]| {
+			serialized_component_matches(key, user_id).then(|| key.to_vec())
+		})
+		.collect::<Vec<_>>()
+		.await;
+
+	for key in &keys {
+		map.remove(key);
+	}
+
+	keys.len()
+}
+
+async fn remove_user_prefix_rows(map: &Arc<Map>, user_id: &UserId) -> usize {
+	let mut keys = Vec::new();
+	if map.get(user_id).await.is_ok() {
+		keys.push(user_id.as_bytes().to_vec());
+	}
+
+	let mut prefix = user_id.as_bytes().to_vec();
+	prefix.push(SEP);
+	keys.extend(
+		map.raw_keys_prefix(&prefix)
+			.ignore_err()
+			.map(<[u8]>::to_vec)
+			.collect::<Vec<_>>()
+			.await,
+	);
+
+	for key in &keys {
+		map.remove(key);
+	}
+
+	keys.len()
+}
+
+async fn remove_user_value_rows(map: &Arc<Map>, user_id: &UserId) -> usize {
+	let keys = map
+		.raw_stream()
+		.ignore_err()
+		.ready_filter_map(|(key, value): (&[u8], &[u8])| {
+			(serialized_component_matches(value, user_id) || value.ends_with(user_id.as_bytes()))
+				.then(|| key.to_vec())
+		})
+		.collect::<Vec<_>>()
+		.await;
+
+	for key in &keys {
+		map.remove(key);
+	}
+
+	keys.len()
 }

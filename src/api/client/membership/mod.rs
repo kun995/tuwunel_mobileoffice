@@ -1,4 +1,7 @@
 mod ban;
+mod clear_history;
+mod delete_conversation;
+mod dissolve;
 mod forget;
 mod invite;
 mod join;
@@ -19,6 +22,9 @@ use tuwunel_service::Services;
 
 pub(crate) use self::{
 	ban::ban_user_route,
+	clear_history::clear_room_history_route,
+	delete_conversation::delete_direct_conversation_route,
+	dissolve::dissolve_room_route,
 	forget::forget_room_route,
 	invite::invite_user_route,
 	join::{join_room_by_id_or_alias_route, join_room_by_id_route},
@@ -29,8 +35,6 @@ pub(crate) use self::{
 	unban::unban_user_route,
 };
 use crate::{Ruma, RumaResponse};
-
-
 
 /// # `GET /_matrix/client/v3/joined_rooms`
 ///
@@ -45,13 +49,11 @@ pub(crate) async fn joined_rooms_route(
 	let sender_user = body.sender_user();
 
 	// Parse optional workspace_id from query string (?workspace_id=xxx)
-	let workspace_id: Option<String> = uri
-		.query()
-		.and_then(|q| {
-			q.split('&')
-				.find(|p| p.starts_with("workspace_id="))
-				.map(|p| p.trim_start_matches("workspace_id=").to_owned())
-		});
+	let workspace_id: Option<String> = uri.query().and_then(|q| {
+		q.split('&')
+			.find(|p| p.starts_with("workspace_id="))
+			.map(|p| p.trim_start_matches("workspace_id=").to_owned())
+	});
 
 	let joined_rooms = if let Some(ref wid) = workspace_id {
 		// Source of truth: RocksDB index (reliable, không phụ thuộc m.space.child event)
@@ -65,6 +67,14 @@ pub(crate) async fn joined_rooms_route(
 					.await
 					.then_some(room_id)
 			})
+			.broad_filter_map(async |room_id| {
+				services
+					.deleted_rooms
+					.should_hide_room(sender_user, &room_id)
+					.await
+					.eq(&false)
+					.then_some(room_id)
+			})
 			.collect()
 			.await
 	} else {
@@ -72,6 +82,14 @@ pub(crate) async fn joined_rooms_route(
 			.state_cache
 			.rooms_joined(sender_user)
 			.map(ToOwned::to_owned)
+			.broad_filter_map(async |room_id| {
+				services
+					.deleted_rooms
+					.should_hide_room(sender_user, &room_id)
+					.await
+					.eq(&false)
+					.then_some(room_id)
+			})
 			.collect()
 			.await
 	};

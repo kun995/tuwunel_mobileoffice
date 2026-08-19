@@ -23,7 +23,7 @@ pub(super) async fn handle_login(
 	_body: &Ruma<Request>,
 	info: &Token,
 ) -> Result<OwnedUserId> {
-	let user_id = validate_user(services, &info.token)?;
+	let user_id = resolve_login_user(services, &info.token).await?;
 	if !services.users.exists(&user_id).await {
 		let config = &services.config.jwt;
 		if !config.register_user {
@@ -39,20 +39,119 @@ pub(super) async fn handle_login(
 	Ok(user_id)
 }
 
-pub(crate) fn validate_user(services: &Services, token: &str) -> Result<OwnedUserId> {
+pub(crate) async fn validate_user(services: &Services, token: &str) -> Result<OwnedUserId> {
+	let (_, candidates) = validate_user_candidates(services, token)?;
+
+	if let Some(user_id) = find_existing_candidate(services, &candidates).await {
+		return Ok(user_id);
+	}
+
+	Err!(Request(NotFound("JWT identity is not mapped to an existing Matrix account.")))
+}
+
+async fn resolve_login_user(services: &Services, token: &str) -> Result<OwnedUserId> {
+	let (raw_is_email, candidates) = validate_user_candidates(services, token)?;
+
+	if let Some(user_id) = find_existing_candidate(services, &candidates).await {
+		return Ok(user_id);
+	}
+
+	let user_id = if raw_is_email {
+		candidates.last()
+	} else {
+		candidates.first()
+	}
+	.cloned()
+	.ok_or_else(|| {
+		err!(Request(InvalidUsername("JWT subject is empty after localpart normalization.")))
+	})?;
+
+	Ok(user_id)
+}
+
+fn validate_user_candidates(
+	services: &Services,
+	token: &str,
+) -> Result<(bool, Vec<OwnedUserId>)> {
 	let config = &services.config.jwt;
 	if !config.enable {
 		return Err!(Request(Unauthorized("JWT login is not enabled.")));
 	}
 
 	let claim = validate(config, token)?;
-	let local = claim.preferred_username.unwrap_or(claim.sub).to_lowercase();
-	let server = &services.server.name;
-	let user_id = UserId::parse_with_server_name(local, server).map_err(|e| {
-		err!(Request(InvalidUsername("JWT subject is not a valid user MXID: {e}")))
-	})?;
+	jwt_user_id_candidates(services, &claim)
+}
 
-	Ok(user_id)
+async fn find_existing_candidate(
+	services: &Services,
+	candidates: &[OwnedUserId],
+) -> Option<OwnedUserId> {
+	for user_id in candidates {
+		if services.users.exists(user_id).await {
+			return Some(user_id.clone());
+		}
+	}
+
+	None
+}
+
+fn jwt_user_id_candidates(
+	services: &Services,
+	claim: &Claim,
+) -> Result<(bool, Vec<OwnedUserId>)> {
+	let raw_local = claim
+		.preferred_username
+		.as_deref()
+		.filter(|preferred_username| !preferred_username.trim().is_empty())
+		.unwrap_or(&claim.sub);
+	let raw_is_email = raw_local.contains('@');
+
+	let mut localparts = Vec::new();
+	push_candidate_localpart(&mut localparts, raw_local.trim().to_lowercase());
+
+	if let Some(normalized) = normalize_jwt_localpart(raw_local) {
+		push_candidate_localpart(&mut localparts, normalized);
+	}
+
+	let server = &services.server.name;
+	let mut user_ids = Vec::with_capacity(localparts.len());
+	let mut last_error = None;
+
+	for localpart in localparts {
+		match UserId::parse_with_server_name(localpart, server) {
+			| Ok(user_id) => user_ids.push(user_id),
+			| Err(e) => last_error = Some(e),
+		}
+	}
+
+	if user_ids.is_empty() {
+		if let Some(e) = last_error {
+			return Err!(Request(InvalidUsername("JWT subject is not a valid user MXID: {e}")));
+		}
+	}
+
+	Ok((raw_is_email, user_ids))
+}
+
+fn push_candidate_localpart(localparts: &mut Vec<String>, localpart: String) {
+	if !localpart.is_empty()
+		&& !localparts
+			.iter()
+			.any(|candidate| candidate == &localpart)
+	{
+		localparts.push(localpart);
+	}
+}
+
+fn normalize_jwt_localpart(value: &str) -> Option<String> {
+	let value = value.trim();
+	let localpart = value
+		.split_once('@')
+		.map_or(value, |(localpart, _)| localpart)
+		.trim()
+		.to_lowercase();
+
+	(!localpart.is_empty()).then_some(localpart)
 }
 
 fn validate(config: &JwtConfig, token: &str) -> Result<Claim> {
@@ -81,7 +180,7 @@ fn init_verifier(config: &JwtConfig) -> Result<DecodingKey> {
 		| "EDDSA" => DecodingKey::from_ed_pem(key.as_bytes())
 			.map_err(|e| err!(Config("jwt.key", "JWT key is not valid EDDSA PEM: {e}")))?,
 		| "RSA" => DecodingKey::from_rsa_pem(key.as_bytes())
-		.map_err(|e| err!(Config("jwt.key", "JWT key is not valid RSA PEM: {e}")))?,
+			.map_err(|e| err!(Config("jwt.key", "JWT key is not valid RSA PEM: {e}")))?,
 
 		| _ => return Err!(Config("jwt.format", "Key format {format:?} is not supported.")),
 	})
@@ -125,4 +224,28 @@ fn init_validator(config: &JwtConfig) -> Result<Validation> {
 	debug!(?validator, "JWT configured");
 
 	Ok(validator)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::normalize_jwt_localpart;
+
+	#[test]
+	fn strips_email_domain_from_jwt_localpart() {
+		assert_eq!(
+			normalize_jwt_localpart("Trieuhonganhsmail@gmail.com").as_deref(),
+			Some("trieuhonganhsmail")
+		);
+	}
+
+	#[test]
+	fn keeps_non_email_jwt_localpart() {
+		assert_eq!(normalize_jwt_localpart(" 0940035066 ").as_deref(), Some("0940035066"));
+	}
+
+	#[test]
+	fn rejects_empty_jwt_localpart_after_normalization() {
+		assert_eq!(normalize_jwt_localpart("@gmail.com"), None);
+		assert_eq!(normalize_jwt_localpart("   "), None);
+	}
 }

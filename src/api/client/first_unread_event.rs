@@ -28,11 +28,18 @@ pub(crate) async fn get_first_unread_event_route(
 		.find_from_token(token.token())
 		.await
 		.map_err(|_| {
-			Error::BadRequest(ErrorKind::UnknownToken { soft_logout: false }, "Unknown access token.")
+			Error::BadRequest(
+				ErrorKind::UnknownToken { soft_logout: false },
+				"Unknown access token.",
+			)
 		})?;
 
 	// Verify the user is in the room
-	if !services.state_cache.is_joined(&sender_user, &room_id).await {
+	if !services
+		.state_cache
+		.is_joined(&sender_user, &room_id)
+		.await
+	{
 		return Err!(Request(Forbidden("You are not a member of this room.")));
 	}
 

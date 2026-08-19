@@ -25,11 +25,13 @@ pub(super) mod read_marker;
 pub(super) mod redact;
 pub(super) mod register;
 pub(super) mod relations;
+pub(super) mod reminder;
 pub(super) mod report;
 pub(super) mod room;
 pub(super) mod search;
 pub(super) mod send;
 pub(super) mod send_batch;
+pub(super) mod send_message_pair;
 pub(super) mod session;
 pub(super) mod space;
 pub(super) mod state;
@@ -44,6 +46,7 @@ pub(super) mod unversioned;
 pub(super) mod user_directory;
 pub(super) mod voip;
 pub(super) mod well_known;
+pub(super) mod workspace_user;
 
 mod utils;
 
@@ -74,11 +77,13 @@ pub(super) use read_marker::*;
 pub(super) use redact::*;
 pub(super) use register::*;
 pub(super) use relations::*;
+pub(super) use reminder::*;
 pub(super) use report::*;
 pub(super) use room::*;
 pub(super) use search::*;
 pub(super) use send::*;
 pub(super) use send_batch::*;
+pub(super) use send_message_pair::*;
 pub(super) use session::*;
 pub(super) use space::*;
 pub(super) use state::*;
@@ -93,6 +98,7 @@ pub(super) use unversioned::*;
 pub(super) use user_directory::*;
 pub(super) use voip::*;
 pub(super) use well_known::*;
+pub(super) use workspace_user::*;
 
 /// generated user access token length
 const TOKEN_LENGTH: usize = tuwunel_service::users::device::TOKEN_LENGTH;
