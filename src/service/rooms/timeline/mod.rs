@@ -17,7 +17,7 @@ use futures::{
 };
 use ruma::{
 	CanonicalJsonObject, EventId, OwnedEventId, OwnedRoomId, RoomId, UserId, api::Direction,
-	events::room::encrypted::Relation,
+	events::{TimelineEventType, room::encrypted::Relation},
 };
 use serde::Deserialize;
 pub use tuwunel_core::matrix::pdu::{PduId, RawPduId};
@@ -50,6 +50,7 @@ struct Data {
 	eventid_pduid: Arc<Map>,
 	pduid_pdu: Arc<Map>,
 	roomid_haslink_pduid: Arc<Map>,
+	roomid_hasusermessage: Arc<Map>,
 	db: Arc<Database>,
 }
 
@@ -90,6 +91,7 @@ impl crate::Service for Service {
 				eventid_pduid: args.db["eventid_pduid"].clone(),
 				pduid_pdu: args.db["pduid_pdu"].clone(),
 				roomid_haslink_pduid: args.db["roomid_haslink_pduid"].clone(),
+				roomid_hasusermessage: args.db["roomid_hasusermessage"].clone(),
 				db: args.db.clone(),
 			},
 			mutex_insert: RoomMutexMap::new(),
@@ -140,6 +142,79 @@ pub async fn first_pdu_in_room(&self, room_id: &RoomId) -> Result<PduEvent> {
 #[inline]
 pub async fn latest_pdu_in_room(&self, room_id: &RoomId) -> Result<PduEvent> {
 	self.latest_item_in_room(None, room_id).await
+}
+
+/// Returns whether a room has ever contained a user message.
+///
+/// The value is cached per room. Existing rooms without an index are scanned
+/// once while holding the insert lock so the result cannot race with a new
+/// timeline append.
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "debug")]
+pub async fn has_user_message(&self, room_id: &RoomId) -> Result<bool> {
+	let cached = self.db.roomid_hasusermessage.get(room_id.as_bytes()).await;
+	match cached {
+		| Ok(value) => return Ok(value.as_ref() == b"1"),
+		| Err(error) if !error.is_not_found() => return Err(error),
+		| Err(_) => {},
+	}
+
+	let _insert_lock = self.mutex_insert.lock(room_id).await;
+
+	// Another sync request may have populated the cache while we waited.
+	if let Ok(value) = self.db.roomid_hasusermessage.get(room_id.as_bytes()).await {
+		return Ok(value.as_ref() == b"1");
+	}
+
+	let pdus = self.pdus(None, room_id, None);
+	pin_mut!(pdus);
+	let mut has_message = false;
+	while let Some((_, pdu)) = pdus.try_next().await? {
+		if pdu.kind == TimelineEventType::RoomMessage {
+			has_message = true;
+			break;
+		}
+	}
+
+	self.db.roomid_hasusermessage.raw_put(
+		room_id.as_bytes(),
+		if has_message { b"1" } else { b"0" },
+	);
+
+	Ok(has_message)
+}
+
+/// Marks a room as having a user message. This marker is intentionally
+/// monotonic so redacting the first message does not hide the room again.
+#[implement(Service)]
+pub fn mark_has_user_message(&self, room_id: &RoomId) {
+	self.db
+		.roomid_hasusermessage
+		.raw_put(room_id.as_bytes(), b"1");
+}
+
+/// Returns true when the room is a direct chat without any user message yet.
+/// Errors while reading the timeline fail open so a temporary database issue
+/// cannot make an existing room disappear from sync.
+#[implement(Service)]
+pub async fn is_empty_direct_room(&self, sender_user: &UserId, room_id: &RoomId) -> bool {
+	let is_direct = self
+		.services
+		.account_data
+		.is_direct(sender_user, room_id)
+		.await
+		|| self
+			.services
+			.state_accessor
+			.is_direct(room_id, sender_user)
+			.await;
+
+	is_direct
+		&& self
+			.has_user_message(room_id)
+			.await
+		.ok()
+		.is_some_and(|has_message| !has_message)
 }
 
 #[implement(Service)]

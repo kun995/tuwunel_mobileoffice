@@ -1,112 +1,106 @@
-# Message Pair API
+# Private translation API
 
-This unstable API creates a new timeline event that can be mapped back to an
-existing message, then allows deleting that mapped message later.
+Translations saved through `send_message_pair` belong to the authenticated
+Matrix user. They are stored on this homeserver, outside the room timeline.
+They do not appear in ordinary `/sync`, `/messages`, room search, push, or
+federation. Mobile must call the GET endpoint below to restore translations
+when opening a room.
 
-## Create mapped message
+## Save translation
 
 `POST /_matrix/client/unstable/org.tuwunel/rooms/{roomId}/send_message_pair`
 
-### Request
+Use `Authorization: Bearer <matrix access token>` and `Content-Type:
+application/json`.
 
 ```json
 {
-  "target_event_id": "$original:example.org",
-  "event_type": "m.room.message",
-  "batch_id": "pair_abc123",
+  "target_event_id": "$originalEventId",
   "content": {
     "msgtype": "m.text",
-    "body": "Tin đã sửa"
+    "body": "Bạn đang làm gì thế",
+    "org.tuwunel.lang": "vi"
   }
 }
 ```
 
-### Response
+The response retains the `event_id` field mobile stores as
+`translationEventId`. The returned ID identifies a private translation
+record; it is not a room PDU and cannot be read from the ordinary Matrix
+room-event endpoint.
 
 ```json
 {
-  "batch_id": "pair_abc123",
-  "target_event_id": "$original:example.org",
-  "event_id": "$update:example.org",
-  "event_ids": ["$update:example.org"],
-  "mapping": {
-    "original_event_id": "$original:example.org",
-    "update_event_id": "$update:example.org",
-    "relation": {
-      "rel_type": "m.replace",
-      "event_id": "$original:example.org"
-    },
-    "async_fields": {
-      "content": [
-        "message_batch_id",
-        "message_batch_sequence",
-        "m.relates_to",
-        "m.new_content"
-      ],
-      "unsigned": [
-        "transaction_id",
-        "message_batch_id",
-        "message_batch_sequence"
-      ]
-    }
-  }
+  "batch_id": "msg_abc123",
+  "target_event_id": "$originalEventId",
+  "event_id": "$translationEventId"
 }
 ```
 
-## Delete mapped message
+The server adds `message_batch_id`, `message_batch_sequence`, and an
+`m.reference` relation to the target in the stored `content`.
+
+## Restore translations
+
+`GET /_matrix/client/unstable/org.tuwunel/rooms/{roomId}/send_message_pair`
+
+Use the same bearer token. The result contains only the caller's saved
+translations in this room, ordered by creation time:
+
+```json
+{
+  "translations": [
+    {
+      "event_id": "$translationEventId",
+      "room_id": "!roomId:server",
+      "sender": "@translator:server",
+      "target_event_id": "$originalEventId",
+      "event_type": "m.room.message",
+      "content": {
+        "msgtype": "m.text",
+        "body": "Bạn đang làm gì thế",
+        "org.tuwunel.lang": "vi",
+        "message_batch_id": "msg_abc123",
+        "message_batch_sequence": 0,
+        "m.relates_to": {
+          "rel_type": "m.reference",
+          "event_id": "$originalEventId"
+        }
+      },
+      "batch_id": "msg_abc123",
+      "origin_server_ts": 1770000000000
+    }
+  ]
+}
+```
+
+Mobile should key each result by `target_event_id`, display `content.body`,
+and keep `event_id -> target_event_id` for immediate cleanup after deletion.
+For a translation just returned by the BFF, mobile can display it at once and
+then save its returned `event_id` as before.
+
+## Delete translation
 
 `DELETE /_matrix/client/unstable/org.tuwunel/rooms/{roomId}/send_message_pair/{eventId}`
 
-This redacts the generated update message itself.
-
-### Response
-
-```json
-{
-  "deleted_event_id": "$update:example.org",
-  "redaction_event_id": "$redact:example.org",
-  "batch_id": "pair_abc123"
-}
-```
-
-## Async sync mapping
-
-When the client receives `/sync`, the mapping data is visible in the event
-payload:
+Use the same bearer token. Only the owner can delete the private record.
+Mobile should remove it from the UI after a successful response.
 
 ```json
 {
-  "event_id": "$update:example.org",
-  "type": "m.room.message",
-  "content": {
-    "msgtype": "m.text",
-    "body": "Tin đã sửa",
-    "message_batch_id": "pair_abc123",
-    "message_batch_sequence": 0,
-    "m.relates_to": {
-      "rel_type": "m.replace",
-      "event_id": "$original:example.org"
-    },
-    "m.new_content": {
-      "msgtype": "m.text",
-      "body": "Tin đã sửa",
-      "message_batch_id": "pair_abc123",
-      "message_batch_sequence": 0
-    }
-  },
-  "unsigned": {
-    "transaction_id": "pair:DEVICE:0",
-    "message_batch_id": "pair_abc123",
-    "message_batch_sequence": 0
-  }
+  "deleted_event_id": "$translationEventId",
+  "batch_id": "msg_abc123"
 }
 ```
 
-Notes:
+If the translation was only in local state and has no `translationEventId`,
+mobile can clear it without calling DELETE. Other users get `M_NOT_FOUND` for
+the private event ID.
 
-- The original message only has `message_batch_id` if it was also created by a
-  mapped flow.
-- If the original message came from normal `/send`, it will not gain a batch id
-  later.
-- `message_batch_id` is the client-side grouping key; `m.relates_to.event_id`
-  is the actual link to the original event.
+## Existing public pairs
+
+Pairs created by earlier versions are room events and are not returned by
+this private GET. Their content may already have reached other clients or
+homeservers. DELETE still accepts an old pair ID from its original sender
+and hides that room event for that sender. Moving old pairs into private
+storage requires a separate migration and cannot retract received copies.

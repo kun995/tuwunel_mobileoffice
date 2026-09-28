@@ -10,8 +10,21 @@ use tuwunel_core::{Err, Result, debug, err, implement, trace, utils::string_from
 
 const CALL_KIND_FIELD: &str = "call_kind";
 const WORKSPACE_ID_FIELD: &str = "workspaceId";
+const IS_DIRECT_CHAT_FIELD: &str = "is_direct_chat";
+const SENDER_AVATAR_URL_FIELD: &str = "sender_avatar_url";
+const ROOM_AVATAR_URL_FIELD: &str = "room_avatar_url";
+const IMAGE_MXC_URI_FIELD: &str = "image_mxc_uri";
+const IMAGE_URL_FIELD: &str = "image_url";
 
-fn add_push_gateway_extensions(body: &mut BytesMut, workspace_id: Option<&str>) {
+fn add_push_gateway_extensions(
+	body: &mut BytesMut,
+	workspace_id: Option<&str>,
+	is_direct_chat: Option<bool>,
+	sender_avatar_url: Option<&str>,
+	room_avatar_url: Option<&str>,
+	image_mxc_uri: Option<&str>,
+	image_url: Option<&str>,
+) {
 	let Ok(mut payload) = serde_json::from_slice::<JsonValue>(body.as_ref()) else {
 		return;
 	};
@@ -53,6 +66,58 @@ fn add_push_gateway_extensions(body: &mut BytesMut, workspace_id: Option<&str>) 
 		changed = true;
 	}
 
+	if let Some(is_direct_chat) = is_direct_chat {
+		notification.insert(
+			IS_DIRECT_CHAT_FIELD.to_owned(),
+			JsonValue::Bool(is_direct_chat),
+		);
+		changed = true;
+	}
+
+	if let Some(sender_avatar_url) = sender_avatar_url
+		.map(str::trim)
+		.filter(|avatar_url| !avatar_url.is_empty())
+	{
+		notification.insert(
+			SENDER_AVATAR_URL_FIELD.to_owned(),
+			JsonValue::String(sender_avatar_url.to_owned()),
+		);
+		changed = true;
+	}
+
+	if let Some(room_avatar_url) = room_avatar_url
+		.map(str::trim)
+		.filter(|avatar_url| !avatar_url.is_empty())
+	{
+		notification.insert(
+			ROOM_AVATAR_URL_FIELD.to_owned(),
+			JsonValue::String(room_avatar_url.to_owned()),
+		);
+		changed = true;
+	}
+
+	if let Some(image_mxc_uri) = image_mxc_uri
+		.map(str::trim)
+		.filter(|uri| !uri.is_empty())
+	{
+		notification.insert(
+			IMAGE_MXC_URI_FIELD.to_owned(),
+			JsonValue::String(image_mxc_uri.to_owned()),
+		);
+		changed = true;
+	}
+
+	if let Some(image_url) = image_url
+		.map(str::trim)
+		.filter(|url| !url.is_empty())
+	{
+		notification.insert(
+			IMAGE_URL_FIELD.to_owned(),
+			JsonValue::String(image_url.to_owned()),
+		);
+		changed = true;
+	}
+
 	if changed && let Ok(serialized) = serde_json::to_vec(&payload) {
 		*body = BytesMut::from(serialized.as_slice());
 	}
@@ -65,6 +130,11 @@ pub(super) async fn send_request<T>(
 	dest: &str,
 	request: T,
 	workspace_id: Option<&str>,
+	is_direct_chat: Option<bool>,
+	sender_avatar_url: Option<&str>,
+	room_avatar_url: Option<&str>,
+	image_mxc_uri: Option<&str>,
+	image_url: Option<&str>,
 ) -> Result<T::IncomingResponse>
 where
 	T: OutgoingRequest + Debug + Send,
@@ -86,7 +156,15 @@ where
 			)))
 		})?;
 
-	add_push_gateway_extensions(http_request.body_mut(), workspace_id);
+	add_push_gateway_extensions(
+		http_request.body_mut(),
+		workspace_id,
+		is_direct_chat,
+		sender_avatar_url,
+		room_avatar_url,
+		image_mxc_uri,
+		image_url,
+	);
 
 	let http_request = http_request.map(BytesMut::freeze);
 
@@ -104,7 +182,7 @@ where
 
 	debug!("Push gateway request URL: {} {}", req_method, req_url);
 	debug!("Push gateway request headers: {:#?}", req_headers);
-	debug!("Push gateway request body: {}", req_body_str);
+	debug!("Push gateway request body: {}", redact_push_gateway_request_body(&req_body_str));
 
 	if let Some(url_host) = req_url.host_str() {
 		trace!("Checking request URL for IP");
@@ -154,15 +232,17 @@ where
 					string_from_bytes(&body).unwrap_or_else(|_| String::from("<non-utf8 body>"))
 				);
 				warn!(
-					"Push gateway request details: method={req_method} url={req_url} | request body: {req_body_str}"
+					"Push gateway request details: method={req_method} url={req_url} | request body: {}",
+					redact_push_gateway_request_body(&req_body_str)
 				);
 				return Err!(BadServerResponse(
 					"Push gateway {dest} returned unsuccessful HTTP response: {status}"
 				));
 			}
 
-			warn!(
-				"Push gateway {dest} returned successful HTTP response: {status} | request body: {req_body_str}"
+			debug!(
+				"Push gateway {dest} returned successful HTTP response: {status} | request body: {}",
+				redact_push_gateway_request_body(&req_body_str)
 			);
 
 			let response = T::IncomingResponse::try_from_http_response(
@@ -184,9 +264,84 @@ where
 	}
 }
 
+fn redact_push_gateway_request_body(body: &str) -> String {
+	let Ok(mut payload) = serde_json::from_str::<JsonValue>(body) else {
+		return String::from("<invalid JSON body>");
+	};
+
+	if let Some(notification) = payload
+		.get_mut("notification")
+		.and_then(JsonValue::as_object_mut)
+	{
+		if let Some(image_url) = notification
+			.get(IMAGE_URL_FIELD)
+			.and_then(JsonValue::as_str)
+			.map(redact_signed_image_url)
+		{
+			notification.insert(IMAGE_URL_FIELD.to_owned(), JsonValue::String(image_url));
+		}
+
+		if let Some(devices) = notification
+			.get_mut("devices")
+			.and_then(JsonValue::as_array_mut)
+		{
+			for device in devices {
+				if let Some(pushkey) = device
+					.get("pushkey")
+					.and_then(JsonValue::as_str)
+					.map(str::to_owned)
+				{
+					if let Some(device_object) = device.as_object_mut() {
+						device_object.insert(
+							"pushkey".to_owned(),
+							JsonValue::String(mask_secret(&pushkey)),
+						);
+					}
+				}
+			}
+		}
+	}
+
+	serde_json::to_string(&payload).unwrap_or_else(|_| String::from("<unable to serialize body>"))
+}
+
+fn redact_signed_image_url(image_url: &str) -> String {
+	let Ok(mut url) = url::Url::parse(image_url) else {
+		return String::from("<redacted image URL>");
+	};
+
+	let query = url
+		.query_pairs()
+		.map(|(key, value)| {
+			if key == "sig" {
+				(key.into_owned(), "***".to_owned())
+			} else {
+				(key.into_owned(), value.into_owned())
+			}
+		})
+		.collect::<Vec<_>>();
+	url.query_pairs_mut().clear().extend_pairs(query);
+	url.to_string()
+}
+
+fn mask_secret(secret: &str) -> String {
+	let chars = secret.chars().collect::<Vec<_>>();
+	if chars.len() <= 8 {
+		return "***".to_owned();
+	}
+
+	let prefix = chars.iter().take(4).collect::<String>();
+	let suffix = chars.iter().rev().take(4).rev().collect::<String>();
+	format!("{prefix}...{suffix}")
+}
+
 #[cfg(test)]
 mod tests {
-	use super::{CALL_KIND_FIELD, WORKSPACE_ID_FIELD, add_push_gateway_extensions};
+	use super::{
+		CALL_KIND_FIELD, IMAGE_MXC_URI_FIELD, IMAGE_URL_FIELD, IS_DIRECT_CHAT_FIELD,
+		ROOM_AVATAR_URL_FIELD, SENDER_AVATAR_URL_FIELD, WORKSPACE_ID_FIELD,
+		add_push_gateway_extensions,
+	};
 	use bytes::BytesMut;
 
 	#[test]
@@ -195,7 +350,7 @@ mod tests {
 			r#"{"notification":{"type":"m.call.invite","content":{"call_kind":"video"}}}"#,
 		);
 
-		add_push_gateway_extensions(&mut body, None);
+		add_push_gateway_extensions(&mut body, None, None, None, None, None, None);
 
 		let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("valid json");
 		assert_eq!(
@@ -210,7 +365,7 @@ mod tests {
 			r#"{"notification":{"type":"m.room.message","content":{"call_kind":"voice"}}}"#,
 		);
 
-		add_push_gateway_extensions(&mut body, None);
+		add_push_gateway_extensions(&mut body, None, None, None, None, None, None);
 
 		let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("valid json");
 		assert!(
@@ -224,7 +379,7 @@ mod tests {
 	fn adds_workspace_id_when_present() {
 		let mut body = BytesMut::from(r#"{"notification":{"type":"m.room.message"}}"#);
 
-		add_push_gateway_extensions(&mut body, Some(" workspace-1 "));
+		add_push_gateway_extensions(&mut body, Some(" workspace-1 "), None, None, None, None, None);
 
 		let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("valid json");
 		assert_eq!(
@@ -237,7 +392,7 @@ mod tests {
 	fn ignores_empty_workspace_id() {
 		let mut body = BytesMut::from(r#"{"notification":{"type":"m.room.message"}}"#);
 
-		add_push_gateway_extensions(&mut body, Some("   "));
+		add_push_gateway_extensions(&mut body, Some("   "), None, None, None, None, None);
 
 		let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("valid json");
 		assert!(
@@ -245,5 +400,77 @@ mod tests {
 				.get(WORKSPACE_ID_FIELD)
 				.is_none()
 		);
+	}
+
+	#[test]
+	fn adds_room_metadata_when_present() {
+		let mut body = BytesMut::from(r#"{"notification":{"type":"m.room.message"}}"#);
+
+		add_push_gateway_extensions(
+			&mut body,
+			None,
+			Some(false),
+			Some("mxc://server/sender"),
+			Some("mxc://server/room"),
+			None,
+			None,
+		);
+
+		let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("valid json");
+		assert_eq!(
+			value["notification"][IS_DIRECT_CHAT_FIELD],
+			serde_json::Value::Bool(false)
+		);
+		assert_eq!(
+			value["notification"][SENDER_AVATAR_URL_FIELD],
+			serde_json::Value::String("mxc://server/sender".to_owned())
+		);
+		assert_eq!(
+			value["notification"][ROOM_AVATAR_URL_FIELD],
+			serde_json::Value::String("mxc://server/room".to_owned())
+		);
+	}
+
+	#[test]
+	fn adds_image_metadata_when_present() {
+		let mut body = BytesMut::from(r#"{"notification":{"type":"m.room.message"}}"#);
+
+		add_push_gateway_extensions(
+			&mut body,
+			None,
+			None,
+			None,
+			None,
+			Some("mxc://server/media"),
+			Some("https://matrix.example/preview.png?expires=10&sig=secret"),
+		);
+
+		let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("valid json");
+		assert_eq!(
+			value["notification"][IMAGE_MXC_URI_FIELD],
+			serde_json::Value::String("mxc://server/media".to_owned())
+		);
+		assert_eq!(
+			value["notification"][IMAGE_URL_FIELD],
+			serde_json::Value::String("https://matrix.example/preview.png?expires=10&sig=secret".to_owned())
+		);
+	}
+
+	#[test]
+	fn redacts_pushkeys_in_request_logs() {
+		let body = r#"{"notification":{"devices":[{"pushkey":"1234567890abcdef"}]}}"#;
+		let redacted = super::redact_push_gateway_request_body(body);
+
+		assert!(!redacted.contains("1234567890abcdef"));
+		assert!(redacted.contains("1234...cdef"));
+	}
+
+	#[test]
+	fn redacts_signed_image_url_in_request_logs() {
+		let body = r#"{"notification":{"image_url":"https://matrix.example/preview.png?expires=10&sig=secret"}}"#;
+		let redacted = super::redact_push_gateway_request_body(body);
+
+		assert!(!redacted.contains("sig=secret"));
+		assert!(redacted.contains("sig=***"));
 	}
 }

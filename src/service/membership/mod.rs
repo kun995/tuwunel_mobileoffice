@@ -29,6 +29,9 @@ struct InviteBatchState {
 
 const AUTO_INVITE_BATCH_WINDOW: Duration = Duration::from_secs(3);
 
+/// Marks membership/name events that are emitted as part of room creation.
+pub const INITIAL_ROOM_CREATION_FIELD: &str = "org.tuwunel.initial_room_creation";
+
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {

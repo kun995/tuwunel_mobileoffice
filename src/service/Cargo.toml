@@ -104,6 +104,7 @@ const-str.workspace = true
 ctor.workspace = true
 futures.workspace = true
 hickory-resolver.workspace = true
+hmac.workspace = true
 http.workspace = true
 image.workspace = true
 image.optional = true

@@ -45,9 +45,21 @@ pub(crate) async fn room_initial_sync_route(
 		.try_collect::<Vec<_>>();
 
 	let limit = LIMIT_MAX;
+	let sender_user = body.sender_user();
 	let events = services
 		.timeline
-		.pdus_rev(None, room_id, Some(PduCount::Normal(next_batch).saturating_add(1)))
+		.pdus_rev(Some(sender_user), room_id, Some(PduCount::Normal(next_batch).saturating_add(1)))
+		.try_filter_map(|item| {
+			let services = &services;
+			async move {
+				let (count, ref pdu) = item;
+				Ok((!services
+					.deleted_rooms
+					.is_deleted_pdu(sender_user, pdu.room_id(), count)
+					.await)
+					.then_some(item))
+			}
+		})
 		.try_take(limit)
 		.try_collect()
 		.map_ok(|mut vec: Vec<_>| {

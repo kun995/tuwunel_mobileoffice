@@ -10,7 +10,7 @@ use futures::{Stream, StreamExt, TryFutureExt, future::join};
 use ipaddress::IPAddress;
 use ruma::{
 	DeviceId, OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId, UserId,
-	api::client::push::{Pusher, PusherKind, set_pusher},
+	api::client::push::{Lang, Pusher, PusherKind, set_pusher},
 	events::{AnySyncTimelineEvent, room::power_levels::RoomPowerLevels},
 	push::{Action, PushConditionPowerLevelsCtx, PushConditionRoomCtx, Ruleset},
 	serde::Raw,
@@ -27,6 +27,21 @@ use tuwunel_core::{
 use tuwunel_database::{Database, Deserialized, Ignore, Interfix, Json, Map};
 
 pub use self::append::Notified;
+
+/// Normalizes the Matrix pusher language to the languages supported by the
+/// Mobile Office notification templates.
+pub(crate) fn normalized_language(lang: &Lang) -> &'static str {
+	if lang
+		.as_str()
+		.split('-')
+		.next()
+		.is_some_and(|language| language.eq_ignore_ascii_case("en"))
+	{
+		"en"
+	} else {
+		"vi"
+	}
+}
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
@@ -95,6 +110,16 @@ pub async fn set_pusher(
 			// add some validation to the pusher URL
 			let pusher_kind = &data.pusher.kind;
 			if let PusherKind::Http(http) = pusher_kind {
+				if let Some(platform) = http.data.get("platform")
+					&& !platform.as_str().is_some_and(|platform| {
+						platform.eq_ignore_ascii_case("ios") || platform.eq_ignore_ascii_case("android")
+					})
+				{
+					return Err!(Request(InvalidParam(
+						"Pusher data.platform must be either `ios` or `android`."
+					)));
+				}
+
 				let url = &http.url;
 				let url = url::Url::parse(&http.url).map_err(|e| {
 					err!(Request(InvalidParam(

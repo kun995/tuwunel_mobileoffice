@@ -177,6 +177,9 @@ where
 
 	// Insert pdu
 	self.append_pdu_json(&pdu_id, pdu, &pdu_json, count);
+	if *pdu.kind() == TimelineEventType::RoomMessage {
+		self.mark_has_user_message(pdu.room_id());
+	}
 
 	drop(insert_lock);
 
@@ -239,6 +242,10 @@ async fn append_pdu_effects(
 			{
 				self.redact_pdu(redact_id, pdu, shortroomid, state_lock)
 					.await?;
+				self.services
+					.pusher
+					.remove_redacted_event_notifications(pdu.room_id(), redact_id)
+					.await;
 			}
 		},
 		| TimelineEventType::SpaceChild => {

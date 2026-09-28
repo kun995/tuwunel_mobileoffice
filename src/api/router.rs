@@ -223,7 +223,7 @@ pub fn build(router: Router<State>, server: &Server) -> Router<State> {
 		)
 		.route(
 			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/send_message_pair",
-			post(client::send_message_pair_route),
+			post(client::send_message_pair_route).get(client::list_message_pairs_route),
 		)
 		.route(
 			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/send_message_pair/{event_id}",
@@ -272,6 +272,10 @@ pub fn build(router: Router<State>, server: &Server) -> Router<State> {
 			put(client::update_workspace_users_route),
 		)
 		.route(
+			"/_matrix/client/unstable/org.tuwunel/workspaces/{workspace_id}/stats",
+			get(client::workspace_stats_route),
+		)
+		.route(
 			"/_matrix/client/unstable/org.tuwunel/users/displaynames",
 			put(client::update_user_displaynames_route),
 		)
@@ -284,6 +288,12 @@ pub fn build(router: Router<State>, server: &Server) -> Router<State> {
 			"/_matrix/client/unstable/org.tuwunel/rooms/{room_id}/first_unread_event",
 			get(client::get_first_unread_event_route),
 		);
+
+	// Short-lived signed thumbnail endpoint for push notification previews.
+	router = router.route(
+		"/_matrix/client/unstable/org.tuwunel/media/thumbnail/{server_name}/{media_id}/preview.png",
+		get(client::get_push_media_thumbnail_route),
+	);
 
 	// SS endpoint not related to federation
 	router = router.ruma_route(&server::get_openid_userinfo_route);

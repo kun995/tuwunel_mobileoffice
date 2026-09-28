@@ -45,6 +45,10 @@ where
 			.watch_raw_prefix(&userid_prefix)
 			.boxed(),
 		self.db
+			.userroomid_deletedbefore
+			.watch_raw_prefix(&userid_prefix)
+			.boxed(),
+		self.db
 			.roomusertype_roomuserdataid
 			.watch_prefix(&globaluserdata_prefix)
 			.boxed(),

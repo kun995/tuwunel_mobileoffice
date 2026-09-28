@@ -295,39 +295,17 @@ async fn check_workspace_filter_with_state<S>(
 		.map(|room_id| (room_id, state))
 }
 
-/// Kiểm tra xem phòng DM có chưa có tin nhắn nào không.
-/// Trả về `true` nếu cần ẩn phòng (là DM + chưa có message event).
-async fn is_empty_direct_room(
-	services: &Services,
-	sender_user: &UserId,
-	room_id: &OwnedRoomId,
-) -> bool {
-	// Chỉ áp dụng cho phòng được đánh dấu là direct chat trong account data của user
-	let is_dm = services
-		.account_data
-		.is_direct(sender_user, room_id)
-		.await;
-	if !is_dm {
-		return false;
-	}
-
-	// Lấy event cuối cùng trong phòng; nếu nó là state event (có state_key)
-	// thì phòng chưa có tin nhắn -> ẩn
-	services
-		.timeline
-		.latest_pdu_in_room(room_id)
-		.await
-		.map_or(false, |pdu| pdu.state_key().is_some())
-}
-
-/// Wrapper: nếu là initial sync và phòng là DM trống → lọc ra (trả None).
+/// Ẩn DM chưa phát sinh message trong cả initial và incremental sync.
 async fn check_empty_direct_filter(
 	services: &Services,
 	sender_user: &UserId,
-	since: u64,
 	room_id: OwnedRoomId,
 ) -> Option<OwnedRoomId> {
-	if since == 0 && is_empty_direct_room(services, sender_user, &room_id).await {
+	if services
+		.timeline
+		.is_empty_direct_room(sender_user, &room_id)
+		.await
+	{
 		return None;
 	}
 	Some(room_id)
@@ -368,22 +346,32 @@ async fn build_sync_events(
 		})
 		.broad_filter_map(|room_id| check_workspace_filter(services, workspace_id, room_id))
 		.broad_filter_map(|room_id| {
-			// Khi initial sync (since==0), ẩn các phòng DM chưa có tin nhắn
-			check_empty_direct_filter(services, sender_user, since, room_id)
+			check_empty_direct_filter(services, sender_user, room_id)
 		})
-		.broad_filter_map(|room_id| {
+		.broad_filter_map(|room_id| async move {
+			let room_since = if services
+				.deleted_rooms
+				.room_reappeared_since(sender_user, &room_id, since, next_batch)
+				.await
+			{
+				0
+			} else {
+				since
+			};
+
 			load_joined_room(
 				services,
 				sender_user,
 				sender_device,
 				room_id.clone(),
-				since,
+				room_since,
 				next_batch,
 				full_state,
 				filter,
 			)
-			.map_ok(move |(joined_room, dlu, jeu)| (room_id, joined_room, dlu, jeu))
+			.await
 			.ok()
+			.map(|(joined_room, dlu, jeu)| (room_id, joined_room, dlu, jeu))
 		})
 		.ready_fold(
 			(BTreeMap::new(), HashSet::new(), HashSet::new()),

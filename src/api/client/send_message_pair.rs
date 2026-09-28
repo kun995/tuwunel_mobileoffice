@@ -9,11 +9,9 @@ use axum_extra::{
 use ruma::{EventId, OwnedEventId, RoomId, api::client::error::ErrorKind};
 use serde::Deserialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use tuwunel_core::{
-	Err, Error, Result, err,
-	matrix::{event::Event, pdu::PduBuilder},
-	utils,
-};
+use tuwunel_core::{Err, Error, Result, err, matrix::event::Event, utils};
+
+use tuwunel_service::rooms::message_pairs::MessagePair;
 
 const MESSAGE_BATCH_ID_FIELD: &str = "message_batch_id";
 const MESSAGE_BATCH_SEQUENCE_FIELD: &str = "message_batch_sequence";
@@ -34,18 +32,18 @@ pub(crate) struct SendMessagePairBody {
 
 /// # `POST /_matrix/client/unstable/org.tuwunel/rooms/{roomId}/send_message_pair`
 ///
-/// Sends a new update/replacement event for an existing message in one request.
+/// Saves an owner-only translation for an existing message in one request.
 ///
 /// - The `event_type` defaults to `m.room.message`.
 /// - The caller only needs to provide the target event id; the server links
-///   the new event back to the original with `m.relates_to`.
+///   the private record back to the original with `m.relates_to`.
 pub(crate) async fn send_message_pair_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
 	Path(room_id): Path<Box<RoomId>>,
 	Json(body): Json<SendMessagePairBody>,
 ) -> Result<Json<serde_json::Value>> {
-	let (sender_user, sender_device, _token) = services
+	let (sender_user, _sender_device, _token) = services
 		.users
 		.find_from_token(token.token())
 		.await
@@ -79,37 +77,32 @@ pub(crate) async fn send_message_pair_route(
 		return Err!(Request(NotFound("Target event not found in this room.")));
 	}
 
-	let state_lock = services.state.mutex.lock(&room_id).await;
+	if !services
+		.state_accessor
+		.user_can_see_event(&sender_user, &room_id, &target_event_id)
+		.await
+	{
+		return Err!(Request(NotFound("Target event not found.")));
+	}
 
 	let content = normalize_content(body.content, body.message.as_deref(), &batch_id, 0)?;
 	let content = add_reference_relation(content, target_event_id.as_ref())?;
-	let content = serde_json::value::to_raw_value(&content)
-		.map_err(|e| err!(Request(BadJson("Invalid JSON body: {e}"))))?;
 	let event_type = body
 		.event_type
 		.unwrap_or_else(|| "m.room.message".to_owned());
 
-	let mut unsigned = std::collections::BTreeMap::new();
-	unsigned.insert("transaction_id".to_owned(), format!("pair:{}:0", sender_device).into());
-	unsigned.insert(MESSAGE_BATCH_ID_FIELD.to_owned(), JsonValue::String(batch_id.clone()));
-	unsigned.insert(MESSAGE_BATCH_SEQUENCE_FIELD.to_owned(), JsonValue::from(0_u64));
-
-	let event_id = services
-		.timeline
-		.build_and_append_pdu(
-			PduBuilder {
-				event_type: event_type.as_str().into(),
-				content,
-				unsigned: Some(unsigned),
-				..Default::default()
-			},
-			&sender_user,
-			&room_id,
-			&state_lock,
-		)
-		.await?;
-
-	drop(state_lock);
+	let event_id = OwnedEventId::parse(format!("${}", utils::random_string(32)))
+		.map_err(|e| err!(Request(InvalidParam("Could not create translation id: {e}"))))?;
+	services.message_pairs.insert(&MessagePair {
+		event_id: event_id.clone(),
+		room_id: room_id.clone(),
+		sender: sender_user.clone(),
+		target_event_id: target_event_id.clone(),
+		event_type,
+		content,
+		batch_id: batch_id.clone(),
+		origin_server_ts: utils::millis_since_unix_epoch(),
+	});
 
 	Ok(Json(serde_json::json!({
 		"batch_id": batch_id,
@@ -118,11 +111,31 @@ pub(crate) async fn send_message_pair_route(
 	})))
 }
 
+/// # `GET /_matrix/client/unstable/org.tuwunel/rooms/{roomId}/send_message_pair`
+///
+/// Lists only the authenticated user's private translations in this room.
+pub(crate) async fn list_message_pairs_route(
+	State(services): State<crate::State>,
+	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
+	Path(room_id): Path<Box<RoomId>>,
+) -> Result<Json<serde_json::Value>> {
+	let (sender_user, ..) = services
+		.users
+		.find_from_token(token.token())
+		.await
+		.map_err(|_| Error::BadRequest(ErrorKind::UnknownToken { soft_logout: false }, "Unknown access token."))?;
+
+	if !services.state_cache.is_joined(&sender_user, &room_id).await {
+		return Err!(Request(Forbidden("You are not a member of this room.")));
+	}
+
+	let translations = services.message_pairs.list(&sender_user, &room_id).await?;
+	Ok(Json(serde_json::json!({ "translations": translations })))
+}
+
 /// # `DELETE /_matrix/client/unstable/org.tuwunel/rooms/{roomId}/send_message_pair/{eventId}`
 ///
-/// Permanently deletes the paired/update message from the room timeline and
-/// appends a notification event (`org.tuwunel.message_pair_deleted`) so that
-/// all clients receive the deletion via /sync.
+/// Deletes only the authenticated user's private translation record.
 pub(crate) async fn delete_message_pair_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
@@ -150,54 +163,39 @@ pub(crate) async fn delete_message_pair_route(
 	let room_id = (*room_id).to_owned();
 	let event_id = (*event_id).to_owned();
 
-	let original_pdu = services
+	if let Ok(pair) = services
+		.message_pairs
+		.get(&sender_user, &room_id, &event_id)
+		.await
+	{
+		services.message_pairs.remove(&pair);
+		return Ok(Json(serde_json::json!({
+			"deleted_event_id": event_id,
+			"batch_id": pair.batch_id,
+		})));
+	}
+
+	// Existing public pairs may still be held by clients. Preserve DELETE for
+	// the original sender, but only hide the old event for that sender.
+	let legacy = services
 		.timeline
 		.get_pdu(&event_id)
 		.await
-		.map_err(|_| err!(Request(NotFound("Event not found."))))?;
-
-	if original_pdu.room_id() != &*room_id {
-		return Err!(Request(NotFound("Event not found in this room.")));
+		.map_err(|_| err!(Request(NotFound("Translation not found."))))?;
+	let content = legacy.get_content_as_value();
+	let is_pair = content.get(MESSAGE_BATCH_ID_FIELD).is_some()
+		&& content
+			.get(MESSAGE_RELATES_TO_FIELD)
+			.and_then(|relation| relation.get("rel_type"))
+			.and_then(JsonValue::as_str)
+			== Some(MESSAGE_REFERENCE_REL_TYPE);
+	if legacy.room_id() != &*room_id || legacy.sender() != &*sender_user || !is_pair {
+		return Err!(Request(NotFound("Translation not found.")));
 	}
-
-	let batch_id = original_pdu
-		.get_content_as_value()
-		.get(MESSAGE_BATCH_ID_FIELD)
-		.cloned();
-
-	// Permanently delete the event from storage
-	services
-		.deleted_events
-		.delete_event(&sender_user, &event_id);
-
-	// Append a notification event so all clients learn about the deletion via /sync
-	let deletion_content = serde_json::json!({
-		"deleted_event_id": event_id,
-		"batch_id": batch_id,
-	});
-	let deletion_content = serde_json::value::to_raw_value(&deletion_content)
-		.map_err(|e| err!(Request(BadJson("Failed to serialize deletion event: {e}"))))?;
-
-	let state_lock = services.state.mutex.lock(&room_id).await;
-	let notification_event_id = services
-		.timeline
-		.build_and_append_pdu(
-			PduBuilder {
-				event_type: "org.tuwunel.message_pair_deleted".into(),
-				content: deletion_content,
-				..Default::default()
-			},
-			&sender_user,
-			&room_id,
-			&state_lock,
-		)
-		.await?;
-	drop(state_lock);
-
+	services.deleted_events.delete_event(&sender_user, &event_id);
 	Ok(Json(serde_json::json!({
 		"deleted_event_id": event_id,
-		"notification_event_id": notification_event_id,
-		"batch_id": batch_id,
+		"batch_id": content.get(MESSAGE_BATCH_ID_FIELD),
 	})))
 }
 

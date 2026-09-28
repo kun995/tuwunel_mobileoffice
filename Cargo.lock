@@ -5983,6 +5983,7 @@ dependencies = [
  "ctor",
  "futures",
  "hickory-resolver",
+ "hmac",
  "http 1.4.0",
  "image",
  "ipaddress",

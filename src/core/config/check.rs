@@ -5,7 +5,7 @@ use figment::Figment;
 use itertools::Itertools;
 
 use super::{DEPRECATED_KEYS, IdentityProvider};
-use crate::{Config, Err, Result, Server, debug, debug_info, debug_warn, error, warn};
+use crate::{Config, Err, Result, Server, debug, debug_info, debug_warn, err, error, warn};
 
 /// Performs check() with additional checks specific to reloading old config
 /// with new config.
@@ -182,6 +182,71 @@ pub fn check(config: &Config) -> Result {
 			"registration_token_file",
 			"Registration token file was specified but is empty or failed to be read"
 		));
+	}
+
+	if config.push_media_preview.enabled {
+		let Some(public_base_url) = config.push_media_preview.public_base_url.as_ref() else {
+			return Err!(Config(
+				"push_media_preview.public_base_url",
+				"Signed push media previews require public_base_url to be configured."
+			));
+		};
+
+		if public_base_url.scheme() != "https"
+			|| public_base_url.host_str().is_none()
+			|| !public_base_url.username().is_empty()
+			|| public_base_url.password().is_some()
+			|| public_base_url.query().is_some()
+			|| public_base_url.fragment().is_some()
+			|| (public_base_url.path() != "" && public_base_url.path() != "/")
+		{
+			return Err!(Config(
+				"push_media_preview.public_base_url",
+				"push media preview public_base_url must be an HTTPS origin without credentials, path, query, or fragment."
+			));
+		}
+
+		let Some(secret_file) = config.push_media_preview.secret_file.as_ref() else {
+			return Err!(Config(
+				"push_media_preview.secret_file",
+				"Signed push media previews require a secret_file to be configured."
+			));
+		};
+
+		let secret = std::fs::read_to_string(secret_file).map_err(|error| {
+			err!(Config(
+				"push_media_preview.secret_file",
+				"Failed to read push media preview secret: {error}"
+			))
+		})?;
+
+		if secret.trim().is_empty() {
+			return Err!(Config(
+				"push_media_preview.secret_file",
+				"Push media preview secret_file is empty."
+			));
+		}
+
+		if config.push_media_preview.ttl_seconds == 0 {
+			return Err!(Config(
+				"push_media_preview.ttl_seconds",
+				"Push media preview ttl_seconds must be greater than zero."
+			));
+		}
+
+		if !(1..=512).contains(&config.push_media_preview.width) {
+			return Err!(Config(
+				"push_media_preview.width",
+				"Push media preview width must be between 1 and 512 pixels."
+			));
+		}
+
+		if !(1..=512).contains(&config.push_media_preview.height) {
+			return Err!(Config(
+				"push_media_preview.height",
+				"Push media preview height must be between 1 and 512 pixels."
+			));
+		}
 	}
 
 	if config.max_request_size < 10_000_000 {

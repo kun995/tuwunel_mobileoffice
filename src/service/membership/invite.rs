@@ -4,7 +4,10 @@ use futures::FutureExt;
 use ruma::{
 	OwnedServerName, RoomId, UserId,
 	api::federation::membership::create_invite,
-	events::{StateEventContent, room::member::{MembershipState, RoomMemberEventContent}},
+	events::{
+		StateEventContent,
+		room::member::{MembershipState, RoomMemberEventContent},
+	},
 };
 use serde_json::Value as JsonValue;
 use tuwunel_core::{
@@ -12,25 +15,35 @@ use tuwunel_core::{
 	utils,
 };
 
-use super::{AUTO_INVITE_BATCH_WINDOW, InviteBatchState, Service};
+use super::{AUTO_INVITE_BATCH_WINDOW, INITIAL_ROOM_CREATION_FIELD, InviteBatchState, Service};
 
 const INVITE_BATCH_ID_FIELD: &str = "membership_batch_id";
 
-fn invite_unsigned(batch_id: Option<&str>) -> Option<BTreeMap<String, JsonValue>> {
-	let batch_id = batch_id.filter(|value| !value.is_empty())?;
+fn invite_unsigned(
+	batch_id: Option<&str>,
+	initial_room_creation: bool,
+) -> Option<BTreeMap<String, JsonValue>> {
 	let mut unsigned = BTreeMap::new();
-	unsigned.insert(INVITE_BATCH_ID_FIELD.to_owned(), JsonValue::String(batch_id.to_owned()));
-	Some(unsigned)
+
+	if let Some(batch_id) = batch_id.filter(|value| !value.is_empty()) {
+		unsigned.insert(INVITE_BATCH_ID_FIELD.to_owned(), JsonValue::String(batch_id.to_owned()));
+	}
+
+	if initial_room_creation {
+		unsigned.insert(INITIAL_ROOM_CREATION_FIELD.to_owned(), JsonValue::Bool(true));
+	}
+
+	(!unsigned.is_empty()).then_some(unsigned)
 }
 
 #[cfg(test)]
 mod tests {
-	use super::{INVITE_BATCH_ID_FIELD, invite_unsigned};
+	use super::{INITIAL_ROOM_CREATION_FIELD, INVITE_BATCH_ID_FIELD, invite_unsigned};
 	use serde_json::Value as JsonValue;
 
 	#[test]
 	fn includes_batch_id_when_present() {
-		let unsigned = invite_unsigned(Some("batch-abc")).expect("has unsigned data");
+		let unsigned = invite_unsigned(Some("batch-abc"), false).expect("has unsigned data");
 		assert_eq!(
 			unsigned.get(INVITE_BATCH_ID_FIELD),
 			Some(&JsonValue::String("batch-abc".to_owned()))
@@ -39,7 +52,13 @@ mod tests {
 
 	#[test]
 	fn returns_none_for_empty_batch_id() {
-		assert!(invite_unsigned(Some("")).is_none());
+		assert!(invite_unsigned(Some(""), false).is_none());
+	}
+
+	#[test]
+	fn includes_initial_room_creation_marker_without_batch_id() {
+		let unsigned = invite_unsigned(None, true).expect("has unsigned data");
+		assert_eq!(unsigned.get(INITIAL_ROOM_CREATION_FIELD), Some(&JsonValue::Bool(true)));
 	}
 }
 
@@ -58,6 +77,38 @@ pub async fn invite(
 	is_direct: bool,
 	batch_id: Option<&str>,
 ) -> Result {
+	self.invite_inner(sender_user, user_id, room_id, reason, is_direct, batch_id, false)
+		.await
+}
+
+/// Invites a user while a room is being created. The invite remains a normal
+/// Matrix membership event, but carries metadata allowing clients to suppress
+/// the derived "member added" activity for the initial room setup.
+#[implement(Service)]
+pub async fn invite_for_room_creation(
+	&self,
+	sender_user: &UserId,
+	user_id: &UserId,
+	room_id: &RoomId,
+	reason: Option<&String>,
+	is_direct: bool,
+	batch_id: Option<&str>,
+) -> Result {
+	self.invite_inner(sender_user, user_id, room_id, reason, is_direct, batch_id, true)
+		.await
+}
+
+#[implement(Service)]
+async fn invite_inner(
+	&self,
+	sender_user: &UserId,
+	user_id: &UserId,
+	room_id: &RoomId,
+	reason: Option<&String>,
+	is_direct: bool,
+	batch_id: Option<&str>,
+	initial_room_creation: bool,
+) -> Result {
 	let resolved_batch_id = self
 		.resolve_invite_batch_id(sender_user, room_id, batch_id)
 		.await;
@@ -70,9 +121,10 @@ pub async fn invite(
 			reason,
 			is_direct,
 			Some(resolved_batch_id.as_str()),
+			initial_room_creation,
 		)
-			.boxed()
-			.await?;
+		.boxed()
+		.await?;
 	} else {
 		self.remote_invite(
 			sender_user,
@@ -81,9 +133,10 @@ pub async fn invite(
 			reason,
 			is_direct,
 			Some(resolved_batch_id.as_str()),
+			initial_room_creation,
 		)
-			.boxed()
-			.await?;
+		.boxed()
+		.await?;
 	}
 
 	Ok(())
@@ -131,6 +184,7 @@ async fn remote_invite(
 	reason: Option<&String>,
 	is_direct: bool,
 	batch_id: Option<&str>,
+	initial_room_creation: bool,
 ) -> Result {
 	let (pdu, pdu_json, invite_room_state) = {
 		let state_lock = self.services.state.mutex.lock(room_id).await;
@@ -158,7 +212,7 @@ async fn remote_invite(
 					content: serde_json::value::to_raw_value(&content).expect(
 						"Invite membership content must serialize to RawValue"
 					),
-					unsigned: invite_unsigned(batch_id),
+					unsigned: invite_unsigned(batch_id, initial_room_creation),
 					..Default::default()
 				},
 				sender_user,
@@ -257,6 +311,7 @@ async fn local_invite(
 	reason: Option<&String>,
 	is_direct: bool,
 	batch_id: Option<&str>,
+	initial_room_creation: bool,
 ) -> Result {
 	if !self
 		.services
@@ -293,7 +348,7 @@ async fn local_invite(
 				state_key: Some(user_id.to_string().into()),
 				content: serde_json::value::to_raw_value(&content)
 					.expect("Invite membership content must serialize to RawValue"),
-				unsigned: invite_unsigned(batch_id),
+				unsigned: invite_unsigned(batch_id, initial_room_creation),
 				..Default::default()
 			},
 			sender_user,

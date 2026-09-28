@@ -7,6 +7,7 @@ pub mod directory;
 pub mod event_handler;
 pub mod lazy_loading;
 pub mod metadata;
+pub mod message_pairs;
 pub mod pdu_metadata;
 pub mod read_receipt;
 pub mod reminders;

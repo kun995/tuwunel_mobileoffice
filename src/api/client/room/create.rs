@@ -36,9 +36,16 @@ use tuwunel_core::{
 	utils::{BoolExt, option::OptionExt},
 	warn,
 };
-use tuwunel_service::{Services, appservice::RegistrationInfo, rooms::state::RoomMutexGuard};
+use tuwunel_service::{
+	Services, appservice::RegistrationInfo, membership::INITIAL_ROOM_CREATION_FIELD,
+	rooms::state::RoomMutexGuard,
+};
 
 use crate::{Ruma, client::utils::invite_check};
+
+fn initial_room_creation_unsigned() -> BTreeMap<String, serde_json::Value> {
+	BTreeMap::from([(INITIAL_ROOM_CREATION_FIELD.to_owned(), serde_json::Value::Bool(true))])
+}
 
 /// # `POST /_matrix/client/v3/createRoom`
 ///
@@ -96,6 +103,33 @@ pub(crate) async fn create_room_route(
 	// Error on existing alias before committing to creation.
 	let alias = alias.await.transpose()?;
 
+	let sender_user = body.sender_user();
+	let can_reuse_direct_room = body.is_direct
+		&& body.invite.len() == 1
+		&& body.invite_3pid.is_empty()
+		&& body.name.is_none()
+		&& body.topic.is_none()
+		&& body.room_alias_name.is_none()
+		&& body.room_id.is_none()
+		&& body.initial_state.is_empty()
+		&& body.power_level_content_override.is_none()
+		&& body.invite[0].as_str() != sender_user.as_str();
+	if can_reuse_direct_room {
+		let workspace_id = body
+			.json_body
+			.as_ref()
+			.and_then(|value| value.as_object())
+			.and_then(|object| object.get("workspace_id"))
+			.and_then(|value| value.as_str());
+
+		if let Some(room_id) =
+			find_existing_direct_room(&services, sender_user, &body.invite[0], workspace_id).await
+		{
+			info!(%sender_user, %room_id, target_user = %body.invite[0], "Reusing existing direct room");
+			return Ok(create_room::v3::Response::new(room_id));
+		}
+	}
+
 	// Increment and hold the counter; the room will sync atomically to clients
 	// which is preferable.
 	let next_count = services.globals.next_count();
@@ -115,24 +149,20 @@ pub(crate) async fn create_room_route(
 	};
 
 	// 2. Let the room creator join
-	let sender_user = body.sender_user();
+	let mut creator_join = PduBuilder::state(
+		sender_user.to_string(),
+		&RoomMemberEventContent {
+			displayname: services.users.displayname(sender_user).await.ok(),
+			avatar_url: services.users.avatar_url(sender_user).await.ok(),
+			blurhash: services.users.blurhash(sender_user).await.ok(),
+			is_direct: Some(body.is_direct),
+			..RoomMemberEventContent::new(MembershipState::Join)
+		},
+	);
+	creator_join.unsigned = Some(initial_room_creation_unsigned());
 	services
 		.timeline
-		.build_and_append_pdu(
-			PduBuilder::state(
-				sender_user.to_string(),
-				&RoomMemberEventContent {
-					displayname: services.users.displayname(sender_user).await.ok(),
-					avatar_url: services.users.avatar_url(sender_user).await.ok(),
-					blurhash: services.users.blurhash(sender_user).await.ok(),
-					is_direct: Some(body.is_direct),
-					..RoomMemberEventContent::new(MembershipState::Join)
-				},
-			),
-			sender_user,
-			&room_id,
-			&state_lock,
-		)
+		.build_and_append_pdu(creator_join, sender_user, &room_id, &state_lock)
 		.boxed()
 		.await?;
 
@@ -343,14 +373,12 @@ pub(crate) async fn create_room_route(
 
 	// 7. Events implied by name and topic
 	if let Some(name) = &body.name {
+		let mut room_name =
+			PduBuilder::state(String::new(), &RoomNameEventContent::new(name.clone()));
+		room_name.unsigned = Some(initial_room_creation_unsigned());
 		services
 			.timeline
-			.build_and_append_pdu(
-				PduBuilder::state(String::new(), &RoomNameEventContent::new(name.clone())),
-				sender_user,
-				&room_id,
-				&state_lock,
-			)
+			.build_and_append_pdu(room_name, sender_user, &room_id, &state_lock)
 			.boxed()
 			.await?;
 	}
@@ -401,7 +429,33 @@ pub(crate) async fn create_room_route(
 	// section on subsequent syncs — leaving new rooms without messages at the
 	// bottom of the list. This timeline event fixes that.
 	{
+		let creator_display = services
+			.users
+			.displayname(sender_user)
+			.await
+			.unwrap_or_else(|_| sender_user.to_string());
+		let creator_message = format!("{creator_display} đã tạo nhóm");
 		let mut created_content = serde_json::Map::new();
+		created_content.insert(
+			"activity_type".to_owned(),
+			serde_json::Value::String("room_created".to_owned()),
+		);
+		created_content
+			.insert("body".to_owned(), serde_json::Value::String(creator_message.clone()));
+		created_content
+			.insert("msgtype".to_owned(), serde_json::Value::String("m.notice".to_owned()));
+		created_content.insert(
+			"self_text".to_owned(),
+			serde_json::Value::String("Bạn đã tạo nhóm".to_owned()),
+		);
+		created_content
+			.insert("other_text".to_owned(), serde_json::Value::String(creator_message));
+		created_content.insert(
+			"creator_user_id".to_owned(),
+			serde_json::Value::String(sender_user.to_string()),
+		);
+		created_content
+			.insert(INITIAL_ROOM_CREATION_FIELD.to_owned(), serde_json::Value::Bool(true));
 		if let Some(ref name) = body.name {
 			created_content
 				.insert("room_name".to_owned(), serde_json::Value::String(name.clone()));
@@ -455,7 +509,14 @@ pub(crate) async fn create_room_route(
 
 			if let Err(e) = services
 				.membership
-				.invite(sender_user, user_id, &room_id, None, body.is_direct, None)
+				.invite_for_room_creation(
+					sender_user,
+					user_id,
+					&room_id,
+					None,
+					body.is_direct,
+					None,
+				)
 				.boxed()
 				.await
 			{
@@ -971,6 +1032,77 @@ async fn room_alias_check(
 	debug_info!("Full room alias: {full_room_alias}");
 
 	Ok(full_room_alias)
+}
+
+/// Finds an existing one-to-one room before creating a new direct room.
+///
+/// A user's `m.direct` account data may contain stale rooms or multiple rooms
+/// for the same target. Only a room which still exists, has exactly two joined
+/// members, is marked direct for both members, and matches the requested
+/// workspace is eligible for reuse.
+async fn find_existing_direct_room(
+	services: &Services,
+	sender_user: &ruma::UserId,
+	target_user: &ruma::UserId,
+	workspace_id: Option<&str>,
+) -> Option<OwnedRoomId> {
+	let room_ids = services
+		.account_data
+		.direct_rooms_for_user(sender_user, target_user)
+		.await;
+
+	for room_id in room_ids.into_iter().rev() {
+		if !services.metadata.exists(&room_id).await
+			|| !services.state_cache.is_joined(sender_user, &room_id).await
+			|| !services.state_cache.is_joined(target_user, &room_id).await
+		{
+			continue;
+		}
+
+		if services
+			.state_cache
+			.room_joined_count(&room_id)
+			.await
+		.ok()
+		.ne(&Some(2))
+		{
+			continue;
+		}
+
+		let sender_is_direct = services
+			.account_data
+			.is_direct(sender_user, &room_id)
+			.await
+			|| services
+				.state_accessor
+				.is_direct(&room_id, sender_user)
+				.await;
+		let target_is_direct = services
+			.account_data
+			.is_direct(target_user, &room_id)
+			.await
+			|| services
+				.state_accessor
+				.is_direct(&room_id, target_user)
+				.await;
+
+		if !sender_is_direct || !target_is_direct {
+			continue;
+		}
+
+		if let Some(workspace_id) = workspace_id {
+			let Ok(existing_workspace_id) = services.workspace.get_workspace_id(&room_id).await else {
+				continue;
+			};
+			if existing_workspace_id != workspace_id {
+				continue;
+			}
+		}
+
+		return Some(room_id);
+	}
+
+	None
 }
 
 /// if a room is being created with a custom room ID, run our checks against it

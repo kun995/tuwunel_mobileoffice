@@ -1,6 +1,7 @@
 pub mod check;
 pub mod manager;
 pub mod media_storage;
+pub mod push_media_preview;
 pub mod proxy;
 
 use std::{
@@ -29,6 +30,7 @@ use self::proxy::ProxyConfig;
 pub use self::media_storage::{
 	FilesystemStorageConfig, HybridStrategyConfig, MediaStorageConfig, S3StorageConfig, StorageStrategy,
 };
+pub use self::push_media_preview::PushMediaPreviewConfig;
 pub use self::{check::check, manager::Manager};
 use crate::{
 	Err, Result, err,
@@ -61,7 +63,7 @@ use crate::{
 ### https://tuwunel.chat/configuration.html
 "#,
 	ignore = "catchall well_known tls blurhashing allow_invalid_tls_certificates ldap jwt \
-	          appservice identity_provider"
+	          appservice identity_provider push_media_preview"
 )]
 pub struct Config {
 	/// The server_name is the pretty name of this server. It is used as a
@@ -1415,6 +1417,10 @@ pub struct Config {
 	/// notifications found in the notifications pane.
 	#[serde(default)]
 	pub push_everything: bool,
+
+	// external structure; separate section
+	#[serde(default)]
+	pub push_media_preview: PushMediaPreviewConfig,
 
 	/// Setting to false disables the heroes calculation made by sliding and
 	/// legacy client sync. The heroes calculation is mandated by the Matrix

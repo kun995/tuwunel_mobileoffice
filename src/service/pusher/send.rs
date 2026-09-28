@@ -1,6 +1,6 @@
 use ipaddress::IPAddress;
 use ruma::{
-	UInt, UserId,
+	Mxc, OwnedMxcUri, UInt, UserId,
 	api::{
 		client::push::{Pusher, PusherKind},
 		push_gateway::send_event_notification::{
@@ -12,6 +12,7 @@ use ruma::{
 	push::{Action, PushFormat, Ruleset, Tweak},
 	uint,
 };
+use serde_json::Value as JsonValue;
 use tuwunel_core::{Err, Result, err, implement, matrix::Event};
 
 const REMINDER_CREATED_EVENT_TYPE: &str = "im.tuwunel.reminder.created";
@@ -78,7 +79,7 @@ where
 			.try_into()
 			.unwrap_or_else(|_| uint!(1));
 
-		self.send_notice(unread, pusher, tweaks, event)
+		self.send_notice(user_id, unread, pusher, tweaks, event)
 			.await?;
 	}
 
@@ -92,10 +93,39 @@ fn is_reminder_push_event(kind: &TimelineEventType) -> bool {
 	)
 }
 
+fn parse_image_mxc(value: Option<&JsonValue>) -> Option<OwnedMxcUri> {
+	let value = value.and_then(JsonValue::as_str)?;
+	if !value.starts_with("mxc://") {
+		return None;
+	}
+
+	let mxc = OwnedMxcUri::from(value.to_owned());
+	mxc.is_valid().then_some(mxc)
+}
+
+fn image_push_uris(content: &serde_json::value::RawValue) -> Option<(OwnedMxcUri, OwnedMxcUri)> {
+	let content = serde_json::from_str::<JsonValue>(content.get()).ok()?;
+	if content.get("msgtype").and_then(JsonValue::as_str) != Some("m.image") {
+		return None;
+	}
+
+	let original = parse_image_mxc(content.get("url"));
+	let thumbnail = parse_image_mxc(
+		content
+			.get("info")
+			.and_then(|info| info.get("thumbnail_url")),
+	);
+	let image = original.clone().or_else(|| thumbnail.clone())?;
+	let preview = thumbnail.or_else(|| original.clone())?;
+
+	Some((image, preview))
+}
+
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip_all)]
 async fn send_notice<Pdu: Event>(
 	&self,
+	user_id: &UserId,
 	unread: UInt,
 	pusher: &Pusher,
 	tweaks: Vec<Tweak>,
@@ -133,6 +163,10 @@ async fn send_notice<Pdu: Event>(
 
 			let mut device = Device::new(pusher.ids.app_id.clone(), pusher.ids.pushkey.clone());
 			device.data.data.clone_from(&http.data);
+			device.data.data.insert(
+				"lang".to_owned(),
+				JsonValue::String(super::normalized_language(&pusher.lang).to_owned()),
+			);
 			device.data.format.clone_from(&http.format);
 
 			// Tweaks are only added if the format is NOT event_id_only
@@ -148,6 +182,58 @@ async fn send_notice<Pdu: Event>(
 				.get_workspace_id(event.room_id())
 				.await
 				.ok();
+			let is_direct_chat = if event_id_only {
+				None
+			} else {
+				Some(
+					self.services
+						.account_data
+						.is_direct(user_id, event.room_id())
+						.await
+						|| self
+							.services
+							.state_accessor
+							.is_direct(event.room_id(), user_id)
+							.await,
+				)
+			};
+			let sender_avatar_url = if event_id_only {
+				None
+			} else {
+				self.services
+					.users
+					.avatar_url(event.sender())
+					.await
+					.ok()
+					.map(|avatar_url| avatar_url.to_string())
+			};
+			let room_avatar_url = if event_id_only {
+				None
+			} else {
+				self.services
+					.state_accessor
+					.get_avatar(event.room_id())
+					.await
+					.ok()
+					.and_then(|content| content.url)
+					.map(|avatar_url| avatar_url.to_string())
+			};
+			let (image_mxc_uri, image_url) = if !event_id_only
+				&& *event.kind() == TimelineEventType::RoomMessage
+			{
+				if let Some((image_mxc, preview_mxc)) = image_push_uris(event.content()) {
+					let image_mxc_uri = Some(image_mxc.to_string());
+					let image_url = match Mxc::try_from(&preview_mxc) {
+						| Ok(mxc) => self.services.media.push_preview_url(&mxc).await,
+						| Err(_) => None,
+					};
+					(image_mxc_uri, image_url)
+				} else {
+					(None, None)
+				}
+			} else {
+				(None, None)
+			};
 
 			notify.event_id = Some(event.event_id().to_owned());
 			notify.room_id = Some(event.room_id().to_owned());
@@ -203,17 +289,83 @@ async fn send_notice<Pdu: Event>(
 					.ok();
 			}
 
-			self.send_request(
-				&http.url,
-				send_event_notification::v1::Request::new(notify),
-				workspace_id.as_deref(),
-			)
-			.await?;
+			self
+				.send_request(
+					&http.url,
+					send_event_notification::v1::Request::new(notify),
+					workspace_id.as_deref(),
+					is_direct_chat,
+					sender_avatar_url.as_deref(),
+					room_avatar_url.as_deref(),
+					image_mxc_uri.as_deref(),
+					image_url.as_deref(),
+				)
+				.await?;
 
 			Ok(())
 		},
 		// TODO: Handle email
 		//PusherKind::Email(_) => Ok(()),
 		| _ => Ok(()),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::image_push_uris;
+
+	fn image_content(value: &str) -> Box<serde_json::value::RawValue> {
+		serde_json::value::to_raw_value(&serde_json::from_str::<serde_json::Value>(value).unwrap())
+			.unwrap()
+	}
+
+	#[test]
+	fn image_preview_prefers_thumbnail_uri() {
+		let content = image_content(
+			r#"{
+				"msgtype":"m.image",
+				"url":"mxc://chat.example/original",
+				"info":{"thumbnail_url":"mxc://chat.example/thumbnail"}
+			}"#,
+		);
+
+		let (image, preview) = image_push_uris(&content).expect("image metadata");
+		assert_eq!(image.as_str(), "mxc://chat.example/original");
+		assert_eq!(preview.as_str(), "mxc://chat.example/thumbnail");
+	}
+
+	#[test]
+	fn image_without_original_uses_thumbnail_as_fallback() {
+		let content = image_content(
+			r#"{
+				"msgtype":"m.image",
+				"info":{"thumbnail_url":"mxc://chat.example/thumbnail"}
+			}"#,
+		);
+
+		let (image, preview) = image_push_uris(&content).expect("image metadata");
+		assert_eq!(image.as_str(), "mxc://chat.example/thumbnail");
+		assert_eq!(preview.as_str(), "mxc://chat.example/thumbnail");
+	}
+
+	#[test]
+	fn encrypted_image_without_mxc_url_has_no_preview() {
+		let content = image_content(
+			r#"{
+				"msgtype":"m.image",
+				"file":{"v":"v2","key":{},"url":"mxc://chat.example/encrypted"}
+			}"#,
+		);
+
+		assert!(image_push_uris(&content).is_none());
+	}
+
+	#[test]
+	fn non_image_events_have_no_image_metadata() {
+		let content = image_content(
+			r#"{"msgtype":"m.text","body":"not an image","url":"mxc://chat.example/media"}"#,
+		);
+
+		assert!(image_push_uris(&content).is_none());
 	}
 }

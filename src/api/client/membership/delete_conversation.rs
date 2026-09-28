@@ -77,6 +77,7 @@ pub(crate) async fn delete_direct_conversation_route(
 		| PduCount::Backfilled(_) => 0,
 	};
 
+	let next_count = services.globals.next_count();
 	services
 		.deleted_rooms
 		.delete_before(&sender_user, &room_id, deleted_before);
@@ -86,6 +87,7 @@ pub(crate) async fn delete_direct_conversation_route(
 	services
 		.read_receipt
 		.private_read_set(&room_id, &sender_user, deleted_before);
+	drop(next_count);
 
 	let room_id_ref: &RoomId = &room_id;
 

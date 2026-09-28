@@ -94,15 +94,33 @@ pub async fn search_pdus<'a>(
 	&'a self,
 	query: &'a RoomQuery<'a>,
 ) -> Result<(usize, impl Stream<Item = impl Event + use<>> + Send + '_)> {
-	let pdu_ids: Vec<_> = self.search_pdu_ids(query).await?.collect().await;
+	let user_id = query.user_id;
+	let room_id = query.room_id;
+	let pdu_ids: Vec<_> = self
+		.search_pdu_ids(query)
+		.await?
+		.wide_filter_map(async |pdu_id| {
+			(match user_id {
+				Some(user_id) => !self
+					.services
+					.deleted_rooms
+					.is_deleted_pdu(user_id, room_id, pdu_id.pdu_count())
+					.await,
+				None => true,
+			})
+			.then_some(pdu_id)
+		})
+		.collect()
+		.await;
 
 	let filter = &query.criteria.filter;
 	let count = pdu_ids.len();
-	let pdus = pdu_ids
+	let pdus: Vec<_> = pdu_ids
 		.into_iter()
 		.stream()
 		.wide_filter_map(async |result_pdu_id: RawPduId| {
-			self.services
+			self
+				.services
 				.timeline
 				.get_pdu_from_id(&result_pdu_id)
 				.await
@@ -111,7 +129,7 @@ pub async fn search_pdus<'a>(
 		.ready_filter(|pdu| !pdu.is_redacted())
 		.ready_filter(move |pdu| filter.matches(pdu))
 		.wide_filter_map(async |pdu| {
-			let user_id = query.user_id?;
+			let user_id = user_id?;
 			(!self
 				.services
 				.deleted_events
@@ -123,9 +141,15 @@ pub async fn search_pdus<'a>(
 			self.services
 				.state_accessor
 				.user_can_see_event(query.user_id?, pdu.room_id(), pdu.event_id())
-				.await
-				.then_some(pdu)
+			.await
+			.then_some(pdu)
 		})
+		.collect()
+		.await;
+
+	let pdus = pdus
+		.into_iter()
+		.stream()
 		.skip(query.skip)
 		.take(query.limit);
 

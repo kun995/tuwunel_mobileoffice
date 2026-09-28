@@ -48,7 +48,7 @@
 #
 # To disable, set this to "" (an empty string).
 #
-#new_user_displayname_suffix = "💕"
+#new_user_displayname_suffix = ""
 
 # The default address (IPv4 or IPv6) tuwunel will listen on.
 #
@@ -623,6 +623,28 @@
 # doing, and by doing so, updates with new versions are precluded.
 #
 #default_room_version =
+
+# Default member limit for newly created rooms.
+#
+# Set to 0 for unlimited (no limit will be set).
+# When set to a value > 0, all new rooms will automatically have the
+# `im.tuwunel.room.member_limit` state event set with this value.
+#
+# This limit can be manually changed per-room after creation using the
+# state event API.
+#
+#default_room_member_limit = 0 (unlimited)
+
+# Automatically accept and join rooms when invited.
+#
+# When enabled, users will automatically join any room they are invited to,
+# similar to how 1-1 direct messages work. This bypasses the need for users
+# to manually accept invitations.
+#
+# This is particularly useful when using the create_room API with invites,
+# as invited users will immediately join the room without additional steps.
+#
+#auto_accept_invites = false
 
 # This item is undocumented. Please contribute documentation for it.
 #
@@ -1377,6 +1399,13 @@
 # sadness.
 #
 #prune_missing_media = false
+
+# Media storage configuration for S3/MinIO support.
+#
+# Configure storage backend for media files. Supports filesystem (default),
+# S3, or hybrid modes.
+#
+#media_storage = filesystem only
 
 # Vector list of regex patterns of server names that tuwunel will refuse
 # to download remote media from.

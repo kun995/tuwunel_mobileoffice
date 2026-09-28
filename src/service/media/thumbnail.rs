@@ -82,6 +82,47 @@ impl super::Service {
 			},
 		}
 	}
+
+	/// Downloads a thumbnail for an anonymous signed push preview.
+	///
+	/// Push providers expect a PNG URL. Existing media metadata may point to
+	/// an image in another format, so convert the returned bytes when needed.
+	pub async fn get_push_thumbnail(&self, mxc: &Mxc<'_>, dim: &Dim) -> Result<Option<FileMeta>> {
+		let Some(mut file) = self.get_thumbnail(mxc, dim).await? else {
+			return Ok(None);
+		};
+		let Some(content) = file.content.take() else {
+			return Ok(None);
+		};
+
+		if content.starts_with(b"\x89PNG\r\n\x1a\n") {
+			file.content = Some(content);
+			file.content_type = Some("image/png".to_owned());
+			return Ok(Some(file));
+		}
+
+		#[cfg(feature = "media_thumbnail")]
+		{
+			let Ok(image) = image::load_from_memory(&content) else {
+				return Ok(None);
+			};
+
+			let mut png = Vec::new();
+			let mut cursor = std::io::Cursor::new(&mut png);
+			image
+				.write_to(&mut cursor, image::ImageFormat::Png)
+				.map_err(|error| err!(error!(?error, "Error writing push preview PNG.")))?;
+
+			file.content = Some(png);
+			file.content_type = Some("image/png".to_owned());
+			return Ok(Some(file));
+		}
+
+		#[cfg(not(feature = "media_thumbnail"))]
+		{
+			Ok(None)
+		}
+	}
 }
 
 /// Using saved thumbnail

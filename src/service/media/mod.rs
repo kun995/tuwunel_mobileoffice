@@ -6,16 +6,22 @@ mod remote;
 pub mod storage;
 mod tests;
 mod thumbnail;
-use std::{path::PathBuf, sync::Arc, time::SystemTime};
+use std::{
+	path::PathBuf,
+	sync::Arc,
+	time::{SystemTime, UNIX_EPOCH},
+};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
-use ruma::{Mxc, OwnedMxcUri, UserId, http_headers::ContentDisposition};
+use hmac::{Hmac, Mac};
+use ruma::{Mxc, OwnedMxcUri, ServerName, UserId, http_headers::ContentDisposition};
 use sha2::Digest;
 use tokio::fs;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, RwLock};
 use tuwunel_core::{
-	Err, Result, debug, debug_error, debug_info, debug_warn, err, error, trace,
+	Err, Result, config::PushMediaPreviewConfig, debug, debug_error, debug_info, debug_warn, err,
+	error, trace,
 	utils::{self, MutexMap},
 	warn,
 };
@@ -34,6 +40,7 @@ pub struct Service {
 	url_preview_mutex: MutexMap<String, ()>,
 	pub(super) db: Data,
 	storage: Arc<OnceCell<Arc<dyn storage::MediaStorage>>>,
+	push_preview_secret: RwLock<Option<Vec<u8>>>,
 	services: Arc<crate::services::OnceServices>,
 }
 
@@ -46,6 +53,62 @@ pub const CACHE_CONTROL_IMMUTABLE: &str = "private,max-age=31536000,immutable";
 /// Default cross-origin resource policy.
 pub const CORP_CROSS_ORIGIN: &str = "cross-origin";
 
+const PUSH_PREVIEW_PATH_PREFIX: &str =
+	"/_matrix/client/unstable/org.tuwunel/media/thumbnail";
+const PUSH_PREVIEW_METHOD: &str = "scale";
+const PUSH_PREVIEW_MAX_DIMENSION: u32 = 512;
+type HmacSha256 = Hmac<sha2::Sha256>;
+
+fn unix_seconds() -> Option<u64> {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+	.ok()
+	.map(|duration| duration.as_secs())
+}
+
+fn valid_push_preview_media_id(media_id: &str) -> bool {
+	!media_id.is_empty()
+		&& media_id
+			.bytes()
+			.all(|byte| !matches!(byte, b'/' | b'\\' | b'?' | b'#'))
+}
+
+fn push_preview_path(server_name: &ServerName, media_id: &str) -> String {
+	format!("{PUSH_PREVIEW_PATH_PREFIX}/{server_name}/{media_id}/preview.png")
+}
+
+fn push_preview_signature_message(
+	server_name: &ServerName,
+	media_id: &str,
+	width: u32,
+	height: u32,
+	method: &str,
+	expires: u64,
+) -> String {
+	format!(
+		"v1\n{}\n{width}\n{height}\n{method}\n{expires}",
+		push_preview_path(server_name, media_id)
+	)
+}
+
+fn sign_push_preview(
+	secret: &[u8],
+	server_name: &ServerName,
+	media_id: &str,
+	width: u32,
+	height: u32,
+	method: &str,
+	expires: u64,
+) -> Option<String> {
+	let mut mac = HmacSha256::new_from_slice(secret).ok()?;
+	mac.update(
+		push_preview_signature_message(server_name, media_id, width, height, method, expires)
+			.as_bytes(),
+	);
+
+	Some(general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+}
+
 #[async_trait]
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
@@ -53,6 +116,7 @@ impl crate::Service for Service {
 			url_preview_mutex: MutexMap::new(),
 			db: Data::new(args.db),
 			storage: Arc::new(OnceCell::new()),
+			push_preview_secret: RwLock::new(None),
 			services: args.services.clone(),
 		}))
 	}
@@ -63,6 +127,19 @@ impl crate::Service for Service {
 		self.storage
 			.set(storage)
 			.map_err(|_| err!(Config("media_storage", "Storage already initialized")))?;
+
+		let push_preview_config = self.services.server.config.push_media_preview.clone();
+		if push_preview_config.enabled {
+			let secret = Self::read_push_preview_secret(&push_preview_config)
+				.await
+				.ok_or_else(|| {
+					err!(Config(
+						"push_media_preview.secret_file",
+						"Failed to load the configured push media preview secret."
+					))
+				})?;
+			*self.push_preview_secret.write().await = Some(secret);
+		}
 
 		self.create_media_dir().await?;
 
@@ -131,6 +208,110 @@ impl Service {
 		self.storage
 			.get()
 			.expect("Storage not initialized - this is a bug")
+	}
+
+	/// Generate a short-lived HTTPS URL for a local MXC thumbnail.
+	pub async fn push_preview_url(&self, mxc: &Mxc<'_>) -> Option<String> {
+		let config = self.services.server.config.push_media_preview.clone();
+		if !config.enabled
+			|| !self.services.globals.server_is_ours(mxc.server_name)
+			|| !valid_push_preview_media_id(mxc.media_id)
+		{
+			return None;
+		}
+
+		let secret = self.get_push_preview_secret(&config).await?;
+		let now = unix_seconds()?;
+		let expires = now.checked_add(config.ttl_seconds)?;
+		let signature = sign_push_preview(
+			&secret,
+			mxc.server_name,
+			mxc.media_id,
+			config.width,
+			config.height,
+			PUSH_PREVIEW_METHOD,
+			expires,
+		)?;
+
+		let mut url = config.public_base_url?;
+		url.set_path(&push_preview_path(mxc.server_name, mxc.media_id));
+		{
+			let mut query = url.query_pairs_mut();
+			query
+				.append_pair("width", &config.width.to_string())
+				.append_pair("height", &config.height.to_string())
+				.append_pair("method", PUSH_PREVIEW_METHOD)
+				.append_pair("expires", &expires.to_string())
+				.append_pair("sig", &signature);
+		}
+
+		Some(url.to_string())
+	}
+
+	/// Verify a signed push preview request without exposing the signing secret.
+	pub async fn verify_push_preview_signature(
+		&self,
+		server_name: &ServerName,
+		media_id: &str,
+		width: u32,
+		height: u32,
+		method: &str,
+		expires: u64,
+		signature: &str,
+	) -> bool {
+		let config = self.services.server.config.push_media_preview.clone();
+		let Some(now) = unix_seconds() else {
+			return false;
+		};
+
+		if !config.enabled
+			|| !self.services.globals.server_is_ours(server_name)
+			|| !valid_push_preview_media_id(media_id)
+			|| width == 0
+			|| width > PUSH_PREVIEW_MAX_DIMENSION
+			|| height == 0
+			|| height > PUSH_PREVIEW_MAX_DIMENSION
+			|| !matches!(method, "scale" | "crop")
+			|| expires <= now
+		{
+			return false;
+		}
+
+		let Some(secret) = self.get_push_preview_secret(&config).await else {
+			return false;
+		};
+		let Ok(signature) = general_purpose::URL_SAFE_NO_PAD.decode(signature) else {
+			return false;
+		};
+		if signature.len() != 32 {
+			return false;
+		}
+
+		let Ok(mut mac) = HmacSha256::new_from_slice(&secret) else {
+			return false;
+		};
+		mac.update(
+			push_preview_signature_message(server_name, media_id, width, height, method, expires)
+				.as_bytes(),
+		);
+		mac.verify_slice(&signature).is_ok()
+	}
+
+	async fn read_push_preview_secret(config: &PushMediaPreviewConfig) -> Option<Vec<u8>> {
+		let path = config.secret_file.as_ref()?;
+		let secret = fs::read_to_string(path).await.ok()?;
+		let secret = secret.trim().as_bytes().to_vec();
+		(!secret.is_empty()).then_some(secret)
+	}
+
+	async fn get_push_preview_secret(&self, config: &PushMediaPreviewConfig) -> Option<Vec<u8>> {
+		if let Some(secret) = self.push_preview_secret.read().await.clone() {
+			return Some(secret);
+		}
+
+		let secret = Self::read_push_preview_secret(config).await?;
+		let mut cached = self.push_preview_secret.write().await;
+		Some(cached.get_or_insert(secret).clone())
 	}
 
 	/// Uploads a file, with content-based deduplication.

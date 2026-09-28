@@ -271,6 +271,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::SEQUENTIAL
 	},
 	Descriptor {
+		name: "roomid_hasusermessage",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
 		name: "roomuserid_knockedcount",
 		val_size_hint: Some(8),
 		..descriptor::RANDOM_SMALL
@@ -557,6 +561,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 	Descriptor {
 		name: "userroomid_knockedstate",
 		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "userroomid_messagepairs",
+		..descriptor::RANDOM
 	},
 	Descriptor {
 		name: "userroomid_notificationcount",

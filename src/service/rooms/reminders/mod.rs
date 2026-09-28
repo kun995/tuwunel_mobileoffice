@@ -425,6 +425,31 @@ async fn send_personal_due_push(&self, reminder: &Reminder) -> Result {
 		.get_workspace_id(&reminder.room_id)
 		.await
 		.ok();
+	let is_direct_chat = self
+		.services
+		.account_data
+		.is_direct(&reminder.created_by, &reminder.room_id)
+		.await
+		|| self
+			.services
+			.state_accessor
+			.is_direct(&reminder.room_id, &reminder.created_by)
+			.await;
+	let sender_avatar_url = self
+		.services
+		.users
+		.avatar_url(&reminder.created_by)
+		.await
+		.ok()
+		.map(|avatar_url| avatar_url.to_string());
+	let room_avatar_url = self
+		.services
+		.state_accessor
+		.get_avatar(&reminder.room_id)
+		.await
+		.ok()
+		.and_then(|content| content.url)
+		.map(|avatar_url| avatar_url.to_string());
 
 	let pushers = self
 		.services
@@ -438,6 +463,21 @@ async fn send_personal_due_push(&self, reminder: &Reminder) -> Result {
 			continue;
 		};
 		attempted = true;
+		let mut device_data = http.data.clone();
+		if let Some(format) = http.format.as_ref()
+			&& let Ok(format) = serde_json::to_value(format)
+		{
+			device_data.insert("format".to_owned(), format);
+		}
+		device_data.insert(
+			"lang".to_owned(),
+			JsonValue::String(crate::pusher::normalized_language(&pusher.lang).to_owned()),
+		);
+		let unread = self
+			.services
+			.pusher
+			.notification_count(&reminder.created_by, &reminder.room_id)
+			.await;
 
 		let url =
 			push_gateway_notify_url(&http.url, &self.services.config.notification_push_path);
@@ -450,13 +490,20 @@ async fn send_personal_due_push(&self, reminder: &Reminder) -> Result {
 				"sender": reminder.created_by.to_string(),
 				"sender_display_name": "Reminder",
 				"room_name": room_name,
+				"sender_avatar_url": sender_avatar_url,
+				"room_avatar_url": room_avatar_url,
+				"is_direct_chat": is_direct_chat,
 				"workspaceId": workspace_id,
 				"prio": "high",
+				"counts": {
+					"unread": unread,
+					"missed_calls": 0
+				},
 				"content": reminder_event_content(reminder, REMINDER_DUE_EVENT_TYPE),
 				"devices": [{
 					"app_id": pusher.ids.app_id.clone(),
 					"pushkey": pusher.ids.pushkey.clone(),
-					"data": http.data.clone(),
+					"data": device_data,
 					"format": http.format.clone(),
 				}]
 			}

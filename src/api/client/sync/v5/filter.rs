@@ -21,6 +21,15 @@ pub(super) async fn filter_room(
 	room_id: &RoomId,
 	membership: Option<&MembershipState>,
 ) -> bool {
+	if matches!(membership, Some(MembershipState::Join))
+		&& services
+			.timeline
+			.is_empty_direct_room(sender_user, room_id)
+			.await
+	{
+		return false;
+	}
+
 	#[expect(clippy::match_same_arms)] // helps readability
 	let match_invite = filter
 		.is_invite

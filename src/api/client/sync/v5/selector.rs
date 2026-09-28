@@ -29,18 +29,33 @@ pub(super) async fn selector(
 
 	let SyncInfo { services, sender_user, .. } = sync_info;
 
-	let mut rooms = services
+	let memberships = services
 		.state_cache
 		.user_memberships(sender_user, Some(&[Join, Invite, Knock]))
 		.map(|(membership, room_id)| (room_id.to_owned(), Some(membership)))
-		.broad_filter_map(|(room_id, membership)| async move {
-			services
-				.deleted_rooms
-				.should_hide_room(sender_user, &room_id)
-				.await
-				.eq(&false)
-				.then_some((room_id, membership))
-		})
+		.collect::<Vec<_>>()
+		.await;
+	let mut visible = Vec::with_capacity(memberships.len());
+	for (room_id, membership) in memberships {
+		if services.deleted_rooms.should_hide_room(sender_user, &room_id).await {
+			// A room removed from a list must be sent as initial when a new event reopens it.
+			conn.rooms.remove(&room_id);
+		} else {
+			if let Some(room) = conn.rooms.get(&room_id)
+				&& services
+					.deleted_rooms
+					.room_reappeared_since(sender_user, &room_id, room.roomsince, conn.next_batch)
+					.await
+			{
+				conn.rooms.remove(&room_id);
+			}
+			visible.push((room_id, membership));
+		}
+	}
+
+	let mut rooms = visible
+		.into_iter()
+		.stream()
 		.broad_filter_map(|(room_id, membership)| matcher(sync_info, conn, room_id, membership))
 		.collect::<Vec<_>>()
 		.await;

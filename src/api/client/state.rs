@@ -10,7 +10,7 @@ use ruma::{
 			history_visibility::{HistoryVisibility, RoomHistoryVisibilityEventContent},
 			join_rules::{JoinRule, RoomJoinRulesEventContent},
 			member::{MembershipState, RoomMemberEventContent},
-			power_levels::RoomPowerLevelsEventContent,
+			power_levels::{RoomPowerLevelsEventContent, UserPowerLevel},
 			server_acl::RoomServerAclEventContent,
 		},
 	},
@@ -252,7 +252,10 @@ enum AssignedRoomRole {
 	Administrator,
 }
 
-fn newly_assigned_room_role(old_power: Int, new_power: Int) -> Option<AssignedRoomRole> {
+fn newly_assigned_room_role(
+	old_power: UserPowerLevel,
+	new_power: Int,
+) -> Option<AssignedRoomRole> {
 	let administrator_power = Int::from(50);
 	let leader_power = Int::from(100);
 
@@ -299,7 +302,7 @@ async fn room_role_promotions(
 
 		let old_power = old_power_levels
 			.as_ref()
-			.map_or_else(|| Int::from(0), |old| old.for_user(user_id_ref));
+			.map_or_else(|| UserPowerLevel::from(Int::from(0)), |old| old.for_user(user_id_ref));
 		match newly_assigned_room_role(old_power, *new_power) {
 			| Some(AssignedRoomRole::Leader) => promotions.leaders.push(user_id.to_owned()),
 			| Some(AssignedRoomRole::Administrator) => {
@@ -424,28 +427,28 @@ mod tests {
 	#[test]
 	fn detects_new_room_role_assignments() {
 		assert_eq!(
-			newly_assigned_room_role(Int::from(0), Int::from(50)),
+			newly_assigned_room_role(Int::from(0).into(), Int::from(50)),
 			Some(AssignedRoomRole::Administrator)
 		);
 		assert_eq!(
-			newly_assigned_room_role(Int::from(49), Int::from(99)),
+			newly_assigned_room_role(Int::from(49).into(), Int::from(99)),
 			Some(AssignedRoomRole::Administrator)
 		);
 		assert_eq!(
-			newly_assigned_room_role(Int::from(50), Int::from(100)),
+			newly_assigned_room_role(Int::from(50).into(), Int::from(100)),
 			Some(AssignedRoomRole::Leader)
 		);
 		assert_eq!(
-			newly_assigned_room_role(Int::from(0), Int::from(100)),
+			newly_assigned_room_role(Int::from(0).into(), Int::from(100)),
 			Some(AssignedRoomRole::Leader)
 		);
 	}
 
 	#[test]
 	fn ignores_existing_roles_and_leader_demotion() {
-		assert_eq!(newly_assigned_room_role(Int::from(50), Int::from(75)), None);
-		assert_eq!(newly_assigned_room_role(Int::from(100), Int::from(100)), None);
-		assert_eq!(newly_assigned_room_role(Int::from(100), Int::from(50)), None);
+		assert_eq!(newly_assigned_room_role(Int::from(50).into(), Int::from(75)), None);
+		assert_eq!(newly_assigned_room_role(Int::from(100).into(), Int::from(100)), None);
+		assert_eq!(newly_assigned_room_role(Int::from(100).into(), Int::from(50)), None);
 	}
 }
 

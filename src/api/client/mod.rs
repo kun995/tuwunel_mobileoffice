@@ -21,6 +21,7 @@ pub(super) mod openid;
 pub(super) mod presence;
 pub(super) mod profile;
 pub(super) mod push;
+pub(super) mod push_media_preview;
 pub(super) mod read_marker;
 pub(super) mod redact;
 pub(super) mod register;
@@ -46,6 +47,7 @@ pub(super) mod unversioned;
 pub(super) mod user_directory;
 pub(super) mod voip;
 pub(super) mod well_known;
+pub(super) mod workspace_stats;
 pub(super) mod workspace_user;
 
 mod utils;
@@ -73,6 +75,7 @@ pub(super) use openid::*;
 pub(super) use presence::*;
 pub(super) use profile::*;
 pub(super) use push::*;
+pub(super) use push_media_preview::*;
 pub(super) use read_marker::*;
 pub(super) use redact::*;
 pub(super) use register::*;
@@ -98,6 +101,7 @@ pub(super) use unversioned::*;
 pub(super) use user_directory::*;
 pub(super) use voip::*;
 pub(super) use well_known::*;
+pub(super) use workspace_stats::*;
 pub(super) use workspace_user::*;
 
 /// generated user access token length

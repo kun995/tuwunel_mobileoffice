@@ -233,6 +233,9 @@ pub async fn backfill_pdu(
 
 	// Insert pdu
 	self.prepend_backfill_pdu(&pdu_id, &event_id, &value);
+	if pdu.kind == TimelineEventType::RoomMessage {
+		self.mark_has_user_message(pdu.room_id());
+	}
 	drop(insert_lock);
 
 	if pdu.kind == TimelineEventType::RoomMessage {

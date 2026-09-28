@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use futures::{TryStreamExt, pin_mut};
 use ruma::{RoomId, UserId};
 use tuwunel_core::{Result, matrix::pdu::PduCount};
 use tuwunel_database::{Deserialized, Map};
@@ -88,6 +89,38 @@ impl Service {
 		};
 
 		!is_after_deleted_before(last_count, Some(deleted_before))
+	}
+
+	/// The first event after deletion makes a hidden room visible again. The
+	/// recipient needs a full room snapshot in that sync response to rebuild a
+	/// room previously removed from their local cache.
+	pub async fn room_reappeared_since(
+		&self,
+		user_id: &UserId,
+		room_id: &RoomId,
+		since: u64,
+		next_batch: u64,
+	) -> bool {
+		if since == 0 {
+			return false;
+		}
+
+		let Some(deleted_before) = self.room_hidden_before(user_id, room_id).await else {
+			return false;
+		};
+
+		let pdus = self
+			.services
+			.timeline
+			.pdus(None, room_id, Some(PduCount::Normal(deleted_before)));
+		pin_mut!(pdus);
+		let first_after_delete = pdus
+			.try_next()
+			.await
+			.ok()
+			.flatten();
+
+		matches!(first_after_delete, Some((PduCount::Normal(count), _)) if count > since && count <= next_batch)
 	}
 
 	pub async fn is_deleted_pdu(

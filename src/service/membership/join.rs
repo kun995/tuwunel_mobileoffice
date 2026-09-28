@@ -1,6 +1,6 @@
 use std::{
 	borrow::Borrow,
-	collections::{HashMap, HashSet},
+	collections::{BTreeMap, HashMap, HashSet},
 	iter::once,
 	mem::take,
 	sync::Arc,
@@ -38,6 +38,7 @@ use tuwunel_core::{
 use super::Service;
 use crate::{
 	Services,
+	membership::INITIAL_ROOM_CREATION_FIELD,
 	rooms::{
 		state::RoomMutexGuard,
 		state_compressor::{CompressedState, HashSetCompressStateEvent},
@@ -591,19 +592,26 @@ pub async fn join_local(
 	)
 	.await;
 
-	let mut is_direct = None;
-	if let Ok(prev_member) = self
+	let previous_member = self
 		.services
 		.state_accessor
-		.room_state_get_content::<RoomMemberEventContent>(
-			room_id,
-			&StateEventType::RoomMember,
-			sender_user.as_str(),
-		)
+		.room_state_get(room_id, &StateEventType::RoomMember, sender_user.as_str())
 		.await
-	{
-		is_direct = prev_member.is_direct;
-	}
+		.ok();
+	let initial_room_creation = previous_member
+		.as_ref()
+		.and_then(|pdu| pdu.unsigned.as_deref())
+		.and_then(|unsigned| serde_json::from_str::<serde_json::Value>(unsigned.get()).ok())
+		.and_then(|unsigned| {
+			unsigned
+				.get(INITIAL_ROOM_CREATION_FIELD)
+				.and_then(|value| value.as_bool())
+		})
+		.unwrap_or(false);
+	let is_direct = previous_member
+		.as_ref()
+		.and_then(|pdu| pdu.get_content::<RoomMemberEventContent>().ok())
+		.and_then(|member| member.is_direct);
 
 	let content = RoomMemberEventContent {
 		displayname,
@@ -615,16 +623,19 @@ pub async fn join_local(
 		..RoomMemberEventContent::new(MembershipState::Join)
 	};
 
+	let mut join_builder = PduBuilder::state(sender_user.to_string(), &content);
+	if initial_room_creation {
+		join_builder.unsigned = Some(BTreeMap::from([(
+			INITIAL_ROOM_CREATION_FIELD.to_owned(),
+			serde_json::Value::Bool(true),
+		)]));
+	}
+
 	// Try normal join first
 	let Err(error) = self
 		.services
 		.timeline
-		.build_and_append_pdu(
-			PduBuilder::state(sender_user.to_string(), &content),
-			sender_user,
-			room_id,
-			state_lock,
-		)
+		.build_and_append_pdu(join_builder, sender_user, room_id, state_lock)
 		.await
 	else {
 		return Ok(());

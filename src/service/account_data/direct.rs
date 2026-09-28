@@ -1,5 +1,5 @@
 use ruma::{
-	RoomId, UserId,
+	OwnedRoomId, RoomId, UserId,
 	events::{GlobalAccountDataEventType, direct::DirectEventContent},
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -47,6 +47,39 @@ pub async fn is_direct(&self, user_id: &UserId, room_id: &RoomId) -> bool {
 		.flat_map(|rooms| rooms.iter())
 		.filter_map(JsonValue::as_str)
 		.any(is_equal_to!(room_id.as_str()))
+}
+
+/// Returns the rooms that the user has marked as direct with `target_user_id`.
+///
+/// The list is kept in the same order as the user's `m.direct` account data so
+/// callers can prefer the most recently added room when duplicate DM rooms
+/// exist.
+#[implement(super::Service)]
+pub async fn direct_rooms_for_user(
+	&self,
+	user_id: &UserId,
+	target_user_id: &UserId,
+) -> Vec<OwnedRoomId> {
+	let Ok(direct_event) = self
+		.services
+		.account_data
+		.get_global::<JsonValue>(user_id, GlobalAccountDataEventType::Direct)
+		.await
+	else {
+		return Vec::new();
+	};
+
+	direct_event
+		.get("content")
+		.unwrap_or(&direct_event)
+		.get(target_user_id.as_str())
+		.and_then(JsonValue::as_array)
+		.into_iter()
+		.flatten()
+		.filter_map(JsonValue::as_str)
+		.filter_map(|room_id| RoomId::parse(room_id).ok())
+		.map(ToOwned::to_owned)
+		.collect()
 }
 
 #[implement(super::Service)]
