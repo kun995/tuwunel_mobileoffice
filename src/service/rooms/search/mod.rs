@@ -13,7 +13,7 @@ use tuwunel_core::{
 		stream::{TryIgnore, WidebandExt},
 	},
 };
-use tuwunel_database::{Interfix, Map, keyval::Val};
+use tuwunel_database::{Map, Txn, keyval::Val};
 
 use crate::rooms::{
 	short::ShortRoomId,
@@ -40,14 +40,15 @@ pub struct RoomQuery<'a> {
 
 type TokenId = ArrayVec<u8, TOKEN_ID_MAX_LEN>;
 
-const TOKEN_ID_MAX_LEN: usize =
-	size_of::<ShortRoomId>() + WORD_MAX_LEN + 1 + size_of::<RawPduId>();
+const TOKEN_ID_MAX_LEN: usize = size_of::<ShortRoomId>() + WORD_MAX_LEN + 1 + size_of::<RawPduId>();
 const WORD_MAX_LEN: usize = 50;
 
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
-			db: Data { tokenids: args.db["tokenids"].clone() },
+			db: Data {
+				tokenids: args.db["tokenids"].clone(),
+			},
 			services: args.services.clone(),
 		}))
 	}
@@ -59,19 +60,16 @@ impl crate::Service for Service {
 
 #[implement(Service)]
 pub fn index_pdu(&self, shortroomid: ShortRoomId, pdu_id: &RawPduId, message_body: &str) {
-	let batch = tokenize(message_body)
-		.map(|word| {
-			let mut key = shortroomid.to_be_bytes().to_vec();
-			key.extend_from_slice(word.as_bytes());
-			key.push(0xFF);
-			key.extend_from_slice(pdu_id.as_ref()); // TODO: currently we save the room id a second time here
-			key
-		})
-		.collect::<Vec<_>>();
+	let items = tokenize(message_body).map(|word| {
+		let mut key = shortroomid.to_be_bytes().to_vec();
+		key.extend_from_slice(word.as_bytes());
+		key.push(0xFF);
+		key.extend_from_slice(pdu_id.as_ref()); // TODO: currently we save the room id a second time here
 
-	self.db
-		.tokenids
-		.insert_batch(batch.iter().map(|k| (k.as_slice(), &[])));
+		(key, [])
+	});
+
+	Txn::insert(&self.db.tokenids, items).execute();
 }
 
 #[implement(Service)]
@@ -101,11 +99,13 @@ pub async fn search_pdus<'a>(
 		.await?
 		.wide_filter_map(async |pdu_id| {
 			(match user_id {
-				Some(user_id) => !self
-					.services
-					.deleted_rooms
-					.is_deleted_pdu(user_id, room_id, pdu_id.pdu_count())
-					.await,
+				Some(user_id) => {
+					!self
+						.services
+						.deleted_rooms
+						.is_deleted_pdu(user_id, room_id, pdu_id.pdu_count())
+						.await
+				}
 				None => true,
 			})
 			.then_some(pdu_id)
@@ -119,8 +119,7 @@ pub async fn search_pdus<'a>(
 		.into_iter()
 		.stream()
 		.wide_filter_map(async |result_pdu_id: RawPduId| {
-			self
-				.services
+			self.services
 				.timeline
 				.get_pdu_from_id(&result_pdu_id)
 				.await
@@ -141,17 +140,13 @@ pub async fn search_pdus<'a>(
 			self.services
 				.state_accessor
 				.user_can_see_event(query.user_id?, pdu.room_id(), pdu.event_id())
-			.await
-			.then_some(pdu)
+				.await
+				.then_some(pdu)
 		})
 		.collect()
 		.await;
 
-	let pdus = pdus
-		.into_iter()
-		.stream()
-		.skip(query.skip)
-		.take(query.limit);
+	let pdus = pdus.into_iter().stream().skip(query.skip).take(query.limit);
 
 	Ok((count, pdus))
 }
@@ -163,15 +158,9 @@ pub async fn search_pdu_ids(
 	&self,
 	query: &RoomQuery<'_>,
 ) -> Result<impl Stream<Item = RawPduId> + Send + '_ + use<'_>> {
-	let shortroomid = self
-		.services
-		.short
-		.get_shortroomid(query.room_id)
-		.await?;
+	let shortroomid = self.services.short.get_shortroomid(query.room_id).await?;
 
-	let pdu_ids = self
-		.search_pdu_ids_query_room(query, shortroomid)
-		.await;
+	let pdu_ids = self.search_pdu_ids_query_room(query, shortroomid).await;
 
 	let iters = pdu_ids.into_iter().map(IntoIterator::into_iter);
 
@@ -217,7 +206,11 @@ fn search_pdu_ids_query_word(
 	word: &str,
 ) -> impl Stream<Item = Val<'_>> + Send + '_ + use<'_> {
 	// rustc says const'ing this not yet stable
-	let end_id: RawPduId = PduId { shortroomid, count: PduCount::max() }.into();
+	let end_id: RawPduId = PduId {
+		shortroomid,
+		count: PduCount::max(),
+	}
+	.into();
 
 	// Newest pdus first
 	let end = make_tokenid(shortroomid, word, &end_id);
@@ -231,17 +224,23 @@ fn search_pdu_ids_query_word(
 
 #[implement(Service)]
 pub async fn delete_all_search_tokenids_for_room(&self, room_id: &RoomId) -> Result {
-	let prefix = (room_id, Interfix);
+	let Ok(shortroomid) = self.services.short.get_shortroomid(room_id).await else {
+		return Ok(());
+	};
 
-	self.db
+	let txn = self
+		.db
 		.tokenids
-		.keys_prefix_raw(&prefix)
+		.keys_prefix_raw(&shortroomid)
 		.ignore_err()
-		.ready_for_each(|key| {
+		.ready_fold(self.services.db.txn(), |mut txn, key| {
 			trace!("Removing key: {key:?}");
-			self.db.tokenids.remove(key);
+			txn.del_raw(&self.db.tokenids, key);
+			txn
 		})
 		.await;
+
+	txn.execute();
 
 	Ok(())
 }

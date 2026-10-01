@@ -1,0 +1,103 @@
+[
+  {
+    "event_id": "$create",
+    "room_id": "!soft-fail:example.com",
+    "sender": "@alice:example.com",
+    "type": "m.room.create",
+    "content": {
+      "creator": "@alice:example.com",
+      "room_version": "10"
+    },
+    "state_key": "",
+    "origin_server_ts": 0,
+    "depth": 0,
+    "hashes": {"sha256": "aaa"},
+    "signatures": {},
+    "prev_events": [],
+    "auth_events": []
+  },
+  {
+    "event_id": "$alice_join",
+    "room_id": "!soft-fail:example.com",
+    "sender": "@alice:example.com",
+    "type": "m.room.member",
+    "content": {"membership": "join"},
+    "state_key": "@alice:example.com",
+    "origin_server_ts": 1,
+    "depth": 1,
+    "hashes": {"sha256": "aaa"},
+    "signatures": {},
+    "prev_events": ["$create"],
+    "auth_events": ["$create"]
+  },
+  {
+    "event_id": "$power",
+    "room_id": "!soft-fail:example.com",
+    "sender": "@alice:example.com",
+    "type": "m.room.power_levels",
+    "content": {"users": {"@alice:example.com": 100}},
+    "state_key": "",
+    "origin_server_ts": 2,
+    "depth": 2,
+    "hashes": {"sha256": "aaa"},
+    "signatures": {},
+    "prev_events": ["$alice_join"],
+    "auth_events": ["$create", "$alice_join"]
+  },
+  {
+    "event_id": "$join_rules",
+    "room_id": "!soft-fail:example.com",
+    "sender": "@alice:example.com",
+    "type": "m.room.join_rules",
+    "content": {"join_rule": "public"},
+    "state_key": "",
+    "origin_server_ts": 3,
+    "depth": 3,
+    "hashes": {"sha256": "aaa"},
+    "signatures": {},
+    "prev_events": ["$power"],
+    "auth_events": ["$create", "$alice_join", "$power"]
+  },
+  {
+    "event_id": "$ghost_join",
+    "room_id": "!soft-fail:example.com",
+    "sender": "@ghost:example.com",
+    "type": "m.room.member",
+    "content": {"membership": "join"},
+    "state_key": "@ghost:example.com",
+    "origin_server_ts": 4,
+    "depth": 4,
+    "hashes": {"sha256": "aaa"},
+    "signatures": {},
+    "prev_events": ["$join_rules"],
+    "auth_events": ["$create", "$join_rules", "$power"]
+  },
+  {
+    "event_id": "$ghost_current_leave",
+    "room_id": "!soft-fail:example.com",
+    "sender": "@ghost:example.com",
+    "type": "m.room.member",
+    "content": {"membership": "leave"},
+    "state_key": "@ghost:example.com",
+    "origin_server_ts": 5,
+    "depth": 5,
+    "hashes": {"sha256": "aaa"},
+    "signatures": {},
+    "prev_events": ["$ghost_join"],
+    "auth_events": ["$create", "$power", "$ghost_join"]
+  },
+  {
+    "event_id": "$ghost_delayed_leave",
+    "room_id": "!soft-fail:example.com",
+    "sender": "@ghost:example.com",
+    "type": "m.room.member",
+    "content": {"membership": "leave"},
+    "state_key": "@ghost:example.com",
+    "origin_server_ts": 6,
+    "depth": 5,
+    "hashes": {"sha256": "aaa"},
+    "signatures": {},
+    "prev_events": ["$ghost_join"],
+    "auth_events": ["$create", "$power", "$ghost_join"]
+  }
+]

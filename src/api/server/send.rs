@@ -1,12 +1,18 @@
-use std::{collections::BTreeMap, net::IpAddr, time::Instant};
+use std::{
+	collections::BTreeMap,
+	iter::once,
+	net::IpAddr,
+	sync::atomic::{AtomicBool, Ordering},
+	time::{Duration, Instant},
+};
 
 use axum::extract::State;
-use axum_client_ip::InsecureClientIp;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use ruma::{
-	CanonicalJsonObject, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, ServerName, UserId,
+	CanonicalJsonObject, CanonicalJsonValue, MilliSecondsSinceUnixEpoch, OwnedDeviceId,
+	OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, ServerName, TransactionId, UserId,
 	api::{
-		client::error::ErrorKind,
+		error::ErrorKind,
 		federation::transactions::{
 			edu::{
 				DeviceListUpdateContent, DirectDeviceContent, Edu, PresenceContent,
@@ -17,33 +23,45 @@ use ruma::{
 		},
 	},
 	events::receipt::{ReceiptEvent, ReceiptEventContent, ReceiptType},
+	int,
 	serde::Raw,
 	to_device::DeviceIdOrAllDevices,
+	uint,
 };
 use tuwunel_core::{
 	Err, Error, Result, debug,
 	debug::INFO_SPAN_LEVEL,
-	debug_warn, err, error,
+	debug_warn, defer, err, error,
 	itertools::Itertools,
 	result::LogErr,
+	smallvec::SmallVec,
 	trace,
 	utils::{
-		IterStream, ReadyExt,
 		debug::str_truncated,
+		future::TryExtExt,
 		millis_since_unix_epoch,
-		stream::{BroadbandExt, TryBroadbandExt, automatic_width},
+		stream::{BroadbandExt, IterStream, ReadyExt, TryBroadbandExt, automatic_width},
 	},
 	warn,
 };
 use tuwunel_service::{
 	Services,
+	rooms::state_res::{is_topologically_sorted_in_place, topological_sort},
 	sending::{EDU_LIMIT, PDU_LIMIT},
+	users::DeviceListChange,
 };
 
-use crate::Ruma;
+use crate::{ClientIp, Ruma};
 
 type ResolvedMap = BTreeMap<OwnedEventId, Result>;
+type RoomsPdus = SmallVec<[RoomPdus; 1]>;
+type RoomPdus = (OwnedRoomId, TxnPdus);
+type TxnPdus = SmallVec<[(usize, Pdu); 1]>;
 type Pdu = (OwnedRoomId, OwnedEventId, CanonicalJsonObject);
+
+/// Recipient devices of one `AllDevices` to-device send paired with their
+/// inbox counts.
+type Deliveries = SmallVec<[(OwnedDeviceId, u64); 1]>;
 
 /// # `PUT /_matrix/federation/v1/send/{txnId}`
 ///
@@ -53,14 +71,14 @@ type Pdu = (OwnedRoomId, OwnedEventId, CanonicalJsonObject);
 	level = INFO_SPAN_LEVEL,
 	skip_all,
 	fields(
-		%client,
-		origin = body.origin().as_str(),
 		txn = str_truncated(body.transaction_id.as_str(), 20),
+		origin = body.origin().as_str(),
+		%client,
 	),
 )]
 pub(crate) async fn send_transaction_message_route(
 	State(services): State<crate::State>,
-	InsecureClientIp(client): InsecureClientIp,
+	ClientIp(client): ClientIp,
 	body: Ruma<send_transaction_message::v1::Request>,
 ) -> Result<send_transaction_message::v1::Response> {
 	if body.origin() != body.body.origin {
@@ -81,6 +99,12 @@ pub(crate) async fn send_transaction_message_route(
 		)));
 	}
 
+	// Clear any failure bucket before processing consults the peer gate.
+	services
+		.sending
+		.notify_peer_alive(body.origin())
+		.await;
+
 	let txn_start_time = Instant::now();
 	trace!(
 		pdus = body.pdus.len(),
@@ -93,24 +117,38 @@ pub(crate) async fn send_transaction_message_route(
 		.pdus
 		.iter()
 		.stream()
-		.broad_then(|pdu| services.event_handler.parse_incoming_pdu(pdu))
-		.inspect_err(|e| debug_warn!("Could not parse PDU: {e}"))
-		.ready_filter_map(Result::ok);
+		.enumerate()
+		.broad_filter_map(|(i, pdu)| {
+			services
+				.event_handler
+				.parse_incoming_pdu(pdu)
+				.inspect_err(move |e| debug_warn!("Could not parse PDU[{i}]: {e}"))
+				.map_ok(move |pdu| (i, pdu))
+				.ok()
+		});
 
 	let edus = body
 		.edus
 		.iter()
-		.map(|edu| edu.json().get())
-		.map(serde_json::from_str)
-		.filter_map(Result::ok)
-		.stream();
+		.stream()
+		.enumerate()
+		.ready_filter_map(|(i, edu)| {
+			serde_json::from_str(edu.json().get())
+				.inspect_err(|e| debug_warn!("Could not parse EDU[{i}]: {e}"))
+				.map(|edu| (i, edu))
+				.ok()
+		});
 
-	trace!(
-		elapsed = ?txn_start_time.elapsed(),
-		"Parsed txn",
-	);
-
-	let results = handle(&services, &client, body.origin(), txn_start_time, pdus, edus).await?;
+	let results = handle(
+		&services,
+		&client,
+		body.origin(),
+		&body.transaction_id,
+		txn_start_time,
+		pdus,
+		edus,
+	)
+	.await?;
 
 	debug!(
 		pdus = body.pdus.len(),
@@ -139,92 +177,233 @@ async fn handle(
 	services: &Services,
 	client: &IpAddr,
 	origin: &ServerName,
+	txn_id: &TransactionId,
 	started: Instant,
-	pdus: impl Stream<Item = Pdu> + Send,
-	edus: impl Stream<Item = Edu> + Send,
+	pdus: impl Stream<Item = (usize, Pdu)> + Send,
+	edus: impl Stream<Item = (usize, Edu)> + Send,
 ) -> Result<ResolvedMap> {
-	// group pdus by room
-	let pdus = pdus
-		.enumerate()
-		.collect()
-		.map(|mut pdus: Vec<_>| {
-			pdus.sort_by(|(_, (room_a, ..)), (_, (room_b, ..))| room_a.cmp(room_b));
+	let results = handle_pdus(services, client, origin, txn_id, started, pdus).await?;
+
+	handle_edus(services, client, origin, txn_id, edus).await?;
+
+	Ok(results)
+}
+
+async fn handle_pdus(
+	services: &Services,
+	client: &IpAddr,
+	origin: &ServerName,
+	txn_id: &TransactionId,
+	started: Instant,
+	pdus: impl Stream<Item = (usize, Pdu)> + Send,
+) -> Result<ResolvedMap> {
+	pdus.collect()
+		.map(Ok)
+		.map_ok(|pdus: TxnPdus| {
 			pdus.into_iter()
+				.sorted_by(|(_, (room_a, ..)), (_, (room_b, ..))| room_a.cmp(room_b))
 				.into_grouping_map_by(|(_, (room_id, ..))| room_id.clone())
 				.collect()
+				.into_iter()
+				.try_stream()
 		})
-		.await;
-
-	// we can evaluate rooms concurrently
-	let results: ResolvedMap = pdus
-		.into_iter()
-		.try_stream()
-		.broad_and_then(async |(room_id, pdus): (_, Vec<_>)| {
-			handle_room(services, client, origin, &started, room_id, pdus.into_iter())
+		.try_flatten_stream()
+		.try_collect::<RoomsPdus>()
+		.map_ok(IntoIterator::into_iter)
+		.map_ok(IterStream::try_stream)
+		.try_flatten_stream()
+		.broad_and_then(async |(room_id, pdus)| {
+			handle_room(services, client, origin, txn_id, started, room_id, pdus)
 				.map_ok(ResolvedMap::into_iter)
 				.map_ok(IterStream::try_stream)
 				.await
 		})
 		.try_flatten()
 		.try_collect()
-		.await?;
-
-	// evaluate edus after pdus, at least for now.
-	edus.enumerate()
-		.for_each_concurrent(automatic_width(), |(i, edu)| {
-			handle_edu(services, client, origin, i, edu)
-		})
-		.await;
-
-	Ok(results)
+		.await
 }
 
+#[tracing::instrument(
+	name = "room",
+	level = INFO_SPAN_LEVEL,
+	skip_all,
+	fields(%room_id)
+)]
 async fn handle_room(
 	services: &Services,
 	_client: &IpAddr,
 	origin: &ServerName,
-	txn_start_time: &Instant,
+	txn_id: &TransactionId,
+	txn_start_time: Instant,
 	ref room_id: OwnedRoomId,
-	pdus: impl Iterator<Item = (usize, Pdu)> + Send,
+	pdus: TxnPdus,
 ) -> Result<ResolvedMap> {
-	let _room_lock = services
+	let pdus = sort_pdus(pdus).await;
+
+	services
 		.event_handler
 		.mutex_federation
 		.lock(room_id)
-		.await;
-
-	pdus.enumerate()
-		.try_stream()
-		.and_then(async |(ri, (ti, (room_id, event_id, value)))| {
-			services.server.check_running()?;
-			let pdu_start_time = Instant::now();
-			let result = services
-				.event_handler
-				.handle_incoming_pdu(origin, &room_id, &event_id, value, true)
-				.map_ok(|_| ())
-				.await;
-
-			debug!(
-				%event_id,
-				%room_id,
-				ri,
-				ti,
-				pdu_elapsed = ?pdu_start_time.elapsed(),
-				txn_elapsed = ?txn_start_time.elapsed(),
-				"Finished PDU",
-			);
-
-			Ok((event_id, result))
+		.then(async |_lock| {
+			pdus.into_iter()
+				.enumerate()
+				.try_stream()
+				.and_then(async |pdu| {
+					services.server.check_running().map(|()| pdu) // interruption point
+				})
+				.and_then(|(ri, (ti, (room_id, event_id, value)))| {
+					let meta = (origin, txn_id, txn_start_time, ti);
+					let pdu = (ri, (room_id, event_id, value));
+					handle_pdu(services, meta, pdu).map(Ok)
+				})
+				.try_collect()
+				.await
 		})
-		.try_collect()
-		.boxed()
 		.await
 }
 
+/// Reorder a room's transaction PDUs so each event follows the in-batch events
+/// it references. An already-ordered batch is returned unchanged; references to
+/// events outside the batch are non-edges. The sort is an optimization, so a
+/// failure falls back to the arrival order.
+async fn sort_pdus(mut pdus: TxnPdus) -> TxnPdus {
+	if already_sorted(&pdus) {
+		return pdus;
+	}
+
+	let event_ids: BTreeMap<&str, &OwnedEventId> = pdus
+		.iter()
+		.map(|(_, (_, event_id, _))| (event_id.as_str(), event_id))
+		.collect();
+
+	let graph = pdus
+		.iter()
+		.map(|(_, (_, event_id, value))| {
+			let references = prev_event_ids(value)
+				.filter_map(|prev| event_ids.get(prev).copied())
+				.map(ToOwned::to_owned)
+				.collect();
+
+			(event_id.clone(), references)
+		})
+		.collect();
+
+	// Causal order alone matters here, so the tie-break inputs are constant.
+	let query = async |_event_id: OwnedEventId| {
+		Ok((int!(0).into(), MilliSecondsSinceUnixEpoch(uint!(0))))
+	};
+
+	let Ok(order) = topological_sort(graph, &query).await else {
+		return pdus;
+	};
+
+	let position: BTreeMap<&str, usize> = order
+		.iter()
+		.enumerate()
+		.map(|(i, event_id)| (event_id.as_str(), i))
+		.collect();
+
+	pdus.sort_by_key(|(_, (_, event_id, _))| position.get(event_id.as_str()).copied());
+	pdus
+}
+
+/// Whether the batch is already in causal order, in which case the sort can be
+/// skipped.
+fn already_sorted(pdus: &[(usize, Pdu)]) -> bool {
+	is_topologically_sorted_in_place(
+		pdus,
+		|(_, (_, id, _))| id.as_str(),
+		|(_, (_, _, value))| prev_event_ids(value),
+	)
+}
+
+/// The `prev_events` of a PDU held as canonical JSON.
+fn prev_event_ids(value: &CanonicalJsonObject) -> impl Iterator<Item = &str> + '_ {
+	value
+		.get("prev_events")
+		.and_then(CanonicalJsonValue::as_array)
+		.into_iter()
+		.flatten()
+		.filter_map(CanonicalJsonValue::as_str)
+}
+
+#[tracing::instrument(
+	name = "pdu",
+	level = INFO_SPAN_LEVEL,
+	skip_all,
+	fields(%event_id, %ti, %ri)
+)]
+async fn handle_pdu(
+	services: &Services,
+	(origin, txn_id, txn_start_time, ti): (&ServerName, &TransactionId, Instant, usize),
+	(ri, (ref room_id, event_id, value)): (usize, Pdu),
+) -> (OwnedEventId, Result) {
+	let pdu_start_time = Instant::now();
+	let completed: AtomicBool = Default::default();
+	defer! {{
+		if completed.load(Ordering::Acquire) {
+			return;
+		}
+
+		if pdu_start_time.elapsed() >= Duration::from_secs(services.config.client_request_timeout) {
+			error!(
+				%origin, %txn_id, %room_id, %event_id, %ri, %ti,
+				elapsed = ?pdu_start_time.elapsed(),
+				"Incoming transaction processing timed out.",
+			);
+		} else {
+			debug_warn!(
+				%origin, %txn_id, %room_id, %event_id, %ri, %ti,
+				elapsed = ?pdu_start_time.elapsed(),
+				"Incoming transaction processing interrupted.",
+			);
+		}
+	}}
+
+	let result = services
+		.event_handler
+		.handle_incoming_pdu(origin, room_id, &event_id, value, true)
+		.map_ok(|_| ())
+		.await;
+
+	completed.store(true, Ordering::Release);
+	debug!(
+		%event_id, ri, ti,
+		pdu_elapsed = ?pdu_start_time.elapsed(),
+		txn_elapsed = ?txn_start_time.elapsed(),
+		"Finished PDU",
+	);
+
+	(event_id.clone(), result)
+}
+
+#[tracing::instrument(name = "edus", level = "debug", skip_all)]
+async fn handle_edus(
+	services: &Services,
+	client: &IpAddr,
+	origin: &ServerName,
+	txn_id: &TransactionId,
+	edus: impl Stream<Item = (usize, Edu)> + Send,
+) -> Result {
+	edus.for_each_concurrent(automatic_width(), |(i, edu)| {
+		handle_edu(services, client, origin, txn_id, i, edu)
+	})
+	.await;
+
+	Ok(())
+}
+
+#[tracing::instrument(
+	name = "edu",
+	level = "debug",
+	skip_all,
+	fields(%i),
+)]
 async fn handle_edu(
 	services: &Services,
 	client: &IpAddr,
 	origin: &ServerName,
+	_txn_id: &TransactionId,
 	i: usize,
 	edu: Edu,
 ) {
@@ -470,7 +649,7 @@ async fn handle_edu_device_list_update(
 
 	services
 		.users
-		.mark_device_key_update(&user_id)
+		.mark_device_key_update(&user_id, DeviceListChange::Resync)
 		.await;
 }
 
@@ -505,11 +684,16 @@ async fn handle_edu_direct_to_device(
 		return;
 	}
 
-	// process messages concurrently for different users
 	let ev_type = ev_type.to_string();
+
 	messages
 		.into_iter()
 		.stream()
+		.broad_filter_map(async |(target_user_id, map)| {
+			to_device_deliverable(services, &target_user_id)
+				.await
+				.then_some((target_user_id, map))
+		})
 		.for_each_concurrent(automatic_width(), |(target_user_id, map)| {
 			handle_edu_direct_to_device_user(services, target_user_id, sender, &ev_type, map)
 		})
@@ -521,6 +705,20 @@ async fn handle_edu_direct_to_device(
 		.add_txnid(sender, None, message_id, &[]);
 }
 
+/// A local account we store or forward to-device events for.
+///
+/// Qualifying accounts are active, the server user once its account exists, or
+/// claimed by an appservice namespace so its puppet events reach the bridge.
+async fn to_device_deliverable(services: &Services, user_id: &UserId) -> bool {
+	services.globals.user_is_local(user_id)
+		&& ((user_id == services.globals.server_user && services.users.exists(user_id).await)
+			|| services.users.is_active(user_id).await
+			|| services
+				.appservice
+				.is_interested_in_user(user_id)
+				.await)
+}
+
 async fn handle_edu_direct_to_device_user<Event: Send + Sync>(
 	services: &Services,
 	target_user_id: OwnedUserId,
@@ -528,24 +726,20 @@ async fn handle_edu_direct_to_device_user<Event: Send + Sync>(
 	ev_type: &str,
 	map: BTreeMap<DeviceIdOrAllDevices, Raw<Event>>,
 ) {
-	for (target_device_id_maybe, event) in map {
-		let Ok(event) = event
-			.deserialize_as()
-			.map_err(|e| err!(Request(InvalidParam(error!("To-Device event is invalid: {e}")))))
-		else {
-			continue;
-		};
-
-		handle_edu_direct_to_device_event(
-			services,
-			&target_user_id,
-			sender,
-			target_device_id_maybe,
-			ev_type,
-			event,
-		)
+	map.into_iter()
+		.stream()
+		.ready_filter_map(|(tid, raw)| {
+			raw.deserialize_as()
+				.map_err(|e| {
+					err!(Request(InvalidParam(error!("To-Device event is invalid: {e}"))))
+				})
+				.ok()
+				.map(|ev| (tid, ev))
+		})
+		.for_each_concurrent(automatic_width(), |(tid, ev)| {
+			handle_edu_direct_to_device_event(services, &target_user_id, sender, tid, ev_type, ev)
+		})
 		.await;
-	}
 }
 
 async fn handle_edu_direct_to_device_event(
@@ -558,29 +752,70 @@ async fn handle_edu_direct_to_device_event(
 ) {
 	match target_device_id_maybe {
 		| DeviceIdOrAllDevices::DeviceId(ref target_device_id) => {
-			services.users.add_to_device_event(
+			let count = services.users.add_to_device_event(
 				sender,
 				target_user_id,
 				target_device_id,
 				ev_type,
 				&event,
 			);
+
+			services
+				.sending
+				.send_to_device_appservices(
+					sender,
+					target_user_id,
+					once((&**target_device_id, count)),
+					ev_type,
+					&event,
+				)
+				.await
+				.log_err()
+				.ok();
 		},
 
 		| DeviceIdOrAllDevices::AllDevices => {
-			services
+			let interested = services
+				.appservice
+				.is_interested_in_user(target_user_id)
+				.await;
+
+			let deliveries: Deliveries = services
 				.users
 				.all_device_ids(target_user_id)
-				.ready_for_each(|target_device_id| {
-					services.users.add_to_device_event(
+				.map(|target_device_id| {
+					let count = services.users.add_to_device_event(
 						sender,
 						target_user_id,
 						target_device_id,
 						ev_type,
 						&event,
 					);
+
+					(target_device_id, count)
 				})
+				.ready_filter_map(|(target_device_id, count)| {
+					interested.then(|| (target_device_id.to_owned(), count))
+				})
+				.collect()
 				.await;
+
+			if !deliveries.is_empty() {
+				services
+					.sending
+					.send_to_device_appservices(
+						sender,
+						target_user_id,
+						deliveries
+							.iter()
+							.map(|(device_id, count)| (&**device_id, *count)),
+						ev_type,
+						&event,
+					)
+					.await
+					.log_err()
+					.ok();
+			}
 		},
 	}
 }
@@ -607,4 +842,124 @@ async fn handle_edu_signing_key_update(
 		.await
 		.log_err()
 		.ok();
+}
+
+#[cfg(test)]
+mod tests {
+	use ruma::{CanonicalJsonObject, OwnedEventId, event_id, room_id};
+	use serde_json::json;
+
+	use super::{Pdu, TxnPdus, already_sorted, prev_event_ids, sort_pdus};
+
+	fn pdu(index: usize, id: &OwnedEventId, prev: &[&OwnedEventId]) -> (usize, Pdu) {
+		let prev_events: Vec<&str> = prev.iter().map(|e| e.as_str()).collect();
+		let value: CanonicalJsonObject =
+			serde_json::from_value(json!({ "prev_events": prev_events }))
+				.expect("valid canonical json");
+
+		(index, (room_id!("!r:example.com").to_owned(), id.clone(), value))
+	}
+
+	fn ids() -> (OwnedEventId, OwnedEventId, OwnedEventId) {
+		(
+			event_id!("$a:example.com").to_owned(),
+			event_id!("$b:example.com").to_owned(),
+			event_id!("$c:example.com").to_owned(),
+		)
+	}
+
+	fn order(pdus: &[(usize, Pdu)]) -> Vec<&str> {
+		pdus.iter()
+			.map(|(_, (_, id, _))| id.as_str())
+			.collect()
+	}
+
+	#[test]
+	fn sorted_when_parents_lead() {
+		let (a, b, c) = ids();
+		let pdus = [pdu(0, &a, &[]), pdu(1, &b, &[&a]), pdu(2, &c, &[&b])];
+
+		assert!(already_sorted(&pdus));
+	}
+
+	#[test]
+	fn unsorted_when_child_leads() {
+		let (a, b, _c) = ids();
+		let pdus = [pdu(0, &b, &[&a]), pdu(1, &a, &[])];
+
+		assert!(!already_sorted(&pdus));
+	}
+
+	#[test]
+	fn sorted_ignores_out_of_batch_references() {
+		let (a, b, c) = ids();
+		let pdus = [pdu(0, &b, &[&c]), pdu(1, &a, &[&c])];
+
+		assert!(already_sorted(&pdus));
+	}
+
+	#[tokio::test]
+	async fn sort_orders_parents_before_children() {
+		let (a, b, c) = ids();
+		let pdus: TxnPdus = [pdu(0, &c, &[&b]), pdu(1, &b, &[&a]), pdu(2, &a, &[])]
+			.into_iter()
+			.collect();
+
+		let sorted = sort_pdus(pdus).await;
+
+		assert_eq!(order(&sorted), ["$a:example.com", "$b:example.com", "$c:example.com"]);
+	}
+
+	#[tokio::test]
+	async fn sort_is_noop_when_already_ordered() {
+		let (a, b, c) = ids();
+		let pdus: TxnPdus = [pdu(0, &a, &[]), pdu(1, &b, &[&a]), pdu(2, &c, &[&b])]
+			.into_iter()
+			.collect();
+
+		let sorted = sort_pdus(pdus.clone()).await;
+
+		assert_eq!(order(&sorted), order(&pdus));
+	}
+
+	#[tokio::test]
+	async fn sort_preserves_duplicates() {
+		let (a, b, _c) = ids();
+		let pdus: TxnPdus = [pdu(0, &b, &[&a]), pdu(1, &a, &[]), pdu(2, &b, &[&a])]
+			.into_iter()
+			.collect();
+
+		let sorted = sort_pdus(pdus).await;
+
+		assert_eq!(sorted.len(), 3);
+	}
+
+	#[tokio::test]
+	async fn sort_preserves_a_cycle() {
+		let (a, b, _c) = ids();
+		let pdus: TxnPdus = [pdu(0, &a, &[&b]), pdu(1, &b, &[&a])]
+			.into_iter()
+			.collect();
+
+		let sorted = sort_pdus(pdus).await;
+
+		assert_eq!(sorted.len(), 2);
+	}
+
+	#[test]
+	fn prev_event_ids_reads_the_array() {
+		let (a, b, _c) = ids();
+		let (_, (_, _, value)) = pdu(0, &a, &[&b]);
+
+		let prev: Vec<&str> = prev_event_ids(&value).collect();
+
+		assert_eq!(prev, ["$b:example.com"]);
+	}
+
+	#[test]
+	fn prev_event_ids_empty_when_absent() {
+		let value = CanonicalJsonObject::new();
+
+		assert_eq!(prev_event_ids(&value).count(), 0);
+	}
 }

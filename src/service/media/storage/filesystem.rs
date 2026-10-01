@@ -1,7 +1,6 @@
 /// Filesystem storage backend
 ///
 /// Stores media files on the local filesystem using a hash-based directory structure.
-
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -31,10 +30,7 @@ impl FilesystemStorage {
 	/// hex-encoded to produce a stable, content-addressable filename.
 	fn get_path(&self, hash_bytes: &[u8]) -> PathBuf {
 		let mut path = self.base_path.clone();
-		let hex: String = hash_bytes
-			.iter()
-			.map(|b| format!("{b:02x}"))
-			.collect();
+		let hex: String = hash_bytes.iter().map(|b| format!("{b:02x}")).collect();
 		path.push(hex);
 		path
 	}
@@ -106,7 +102,7 @@ impl MediaStorage for FilesystemStorage {
 /// Encode a key (hash digest) to a string for use as filename
 #[allow(dead_code)]
 fn encode_key(key: &[u8]) -> String {
-	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+	use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 	URL_SAFE_NO_PAD.encode(key)
 }
 

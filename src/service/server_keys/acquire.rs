@@ -1,3 +1,9 @@
+//! Best-effort acquisition of missing federation verify keys.
+//!
+//! Requests are deduplicated by server and key ID, checked against local
+//! storage, and then sent to origins and trusted notaries in configured order.
+//! Missing keys are logged rather than returned to callers as an error.
+
 use std::{
 	borrow::Borrow,
 	collections::{BTreeMap, BTreeSet},
@@ -19,6 +25,10 @@ use super::key_exists;
 
 type Batch = BTreeMap<OwnedServerName, Vec<OwnedServerSigningKeyId>>;
 
+/// Acquires the signing keys referenced by a collection of raw events.
+///
+/// Signature maps are grouped and deduplicated before acquisition. Events with
+/// malformed JSON or unreadable signature fields are silently skipped.
 #[implement(super::Service)]
 pub async fn acquire_events_pubkeys<'a, I>(&self, events: I)
 where
@@ -48,6 +58,11 @@ where
 	self.acquire_pubkeys(batch).await;
 }
 
+/// Best-effort acquires a batch of server signing keys into the local cache.
+///
+/// Local storage is checked first, then origins and trusted notaries are tried
+/// according to configuration. The method returns no status; keys still missing
+/// after all allowed sources are logged.
 #[implement(super::Service)]
 pub async fn acquire_pubkeys<'a, S, K>(&self, batch: S)
 where
@@ -242,7 +257,7 @@ async fn acquire_notary_result(&self, missing: &mut Batch, server_keys: ServerSi
 	self.add_signing_keys(server_keys.clone()).await;
 
 	if let Some(key_ids) = missing.get_mut(server) {
-		key_ids.retain(|key_id| key_exists(&server_keys, key_id));
+		key_ids.retain(|key_id| !key_exists(&server_keys, key_id));
 		if key_ids.is_empty() {
 			missing.remove(server);
 		}
@@ -251,7 +266,7 @@ async fn acquire_notary_result(&self, missing: &mut Batch, server_keys: ServerSi
 
 fn keys_count(batch: &Batch) -> usize {
 	batch
-		.iter()
-		.flat_map(|(_, key_ids)| key_ids.iter())
+		.values()
+		.flat_map(|key_ids| key_ids.iter())
 		.count()
 }

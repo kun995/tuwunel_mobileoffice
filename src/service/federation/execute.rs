@@ -1,37 +1,88 @@
-use std::{fmt::Debug, mem};
+//! Resolves, signs, sends, and decodes one outbound federation request.
+//!
+//! Entry points select an HTTP client plus peer-status posture. Destination
+//! validation and resolver-cache eviction remain shared across those postures.
+
+use std::{fmt::Debug, mem, time::Duration};
 
 use bytes::Bytes;
-use http::{HeaderValue, header::AUTHORIZATION};
 use ipaddress::IPAddress;
 use reqwest::{Client, Method, Request, Response, Url};
 use ruma::{
-	CanonicalJsonName, CanonicalJsonObject, CanonicalJsonValue, ServerName, ServerSigningKeyId,
+	ServerName,
 	api::{
-		AuthScheme, EndpointError, IncomingResponse, MatrixVersion, OutgoingRequest,
-		SendAccessToken, SupportedVersions, client::error::Error as RumaError,
-		federation::authentication::XMatrix,
+		EndpointError, IncomingResponse, MatrixVersion, OutgoingRequest, OutgoingRequestExt,
+		SupportedVersions,
+		error::{Error as RumaError, ErrorBody},
 	},
-	serde::Base64,
 };
+use tokio::time::timeout;
 use tuwunel_core::{
-	Err, Error, Result, debug, debug::INFO_SPAN_LEVEL, debug_error, debug_warn, err,
-	error::inspect_debug_log, implement, trace, utils::string::EMPTY,
+	Err, Error, Result, debug, debug::INFO_SPAN_LEVEL, debug_error, debug_warn, err, implement,
+	trace,
 };
 
-use crate::resolver::actual::ActualDest;
+use super::{
+	ShouldAttempt,
+	peer::classify_error,
+	scheme::{FedAuth, FedPath},
+};
+use crate::{client::read_response_capped, resolver::actual::ActualDest};
 
-/// Sends a request to a federation server
+/// Sends a federation request with the standard federation client.
+///
+/// The destination is validated and resolved before the request is signed and
+/// sent. Success clears peer failures and classifiable errors record a failure;
+/// this entry point does not itself consult peer backoff.
 #[implement(super::Service)]
 #[tracing::instrument(skip_all, name = "request", level = "debug")]
 pub async fn execute<T>(&self, dest: &ServerName, request: T) -> Result<T::IncomingResponse>
 where
 	T: OutgoingRequest + Debug + Send,
+	T::Authentication: FedAuth,
+	T::PathBuilder: FedPath,
 {
 	let client = &self.services.client.federation;
 	self.execute_on(client, dest, request).await
 }
 
-/// Like execute() but with a very large timeout
+/// Sends a bounded, backoff-aware client key lookup over federation.
+///
+/// `/keys/query` and `/keys/claim` requests skip servers already in backoff and
+/// are limited by `federation_keys_timeout`. The uncounted send path
+/// deliberately records neither success, failure, nor timeout, so a slow key
+/// lookup does not suppress unrelated outbound traffic to the server.
+#[implement(super::Service)]
+#[tracing::instrument(skip_all, name = "keys", level = "debug")]
+pub async fn execute_keys<T>(&self, dest: &ServerName, request: T) -> Result<T::IncomingResponse>
+where
+	T: OutgoingRequest + Debug + Send,
+	T::Authentication: FedAuth,
+	T::PathBuilder: FedPath,
+{
+	if matches!(self.should_attempt(dest).await, ShouldAttempt::No { .. }) {
+		return Err!("{dest} is in federation backoff; skipping key lookup");
+	}
+
+	let timeout_dur = Duration::from_secs(
+		self.services
+			.server
+			.config
+			.federation_keys_timeout,
+	);
+
+	let client = &self.services.client.federation;
+
+	match timeout(timeout_dur, self.execute_uncounted(client, dest, request)).await {
+		| Ok(result) => result,
+		| Err(_elapsed) => Err!("{dest} key lookup exceeded {}s", timeout_dur.as_secs()),
+	}
+}
+
+/// Sends a federation request with the long-timeout Synapse client.
+///
+/// Resolution, signing, response decoding, and peer-status recording match
+/// [`super::Service::execute`]; only the selected HTTP client differs.
 #[implement(super::Service)]
 #[tracing::instrument(skip_all, name = "synapse", level = "debug")]
 pub async fn execute_synapse<T>(
@@ -41,17 +92,19 @@ pub async fn execute_synapse<T>(
 ) -> Result<T::IncomingResponse>
 where
 	T: OutgoingRequest + Debug + Send,
+	T::Authentication: FedAuth,
+	T::PathBuilder: FedPath,
 {
 	let client = &self.services.client.synapse;
 	self.execute_on(client, dest, request).await
 }
 
+/// Sends through a supplied client and records the peer outcome.
+///
+/// A successful response clears every stored failure row for the destination.
+/// Only errors classified as peer failures are recorded, and no backoff gate is
+/// consulted before sending.
 #[implement(super::Service)]
-#[tracing::instrument(
-	name = "fed",
-	level = INFO_SPAN_LEVEL,
-	skip(self, client, request),
-)]
 pub async fn execute_on<T>(
 	&self,
 	client: &Client,
@@ -60,7 +113,119 @@ pub async fn execute_on<T>(
 ) -> Result<T::IncomingResponse>
 where
 	T: OutgoingRequest + Send,
+	T::Authentication: FedAuth,
+	T::PathBuilder: FedPath,
 {
+	let result = self
+		.execute_uncounted(client, dest, request)
+		.await;
+
+	match &result {
+		| Ok(_) => self.record_success(dest).await,
+		| Err(error) =>
+			if let Some(class) = classify_error(error) {
+				self.record_failure(dest, class);
+			},
+	}
+
+	result
+}
+
+/// Executes one Feds request while permitting only this server as a
+/// self-destination and preserving ordinary peer-status recording.
+///
+/// Other federation entry points retain the configured loopback gate.
+#[implement(super::Service)]
+pub(super) async fn execute_on_allow_self<T>(
+	&self,
+	client: &Client,
+	dest: &ServerName,
+	request: T,
+) -> Result<T::IncomingResponse>
+where
+	T: OutgoingRequest + Send,
+	T::Authentication: FedAuth,
+	T::PathBuilder: FedPath,
+{
+	let result = self
+		.execute_uncounted_allow_self(client, dest, request)
+		.await;
+
+	match &result {
+		| Ok(_) => self.record_success(dest).await,
+		| Err(error) =>
+			if let Some(class) = classify_error(error) {
+				self.record_failure(dest, class);
+			},
+	}
+
+	result
+}
+
+/// Sends through a supplied client without changing peer status.
+///
+/// Callers that gate separately can honor existing backoff without adding
+/// success or failure records.
+#[implement(super::Service)]
+#[tracing::instrument(
+	name = "fed",
+	level = INFO_SPAN_LEVEL,
+	skip(self, client, request),
+)]
+pub(super) async fn execute_uncounted<T>(
+	&self,
+	client: &Client,
+	dest: &ServerName,
+	request: T,
+) -> Result<T::IncomingResponse>
+where
+	T: OutgoingRequest + Send,
+	T::Authentication: FedAuth,
+	T::PathBuilder: FedPath,
+{
+	self.validate_request_destination(dest)?;
+	let actual = self
+		.services
+		.resolver
+		.get_actual_dest(dest)
+		.await?;
+	let request = self.prepare(&actual, dest, request)?;
+
+	self.perform::<T>(&actual, dest, request, client)
+		.await
+}
+
+/// Executes one Feds request while permitting only this server as a
+/// self-destination and leaving peer status untouched.
+///
+/// Other federation entry points retain the configured loopback gate.
+#[implement(super::Service)]
+#[tracing::instrument(name = "fed", level = "debug", skip(self, client, request))]
+pub(super) async fn execute_uncounted_allow_self<T>(
+	&self,
+	client: &Client,
+	dest: &ServerName,
+	request: T,
+) -> Result<T::IncomingResponse>
+where
+	T: OutgoingRequest + Send,
+	T::Authentication: FedAuth,
+	T::PathBuilder: FedPath,
+{
+	self.validate_request_destination(dest)?;
+	let actual = self
+		.services
+		.resolver
+		.get_actual_dest_allow_self(dest)
+		.await?;
+	let request = self.prepare(&actual, dest, request)?;
+
+	self.perform::<T>(&actual, dest, request, client)
+		.await
+}
+
+#[implement(super::Service)]
+fn validate_request_destination(&self, dest: &ServerName) -> Result {
 	if !self.services.server.config.allow_federation {
 		return Err!(Config("allow_federation", "Federation is disabled."));
 	}
@@ -69,21 +234,12 @@ where
 		.services
 		.server
 		.config
-		.forbidden_remote_server_names
-		.is_match(dest.host())
+		.is_forbidden_remote_server_name(dest)
 	{
 		return Err!(Request(Forbidden(debug_warn!("Federation with {dest} is not allowed."))));
 	}
 
-	let actual = self
-		.services
-		.resolver
-		.get_actual_dest(dest)
-		.await?;
-
-	let request = self.prepare(&actual, dest, request)?;
-	self.perform::<T>(&actual, dest, request, client)
-		.await
+	Ok(())
 }
 
 #[implement(super::Service)]
@@ -96,13 +252,19 @@ async fn perform<T>(
 ) -> Result<T::IncomingResponse>
 where
 	T: OutgoingRequest + Send,
+	T::Authentication: FedAuth,
+	T::PathBuilder: FedPath,
 {
 	let url = request.url().clone();
 	let method = request.method().clone();
 
 	debug!(?method, ?url, "Sending request");
+	let limit = self.services.server.config.max_response_size;
+
 	match client.execute(request).await {
-		| Ok(response) => handle_response::<T>(actual, dest, &method, &url, response).await,
+		| Ok(response) => handle_response::<T>(actual, dest, &method, &url, response, limit)
+			.await
+			.inspect_err(|error| self.evict_misrouted(dest, actual, error)),
 		| Err(error) => Err(self
 			.handle_error(dest, actual, &method, &url, error)
 			.expect_err("always returns error")),
@@ -113,6 +275,8 @@ where
 fn prepare<T>(&self, actual: &ActualDest, dest: &ServerName, request: T) -> Result<Request>
 where
 	T: OutgoingRequest + Send,
+	T::Authentication: FedAuth,
+	T::PathBuilder: FedPath,
 {
 	let request = self.to_http_request::<T>(actual, dest, request)?;
 	let request = Request::try_from(request)?;
@@ -140,11 +304,14 @@ async fn handle_response<T>(
 	method: &Method,
 	url: &Url,
 	response: Response,
+	limit: usize,
 ) -> Result<T::IncomingResponse>
 where
 	T: OutgoingRequest + Send,
+	T::Authentication: FedAuth,
+	T::PathBuilder: FedPath,
 {
-	let response = into_http_response(dest, actual, method, url, response).await?;
+	let response = into_http_response(dest, actual, method, url, response, limit).await?;
 
 	T::IncomingResponse::try_from_http_response(response)
 		.map_err(|e| err!(BadServerResponse("Server returned bad 200 response: {e:?}")))
@@ -156,6 +323,7 @@ async fn into_http_response(
 	method: &Method,
 	url: &Url,
 	mut response: Response,
+	limit: usize,
 ) -> Result<http::Response<Bytes>> {
 	let status = response.status();
 	trace!(
@@ -179,11 +347,7 @@ async fn into_http_response(
 
 	// TODO: handle timeout
 	trace!("Waiting for response body...");
-	let body = response
-		.bytes()
-		.await
-		.inspect_err(inspect_debug_log)
-		.unwrap_or_else(|_| Vec::new().into());
+	let body = read_response_capped(response, limit).await?;
 
 	let http_response = http_response_builder
 		.body(body)
@@ -225,10 +389,33 @@ fn handle_error(
 		debug_error!("{e:?}");
 	}
 
-	self.services.resolver.cache.del_destination(dest);
-	self.services.resolver.cache.del_override(dest);
+	self.evict_route(dest, actual);
 
 	Err(e.into())
+}
+
+// A non-JSON federation response means a proxy or CDN answered, not the
+// homeserver, so the cached route is stale; evict it as transport errors do.
+#[implement(super::Service)]
+fn evict_misrouted(&self, dest: &ServerName, actual: &ActualDest, error: &Error) {
+	let Error::Federation(_, response) = error else {
+		return;
+	};
+
+	if matches!(response.body, ErrorBody::NotJson { .. }) {
+		self.evict_route(dest, actual);
+	}
+}
+
+// Overrides are keyed by the resolved (delegated/SRV) hostname, so evict under
+// the key resolution wrote (`actual.dest.hostname()`), not the origin name.
+#[implement(super::Service)]
+fn evict_route(&self, dest: &ServerName, actual: &ActualDest) {
+	self.services.resolver.cache.del_destination(dest);
+	self.services
+		.resolver
+		.cache
+		.del_override(&actual.dest.hostname());
 }
 
 #[implement(super::Service)]
@@ -240,92 +427,23 @@ fn to_http_request<T>(
 ) -> Result<http::Request<Vec<u8>>>
 where
 	T: OutgoingRequest + Send,
+	T::Authentication: FedAuth,
+	T::PathBuilder: FedPath,
 {
 	const VERSIONS: [MatrixVersion; 1] = [MatrixVersion::V1_11];
-	const SATIR: SendAccessToken<'_> = SendAccessToken::IfRequired(EMPTY);
 	let supported = SupportedVersions {
 		versions: VERSIONS.into(),
 		features: Default::default(),
 	};
 
-	let mut request = request
-		.try_into_http_request::<Vec<u8>>(actual.to_string().as_str(), SATIR, &supported)
-		.map_err(|e| err!(BadServerResponse("Invalid destination: {e:?}")))?;
+	let auth = T::Authentication::input(
+		self.services.server.name.clone(),
+		dest.to_owned(),
+		self.services.server_keys.keypair(),
+	);
+	let path = T::PathBuilder::input(&supported);
 
-	if matches!(T::METADATA.authentication, AuthScheme::ServerSignatures) {
-		self.sign_request(&mut request, dest);
-	}
-
-	Ok(request)
-}
-
-#[implement(super::Service)]
-fn sign_request(&self, http_request: &mut http::Request<Vec<u8>>, dest: &ServerName) {
-	type Member = (CanonicalJsonName, Value);
-	type Value = CanonicalJsonValue;
-	type Object = CanonicalJsonObject;
-
-	let origin = &self.services.server.name;
-	let body = http_request.body();
-	let uri = http_request
-		.uri()
-		.path_and_query()
-		.expect("http::Request missing path_and_query");
-
-	let mut req: Object = if !body.is_empty() {
-		let content: CanonicalJsonValue =
-			serde_json::from_slice(body).expect("failed to serialize body");
-
-		let authorization: [Member; 5] = [
-			("content".into(), content),
-			("destination".into(), dest.as_str().into()),
-			("method".into(), http_request.method().as_str().into()),
-			("origin".into(), origin.as_str().into()),
-			("uri".into(), uri.to_string().into()),
-		];
-
-		authorization.into()
-	} else {
-		let authorization: [Member; 4] = [
-			("destination".into(), dest.as_str().into()),
-			("method".into(), http_request.method().as_str().into()),
-			("origin".into(), origin.as_str().into()),
-			("uri".into(), uri.to_string().into()),
-		];
-
-		authorization.into()
-	};
-
-	self.services
-		.server_keys
-		.sign_json(&mut req)
-		.expect("request signing failed");
-
-	let signatures = req["signatures"]
-		.as_object()
-		.and_then(|object| object[origin.as_str()].as_object())
-		.expect("origin signatures object");
-
-	let key: &ServerSigningKeyId = signatures
-		.keys()
-		.next()
-		.map(|k| k.as_str().try_into())
-		.expect("at least one signature from this origin")
-		.expect("keyid is json string");
-
-	let sig: Base64 = signatures
-		.values()
-		.next()
-		.map(|s| s.as_str().map(Base64::parse))
-		.expect("at least one signature from this origin")
-		.expect("signature is json string")
-		.expect("signature is valid base64");
-
-	let x_matrix = XMatrix::new(origin.into(), dest.into(), key.into(), sig);
-	let authorization = HeaderValue::from(&x_matrix);
-	let authorization = http_request
-		.headers_mut()
-		.insert(AUTHORIZATION, authorization);
-
-	debug_assert!(authorization.is_none(), "Authorization header already present");
+	request
+		.try_into_http_request::<Vec<u8>>(actual.to_string().as_str(), auth, path)
+		.map_err(|e| err!(BadServerResponse("Invalid destination: {e:?}")))
 }

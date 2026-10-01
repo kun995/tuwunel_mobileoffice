@@ -1,4 +1,7 @@
-mod commands;
+mod list;
+mod register;
+mod show_config;
+mod unregister;
 
 use clap::Subcommand;
 use tuwunel_core::Result;
@@ -6,7 +9,7 @@ use tuwunel_core::Result;
 use crate::admin_command_dispatch;
 
 #[derive(Debug, Subcommand)]
-#[admin_command_dispatch]
+#[admin_command_dispatch(handler_prefix = "appservice")]
 pub(super) enum AppserviceCommand {
 	/// - Register an appservice using its registration YAML
 	///
@@ -29,12 +32,11 @@ pub(super) enum AppserviceCommand {
 	///
 	/// You can find the ID using the `list-appservices` command.
 	#[clap(alias("show"))]
-	ShowAppserviceConfig {
+	ShowConfig {
 		/// The appservice to show
 		appservice_identifier: String,
 	},
 
 	/// - List all the currently registered appservices
-	#[clap(alias("list"))]
-	ListRegistered,
+	List,
 }

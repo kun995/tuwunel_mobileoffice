@@ -17,6 +17,15 @@ release [here](https://github.com/matrix-construct/tuwunel/releases/latest) or
 `main` CI branch workflow artifact output. These also include `.deb` packages
 for Debian or Ubuntu and `.rpm` packages for Red Hat or Fedora.
 
+Debian and Ubuntu users can instead install and update Tuwunel through the
+apt repository; see the [Debian guide](debian.md) for setup.
+
+The static binaries do not bundle CA certificates. Federation and every other
+outbound HTTPS request uses the system trust store, so the host needs a CA
+bundle installed (`ca-certificates` on Debian and Ubuntu). When running the
+binary in a minimal image or a chroot, mount the bundle in or set
+`SSL_CERT_FILE` to its path.
+
 For the **best** performance; if using an `x86_64` CPU made in the last ~10 years,
 we recommend using the `-v3-` optimised packages. See below for a command to check
 what your system supports. If the server refuses to start or exits with an "Illegal
@@ -49,6 +58,20 @@ If wanting to build using standard Rust toolchains, make sure you install:
 
 You can build Tuwunel using `cargo build --release --all-features`
 
+A plain build targets the baseline architecture, which is the `-v1-` equivalent
+and gets RocksDB's software CRC32C. Pass `-C target-cpu=` to get the hardware
+implementation the `-v2-` and `-v3-` packages use: `native` when the binary
+stays on the machine that built it, or a named architecture such as `broadwell`
+when it does not.
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo build --release --all-features
+```
+
+Add `--locked` to build against the committed `Cargo.lock`. Without it Cargo
+re-resolves the whole dependency graph, which is not the combination that gets
+tested.
+
 ## Adding a Tuwunel user
 
 While Tuwunel can run as any user it is better to use dedicated users for
@@ -73,7 +96,7 @@ Matrix's default federation port is port 8448, and clients must be using port 44
 If you would like to use only port 443, or a different port, you will need to setup
 delegation. Tuwunel has config options for doing delegation, or you can configure
 your reverse proxy to manually serve the necessary JSON files to do delegation
-(see the `[global.well_known]` config section).
+(see the `[global.well_known]` config section and the [delegation example](root-domain-delegation.md)).
 
 If Tuwunel runs behind a router or in a container and has a different public
 IP address than the host system these public ports need to be forwarded directly
@@ -98,6 +121,47 @@ binary if it is not `/usr/bin/tuwunel`.
 On systems where rsyslog is used alongside journald (i.e. Red Hat-based distros
 and OpenSUSE), put `$EscapeControlCharactersOnReceive off` inside
 `/etc/rsyslog.conf` to allow color in logs.
+
+When running as a systemd service, Tuwunel submits its logs directly to
+journald with each entry's severity preserved as the journal priority, so
+`journalctl --priority warning` catches Tuwunel's warnings and errors. Each
+entry carries the same formatted message as the console output, span fields
+included, and thread ids when `log_thread_ids` is enabled. The target and
+source location are attached as journal fields, and every tracing field is
+recorded under an `F_` prefix, so a single room or event can be pulled out of
+the journal directly:
+
+```bash
+journalctl -u tuwunel F_ROOM_ID='!room:example.com'
+```
+
+Set `log_journald = false` in the config to write plain console output instead.
+A unit that sends its output to a terminal rather than the journal, as the Arch
+unit does for the interactive admin console, needs that setting to keep showing
+log lines there.
+
+The packages also ship a `tuwunel.socket` unit, disabled by default, for
+letting systemd open the listening socket instead. That is what allows the
+server to answer on a privileged port such as 443 or 8448 while holding no
+capability of its own. See [systemd socket activation](socket-activation.md).
+
+The first boot after an upgrade can run a one-time database migration, and the
+listener does not open until it finishes. While one is running the unit stays
+in `activating` and its status line names the step, how far into it the server
+is, and how long it has been going, so `systemctl status tuwunel` answers
+whether anything is happening:
+
+```
+     Active: activating (start) since Thu 2026-08-27 14:10:47 UTC; 12min ago
+     Status: "retroactively_fix_bad_data_from_roomuserid_joined, 412 of 3100, 6.20 minutes"
+```
+
+The same line goes to the journal every fifteen seconds. A step reports a
+position without a total when it cannot count its remaining work without a
+second pass over the data; a position that keeps climbing is the signal that
+the migration is progressing. Do not kill the server to interrupt one. A stop
+request is honored between steps and the steps that finished are recorded, so
+the migration resumes on the next start.
 
 If you are using a different `database_path` other than the systemd unit
 configured default `/var/lib/tuwunel`, you need to add your path to the
@@ -158,13 +222,35 @@ Regardless of which reverse proxy you choose, you will need to:
    - `/_tuwunel/` - ad-hoc Tuwunel routes such as `/local_user_count` and `/server_version`
 
 2. **Optionally reverse proxy (recommended):**
-   - `/.well-known/matrix/client` and `/.well-known/matrix/server` if using Tuwunel to perform delegation (see the `[global.well_known]` config section)
+   - `/_synapse/admin/` if you use administration dashboards such as synapse-admin or moderation bots; see the [Synapse Admin API](../development/compliance/synapse-admin.md) page for the served endpoints. Most require an administrator access token. The exception is the `/_synapse/admin/v1/register` pair, which authenticates by HMAC over `registration_shared_secret` instead of a token and is served only while that secret is configured, so anyone holding it can create accounts. Restrict this path to trusted networks
+   - `/_synapse/mas/` if the Matrix Authentication Service reaches Tuwunel through the reverse proxy rather than directly; these endpoints reject every request not bearing the configured `mas_secret`
+   - `/.well-known/matrix/client` and `/.well-known/matrix/server` if using Tuwunel to perform delegation (see the `[global.well_known]` config section and the [delegation example](root-domain-delegation.md))
    - `/.well-known/matrix/support` if using Tuwunel to send the homeserver admin contact and support page (formerly known as MSC1929)
    - `/` if you would like to see `hewwo from tuwunel woof!` at the root
 
 3. **Handle ports:**
    - Port 443 (HTTPS) for client-server API
    - Port 8448 for federation (if federating with other homeservers)
+
+### Client IP source
+
+Set `ip_source` when you want Tuwunel to use a spoofing-resistant client IP
+source for rate limiting, logging, and security tooling. Leave it unset to keep
+the legacy fallback behavior.
+
+Use `ip_source = "connect_info"` only when Tuwunel accepts direct TCP
+connections and should use the TCP peer address. Do not use `connect_info` for
+Unix-socket deployments; leave `ip_source` unset there.
+
+If Tuwunel is behind a trusted reverse proxy, set `ip_source` to match the
+header that proxy controls. Caddy, Nginx, and Traefik usually use
+`ip_source = "rightmost_x_forwarded_for"`. Cloudflare and cloudflared
+deployments can use `ip_source = "cf_connecting_ip"` when Cloudflare supplies
+that header.
+
+Only use header-based values when clients cannot connect to Tuwunel directly.
+If clients can reach Tuwunel without going through the trusted proxy, they can
+send forged forwarding headers and choose the IP address Tuwunel sees.
 
 See the following spec pages for more details on well-known files:
 - [`/.well-known/matrix/server`](https://spec.matrix.org/latest/client-server-api/#getwell-knownmatrixserver)
@@ -224,7 +310,7 @@ if the port 8448 is open and forwarded correctly.
 
 ## Audio/Video calls
 
-For Audio/Video call functionality see the [TURN Guide](../turn.md).
+For Audio/Video call functionality see the [TURN Guide](../calls/turn.md).
 
 ## Appservices
 

@@ -5,7 +5,10 @@ use rocksdb::{
 };
 use tuwunel_core::{Config, Result, err, utils::math::Expected};
 
-use super::descriptor::{CacheDisp, Descriptor};
+use super::{
+	context::{ColCache, ColCaches, SHARED_POOL},
+	descriptor::{CacheDisp, Descriptor},
+};
 use crate::{Context, util::map_err};
 
 pub(super) const SENTINEL_COMPRESSION_LEVEL: i32 = 32767;
@@ -26,6 +29,7 @@ fn descriptor_cf_options(
 	cache: Option<&Cache>,
 ) -> Result<Options> {
 	set_compression(&mut desc, config);
+	set_preview_retention(&mut desc, config.url_preview_cache_ttl);
 	set_table_options(&mut opts, &desc, cache)?;
 
 	opts.set_min_write_buffer_number(1);
@@ -35,6 +39,7 @@ fn descriptor_cf_options(
 	opts.set_target_file_size_base(desc.file_size);
 	opts.set_target_file_size_multiplier(desc.file_shape);
 
+	opts.set_max_compaction_bytes(desc.compaction_size);
 	opts.set_level_zero_file_num_compaction_trigger(desc.level0_width);
 	opts.set_level_compaction_dynamic_level_bytes(false);
 	opts.set_ttl(desc.ttl);
@@ -115,6 +120,11 @@ fn set_table_options(opts: &mut Options, desc: &Descriptor, cache: Option<&Cache
 }
 
 fn set_compression(desc: &mut Descriptor, config: &Config) {
+	// A column opting out of compression is never overridden by the config.
+	if desc.compression == CompressionType::None {
+		return;
+	}
+
 	desc.compression = match config.rocksdb_compression_algo.as_ref() {
 		| "snappy" => CompressionType::Snappy,
 		| "zlib" => CompressionType::Zlib,
@@ -145,9 +155,24 @@ fn set_compression(desc: &mut Descriptor, config: &Config) {
 	}
 }
 
+/// Raise the preview columns' FIFO ttl to the configured preview lifetime
+/// when it exceeds their floor.
+///
+/// A preview evicted before it expires is fetched from the origin again, and
+/// one whose lazy media mapping went with it serves an `mxc://` URI that no
+/// longer resolves, so the configured lifetime raises both columns. Only the
+/// time arm moves: `limit_size` still caps each column, and evicts oldest
+/// first once reached.
+pub(super) fn set_preview_retention(desc: &mut Descriptor, configured: u64) {
+	if matches!(desc.name, "url_preview" | "mediaid_lazy") {
+		desc.ttl = desc.ttl.max(configured);
+	}
+}
+
 fn fifo_options(desc: &Descriptor) -> FifoCompactOptions {
 	let mut opts = FifoCompactOptions::default();
 	opts.set_max_table_files_size(desc.limit_size);
+	opts.set_allow_compaction(true);
 
 	opts
 }
@@ -195,19 +220,23 @@ fn get_cache(ctx: &Context, desc: &Descriptor) -> Option<Cache> {
 		return None;
 	}
 
-	// Some cache capacities are overridden by server config in a strange but
-	// legacy-compat way
+	// Capacity is configured in entries, converted to bytes against the
+	// descriptor's size hints; the lookup by column name is legacy-compat.
 	let config = &ctx.server.config;
 	let cap = match desc.name {
 		| "eventid_pduid" => Some(config.eventid_pdu_cache_capacity),
 		| "eventid_shorteventid" => Some(config.eventidshort_cache_capacity),
+		| "eventid_backoff" => Some(config.eventid_backoff_cache_capacity),
 		| "shorteventid_eventid" => Some(config.shorteventid_cache_capacity),
 		| "shortstatekey_statekey" => Some(config.shortstatekey_cache_capacity),
 		| "statekey_shortstatekey" => Some(config.statekeyshort_cache_capacity),
 		| "servernameevent_data" => Some(config.servernameevent_data_cache_capacity),
+		| "servername_destination" | "servername_override" =>
+			Some(config.resolver_cache_capacity),
+		| "servername_status" => Some(config.servername_status_cache_capacity),
+		| "mediaid_lazycontent" => Some(config.mediaid_lazycontent_cache_capacity),
 		| "pduid_pdu" | "eventid_outlierpdu" => Some(config.pdu_cache_capacity),
-		| "shorteventid_authchain" | "authchainkey_authchain" =>
-			Some(config.auth_chain_cache_capacity),
+		| "authchainkey_authchain" => Some(config.auth_chain_cache_capacity),
 		| _ => None,
 	}
 	.map(TryInto::try_into)
@@ -236,33 +265,52 @@ fn get_cache(ctx: &Context, desc: &Descriptor) -> Option<Cache> {
 	cache_opts.set_capacity(size);
 
 	let mut caches = ctx.col_cache.lock().expect("locked");
+	register_pool(&mut caches, desc, || Cache::new_lru_cache_opts(&cache_opts))
+}
+
+/// Returns the cache for `desc`'s pool; `build_cache` is invoked only when a
+/// new pool must be created.
+pub(crate) fn register_pool(
+	caches: &mut ColCaches,
+	desc: &Descriptor,
+	build_cache: impl FnOnce() -> Cache,
+) -> Option<Cache> {
 	match desc.cache_disp {
 		| CacheDisp::Unique if desc.cache_size == 0 => None,
 		| CacheDisp::Unique => {
-			let cache = Cache::new_lru_cache_opts(&cache_opts);
-			caches.insert(desc.name.into(), cache.clone());
+			let cache = build_cache();
+			caches.insert(desc.name, ColCache {
+				cache: cache.clone(),
+				participants: vec![desc.name],
+			});
+
 			Some(cache)
 		},
 
-		| CacheDisp::SharedWith(other) if !caches.contains_key(other) => {
-			let cache = Cache::new_lru_cache_opts(&cache_opts);
-			caches.insert(desc.name.into(), cache.clone());
-			Some(cache)
+		| CacheDisp::SharedWith(other) => Some(match caches.get_mut(other) {
+			| Some(pool) => {
+				pool.participants.push(desc.name);
+				pool.cache.clone()
+			},
+			| None => {
+				let new = build_cache();
+				caches.insert(desc.name, ColCache {
+					cache: new.clone(),
+					participants: vec![desc.name],
+				});
+
+				new
+			},
+		}),
+
+		| CacheDisp::Shared => {
+			let pool = caches
+				.get_mut(SHARED_POOL)
+				.expect("shared cache must already exist");
+
+			pool.participants.push(desc.name);
+			Some(pool.cache.clone())
 		},
-
-		| CacheDisp::SharedWith(other) => Some(
-			caches
-				.get(other)
-				.cloned()
-				.expect("caches.contains_key(other) must be true"),
-		),
-
-		| CacheDisp::Shared => Some(
-			caches
-				.get("Shared")
-				.cloned()
-				.expect("shared cache must already exist"),
-		),
 	}
 }
 

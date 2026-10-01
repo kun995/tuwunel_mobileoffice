@@ -1,3 +1,4 @@
+mod adopt;
 pub mod association;
 
 use std::{
@@ -11,17 +12,30 @@ use ruma::{OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
 use tuwunel_core::{
 	Err, Result, at, implement,
-	utils::stream::{IterStream, ReadyExt, TryExpect},
+	itertools::Itertools,
+	result::NotFound,
+	utils::{
+		MutexMap,
+		stream::{IterStream, ReadyExt, TryExpect},
+	},
 };
-use tuwunel_database::{Cbor, Deserialized, Ignore, Map};
+use tuwunel_database::{Cbor, Database, Deserialized, Ignore, Map};
 use url::Url;
 
-use super::{Provider, Providers, UserInfo, unique_id};
+pub use self::adopt::Counts;
+use super::{Provider, Providers, UserInfo, unique_id as session_unique_id};
 use crate::SelfServices;
 
 pub struct Sessions {
-	_services: SelfServices,
+	services: SelfServices,
 	association_pending: Mutex<association::Pending>,
+
+	/// Serializes probes and writes for each unique identity.
+	///
+	/// Transaction batches cannot conditionally claim an index key. Each
+	/// identity therefore has an independent critical section.
+	write_locks: MutexMap<String, ()>,
+
 	providers: Arc<Providers>,
 	db: Data,
 }
@@ -30,14 +44,14 @@ struct Data {
 	oauthid_session: Arc<Map>,
 	oauthuniqid_oauthid: Arc<Map>,
 	userid_oauthid: Arc<Map>,
+	database: Arc<Database>,
 }
 
-/// Session ultimately represents an OAuth authorization session yielding an
-/// associated matrix user registration.
+/// Persistent state for one upstream OAuth authorization.
 ///
-/// Mixed-use structure capable of deserializing response values, maintaining
-/// the state between authorization steps, and maintaining the association to
-/// the matrix user until deactivation or revocation.
+/// The record carries provider, redirect, PKCE, nonce, and token data across
+/// the authorization flow. Once linked, it also associates the provider
+/// identity with a Matrix user.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Session {
 	/// Identity Provider ID (the `client_id` in the configuration) associated
@@ -52,6 +66,9 @@ pub struct Session {
 
 	/// Access token to the provider.
 	pub access_token: Option<String>,
+
+	/// OIDC ID token returned by the provider.
+	pub id_token: Option<String>,
 
 	/// Duration in seconds the access_token is valid for.
 	pub expires_in: Option<u64>,
@@ -106,26 +123,78 @@ pub const SESSION_ID_LENGTH: usize = 32;
 #[implement(Sessions)]
 pub(super) fn build(args: &crate::Args<'_>, providers: Arc<Providers>) -> Self {
 	Self {
-		_services: args.services.clone(),
+		services: args.services.clone(),
 		association_pending: Default::default(),
+		write_locks: MutexMap::new(),
 		providers,
 		db: Data {
 			oauthid_session: args.db["oauthid_session"].clone(),
 			oauthuniqid_oauthid: args.db["oauthuniqid_oauthid"].clone(),
 			userid_oauthid: args.db["userid_oauthid"].clone(),
+			database: args.db.clone(),
 		},
 	}
 }
 
 /// Delete database state for the session.
+///
+/// The canonical session and every association index that still refers to it
+/// commit together.
 #[implement(Sessions)]
 #[tracing::instrument(level = "debug", skip(self))]
 pub async fn delete(&self, sess_id: &str) {
-	let Ok(session) = self.get(sess_id).await else {
-		return;
+	let (session, unique_id, _write_guard) = loop {
+		let Ok(snapshot) = self.get(sess_id).await else {
+			return;
+		};
+
+		let provider = async {
+			let idp_id = snapshot.idp_id.as_deref()?;
+
+			self.providers.get(idp_id).map(Result::ok).await
+		}
+		.await;
+
+		let unique_id = provider
+			.as_ref()
+			.and_then(|provider| session_unique_id((provider, &snapshot)).ok());
+
+		let write_guard = match unique_id.as_deref() {
+			| Some(unique_id) => Some(self.write_locks.lock(unique_id).await),
+			| None => None,
+		};
+
+		let Ok(session) = self.get(sess_id).await else {
+			return;
+		};
+
+		if session.idp_id.as_deref() != snapshot.idp_id.as_deref() {
+			continue;
+		}
+
+		let current_unique_id = provider
+			.as_ref()
+			.and_then(|provider| session_unique_id((provider, &session)).ok());
+
+		if current_unique_id == unique_id {
+			break (session, unique_id, write_guard);
+		}
 	};
 
-	if let Some(user_id) = session.user_id.as_deref() {
+	// Preserve a unique identity association updated to a newer session.
+	let unique_id = async {
+		let unique_id = unique_id.as_deref()?;
+		let assoc_id = self
+			.get_sess_id_by_unique_id(unique_id)
+			.map(Result::ok)
+			.await?;
+
+		(assoc_id == sess_id).then_some(unique_id)
+	}
+	.await;
+
+	let user_sessions = async {
+		let user_id = session.user_id.as_deref()?;
 		let sess_ids: Vec<_> = self
 			.get_sess_id_by_user(user_id)
 			.ready_filter_map(Result::ok)
@@ -133,64 +202,124 @@ pub async fn delete(&self, sess_id: &str) {
 			.collect()
 			.await;
 
+		Some((user_id, sess_ids))
+	}
+	.await;
+
+	let mut txn = self.db.database.txn();
+
+	if let Some((user_id, sess_ids)) = user_sessions {
 		if !sess_ids.is_empty() {
-			self.db.userid_oauthid.raw_put(user_id, sess_ids);
+			txn.raw_put(&self.db.userid_oauthid, user_id, sess_ids);
 		} else {
-			self.db.userid_oauthid.remove(user_id);
+			txn.del_raw(&self.db.userid_oauthid, user_id);
 		}
 	}
 
-	// Check the unique identity still points to this sess_id before deleting. If
-	// not, the association was updated to a newer session.
-	if let Some(idp_id) = session.idp_id.as_ref()
-		&& let Ok(provider) = self.providers.get(idp_id).await
-		&& let Ok(unique_id) = unique_id((&provider, &session))
-		&& let Ok(assoc_id) = self.get_sess_id_by_unique_id(&unique_id).await
-		&& assoc_id == sess_id
-	{
-		self.db.oauthuniqid_oauthid.remove(&unique_id);
+	if let Some(unique_id) = unique_id {
+		txn.del_raw(&self.db.oauthuniqid_oauthid, unique_id);
 	}
 
-	self.db.oauthid_session.remove(sess_id);
+	txn.del_raw(&self.db.oauthid_session, sess_id);
+	txn.execute();
 }
 
 /// Create or overwrite database state for the session.
+///
+/// The canonical session and its available identity and user indexes commit
+/// together.
 #[implement(Sessions)]
 #[tracing::instrument(level = "info", skip(self))]
 pub async fn put(&self, session: &Session) {
+	let unique_id = async {
+		let idp_id = session.idp_id.as_ref()?;
+		let provider = self.providers.get(idp_id).map(Result::ok).await?;
+
+		session_unique_id((&provider, session)).ok()
+	}
+	.await;
+
+	let _write_guard = match unique_id.as_deref() {
+		| Some(unique_id) => Some(self.write_locks.lock(unique_id).await),
+		| None => None,
+	};
+
+	self.put_locked(session, unique_id.as_deref())
+		.await;
+}
+
+/// Build and commit a session while exclusively claiming its identity key.
+///
+/// The callback's identity lookup and user selection remain ordered with bulk
+/// adoption until the canonical session and indexes have committed.
+#[implement(Sessions)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn commit_identity_session<T, F, Fut>(
+	&self,
+	unique_id: &str,
+	build: F,
+) -> Result<(Session, T, Option<SessionId>)>
+where
+	T: Send,
+	F: FnOnce(Option<OwnedUserId>) -> Fut + Send,
+	Fut: Future<Output = Result<(Session, T)>> + Send,
+{
+	let write_guard = self.write_locks.lock(unique_id).await;
+	let existing = self
+		.get_by_unique_id(unique_id)
+		.await
+		.optional()?;
+
+	let old_sess_id = existing
+		.as_ref()
+		.and_then(|session| session.sess_id.clone());
+
+	let old_user_id = existing.and_then(|session| session.user_id);
+	let (session, value) = build(old_user_id).await?;
+
+	self.put_locked(&session, Some(unique_id)).await;
+	drop(write_guard);
+
+	Ok((session, value, old_sess_id))
+}
+
+#[implement(Sessions)]
+async fn put_locked(&self, session: &Session, unique_id: Option<&str>) {
 	let sess_id = session
 		.sess_id
 		.as_deref()
 		.expect("Missing session.sess_id required for sessions.put()");
 
-	self.db
-		.oauthid_session
-		.raw_put(sess_id, Cbor(session));
-
-	if let Some(idp_id) = session.idp_id.as_ref()
-		&& let Ok(provider) = self.providers.get(idp_id).await
-		&& let Ok(unique_id) = unique_id((&provider, session))
-	{
-		self.db
-			.oauthuniqid_oauthid
-			.insert(&unique_id, sess_id);
-	}
-
-	if let Some(user_id) = session.user_id.as_deref() {
-		let sess_ids = self
+	let user_sessions = async {
+		let user_id = session.user_id.as_deref()?;
+		let sess_ids: Vec<_> = self
 			.get_sess_id_by_user(user_id)
 			.ready_filter_map(Result::ok)
 			.chain(once(sess_id.to_owned()).stream())
 			.collect::<Vec<_>>()
-			.map(|mut ids| {
-				ids.sort_unstable();
-				ids.dedup();
-				ids
-			})
+			.map(IntoIterator::into_iter)
+			.map(Itertools::sorted_unstable)
+			.map(Itertools::dedup)
+			.map(Iterator::collect)
 			.await;
 
-		self.db.userid_oauthid.raw_put(user_id, sess_ids);
+		Some((user_id, sess_ids))
 	}
+	.await;
+
+	let mut txn = self.db.database.txn();
+
+	txn.raw_put(&self.db.oauthid_session, sess_id, Cbor(session));
+
+	if let Some(unique_id) = unique_id {
+		txn.insert_raw(&self.db.oauthuniqid_oauthid, unique_id, sess_id);
+	}
+
+	if let Some((user_id, sess_ids)) = user_sessions {
+		txn.raw_put(&self.db.userid_oauthid, user_id, sess_ids);
+	}
+
+	txn.execute();
 }
 
 /// Fetch database state for a session from its associated `(iss,sub)`, in case

@@ -5,6 +5,7 @@ on:
     secrets:
       ghcr_token:
       dockerhub_token:
+      apt_ssh_key:
     inputs:
       cargo_profiles:
         type: string
@@ -40,13 +41,19 @@ on:
         description: Matrix inclusions
       checkout:
         type: string
-        default: 'HEAD'
+        default: ${{github.sha}}
       docker_repo:
         type: string
         description: DockerHub Repository
       docker_acct:
         type: string
         description: DockerHub account name
+      apt_ssh_dest:
+        type: string
+        description: Apt repository ssh destination
+      apt_ssh_hostkey:
+        type: string
+        description: Apt repository ssh host key
       release_url:
         type: string
         description: For release assets
@@ -74,8 +81,31 @@ jobs:
 
     steps:
       - id: book
-        name: Book
-        uses: actions/deploy-pages@v4
+        name: Fetch Book
+        uses: actions/download-artifact@v8
+        with:
+          name: release-all-x86_64-v1-linux-gnu-book
+          path: pages
+
+      - id: docs
+        name: Fetch Docs
+        uses: actions/download-artifact@v8
+        with:
+          name: release-all-x86_64-v1-linux-gnu-docs
+          path: pages/book
+
+      - id: store
+        name: Store Pages
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: pages/book
+          name: github-pages-${{github.run_attempt}}
+
+      - id: deploy
+        name: Deploy Pages
+        uses: actions/deploy-pages@v5
+        with:
+          artifact_name: github-pages-${{github.run_attempt}}
 
   containers:
     if: >
@@ -103,21 +133,22 @@ jobs:
         include: ${{fromJSON(inputs.includes)}}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
-          persist-credentials: false
-          fetch-depth: 0
+          ref: ${{inputs.checkout || github.sha}}
+          fetch-depth: 1
           fetch-tags: true
+          persist-credentials: false
 
       - name: GitHub Login
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.ghcr_token }}
 
       - name: DockerHub Login
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: docker.io
           username: ${{ inputs.docker_acct }}
@@ -173,14 +204,14 @@ jobs:
 
     steps:
       - name: GitHub Login
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.ghcr_token }}
 
       - name: DockerHub Login
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: docker.io
           username: ${{ inputs.docker_acct }}
@@ -244,6 +275,7 @@ jobs:
           !failure() && !cancelled()
           && contains(github.ref, 'refs/tags/v')
           && !contains(github.ref, '-draft')
+          && !contains(github.ref, '-pre')
           && !contains(github.ref, '-rc')
 
         env:
@@ -267,27 +299,63 @@ jobs:
           docker manifest create "${registry}/${repo}:latest" \
             --amend "${registry}/${repo}:${ref_name}-${cargo_profile}-${feat_set}-${sys_target}"
 
-  delivery:
+  apt:
     if: >
       !failure() && !cancelled()
+      && inputs.apt_ssh_dest != ''
+      && contains(github.ref, 'refs/tags/v')
+      && !contains(github.ref, '-draft')
+      && !contains(github.ref, '-pre')
+      && !contains(github.ref, '-rc')
+
+    name: Apt Repository
+    runs-on: 'het'
+    timeout-minutes: 10
+    steps:
+      - name: Publish Release
+        env:
+          ref_name: ${{github.ref_name}}
+          ssh_dest: ${{inputs.apt_ssh_dest}}
+          ssh_hostkey: ${{inputs.apt_ssh_hostkey}}
+          deploy_key: ${{secrets.apt_ssh_key}}
+
+        run: |
+          if [ -z "$deploy_key" ]; then
+            echo "apt_ssh_key secret is not set; skipping"
+            exit 0
+          fi
+          key="$(mktemp)"
+          hosts="$(mktemp)"
+          trap 'shred -u "$key"; rm -f "$hosts"' EXIT
+          printf '%s\n' "$deploy_key" > "$key"
+          printf '%s\n' "$ssh_hostkey" > "$hosts"
+          ssh -i "$key" -o UserKnownHostsFile="$hosts" -o IdentitiesOnly=yes \
+            -o BatchMode=yes -o ConnectTimeout=30 \
+            "$ssh_dest" "$ref_name"
+
+  delivery:
+    if: >
+      !cancelled()
+      && needs.bundles.result == 'success'
+      && needs.documents.result != 'failure'
       && inputs.machines
       && inputs.docker_repo != ''
       && (github.ref == 'refs/heads/main' || contains(github.ref, 'refs/tags/v'))
 
     name: Delivery
-    needs: [bundles, documents]
+    needs: [bundles, documents, apt]
     runs-on: 'het'
     permissions: write-all
     steps:
       - name: GitHub Login
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.ghcr_token }}
 
       - name: DockerHub Login
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: docker.io
           username: ${{ inputs.docker_acct }}
@@ -326,6 +394,7 @@ jobs:
           !failure() && !cancelled()
           && contains(github.ref, 'refs/tags/v')
           && !contains(github.ref, '-draft')
+          && !contains(github.ref, '-pre')
           && !contains(github.ref, '-rc')
 
         env:

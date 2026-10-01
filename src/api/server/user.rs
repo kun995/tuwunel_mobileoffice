@@ -1,11 +1,14 @@
 use axum::extract::State;
-use futures::{FutureExt, StreamExt, TryFutureExt, future::join4};
+use futures::{FutureExt, StreamExt, TryFutureExt, future::join3};
 use ruma::{
 	UserId,
 	api::{
 		client::device::Device,
 		federation::{
-			device::get_devices::{self, v1::UserDevice},
+			device::get_devices::{
+				self,
+				v1::{Response as GetDevicesResponse, UserDevice},
+			},
 			keys::{claim_keys, get_keys},
 		},
 	},
@@ -31,6 +34,13 @@ pub(crate) async fn get_devices_route(
 	}
 
 	let allowed_signatures = |u: &UserId| u.server_name() == body.origin();
+	let stream_id = services
+		.users
+		.get_devicelist_version(user_id)
+		.map_ok(TryInto::try_into)
+		.map_ok(Result::ok)
+		.ok()
+		.await;
 
 	let master_key = services
 		.users
@@ -40,13 +50,6 @@ pub(crate) async fn get_devices_route(
 	let self_signing_key = services
 		.users
 		.get_self_signing_key(None, user_id, &allowed_signatures)
-		.ok();
-
-	let stream_id = services
-		.users
-		.get_devicelist_version(user_id)
-		.map_ok(TryInto::try_into)
-		.map_ok(Result::ok)
 		.ok();
 
 	let devices = services
@@ -73,12 +76,12 @@ pub(crate) async fn get_devices_route(
 		})
 		.collect::<Vec<_>>();
 
-	let (stream_id, master_key, self_signing_key, devices) =
-		join4(stream_id, master_key, self_signing_key, devices)
-			.boxed()
-			.await;
+	// size firewall
+	let (master_key, self_signing_key, devices) = join3(master_key, self_signing_key, devices)
+		.boxed()
+		.await;
 
-	Ok(get_devices::v1::Response {
+	Ok(GetDevicesResponse {
 		user_id: body.body.user_id,
 		stream_id: stream_id.flatten().unwrap_or_else(|| uint!(0)),
 		devices,

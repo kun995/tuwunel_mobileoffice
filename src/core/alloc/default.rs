@@ -1,12 +1,13 @@
 //! Default allocator with no special features
 
-/// Always returns Ok
-pub fn trim<I: Into<Option<usize>>>(_: I) -> crate::Result { Ok(()) }
+use crate::Result;
+
+/// Reclaims unused pages from every initialized arena.
+///
+/// The default allocator exposes no reclamation facility, so nothing is purged
+/// and the call always succeeds.
+pub fn trim() -> Result { Ok(()) }
 
 /// Always returns None
 #[must_use]
 pub fn memory_stats(_opts: &str) -> Option<String> { None }
-
-/// Always returns None
-#[must_use]
-pub fn memory_usage() -> Option<String> { None }

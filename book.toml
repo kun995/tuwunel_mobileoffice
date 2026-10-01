@@ -26,6 +26,7 @@ edition = "2024"
 git-repository-url = "https://github.com/matrix-construct/tuwunel"
 edit-url-template = "https://github.com/matrix-construct/tuwunel/edit/main/{path}"
 git-repository-icon = "fab-github"
+additional-css = ["docs/override.css"]
 
 [output.html.search]
 limit-results = 15

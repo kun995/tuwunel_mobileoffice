@@ -1,11 +1,8 @@
-use std::{convert::AsRef, fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc};
 
-use futures::{
-	Future, FutureExt, TryFutureExt,
-	future::{Either, ready},
-};
+use futures::{FutureExt, TryFutureExt, future::ready};
 use rocksdb::{DBPinnableSlice, ReadOptions};
-use tokio::task;
+use tokio::task::consume_budget;
 use tuwunel_core::{Err, Result, err, implement, utils::result::MapExpect};
 
 use crate::{
@@ -13,8 +10,11 @@ use crate::{
 	util::{is_incomplete, map_err, or_else},
 };
 
-/// Fetch a value from the database into cache, returning a reference-handle
-/// asynchronously. The key is referenced directly to perform the query.
+/// Fetches a raw key asynchronously and returns a pinned value handle.
+///
+/// Cache results consume cooperative scheduler budget, while misses run on the
+/// engine's blocking pool. The returned handle keeps its RocksDB value storage
+/// pinned for the handle's lifetime.
 #[implement(super::Map)]
 #[tracing::instrument(skip(self, key), fields(%self), level = "trace")]
 pub fn get<K>(
@@ -28,9 +28,9 @@ where
 
 	let cached = self.get_cached(key);
 	if matches!(cached, Err(_) | Ok(Some(_))) {
-		return Either::Left(
-			task::consume_budget().map(move |()| cached.map_expect("data found in cache")),
-		);
+		return consume_budget()
+			.map(move |()| cached.map_expect("data found in cache"))
+			.left_future();
 	}
 
 	debug_assert!(matches!(cached, Ok(None)), "expected status Incomplete");
@@ -40,15 +40,17 @@ where
 		res: None,
 	};
 
-	Either::Right(
-		self.engine
-			.pool
-			.execute_get(cmd)
-			.and_then(|mut res| ready(res.remove(0))),
-	)
+	self.engine
+		.pool
+		.execute_get(cmd)
+		.and_then(|mut res| ready(res.remove(0)))
+		.right_future()
 }
 
-/// Fetch a value from the cache without I/O.
+/// Fetches a raw key from block cache without storage I/O.
+///
+/// A cache miss returns `Ok(None)`, while a cached absence or database failure
+/// remains an error.
 #[implement(super::Map)]
 #[tracing::instrument(skip(self, key), name = "cache", level = "trace")]
 pub(crate) fn get_cached<K>(&self, key: &K) -> Result<Option<Handle<'_>>>
@@ -59,9 +61,10 @@ where
 	cached_handle_from(res)
 }
 
-/// Fetch a value from the database into cache, returning a reference-handle.
-/// The key is referenced directly to perform the query. This is a thread-
-/// blocking call.
+/// Fetches a raw key synchronously and returns a pinned value handle.
+///
+/// The call may block on storage and populate RocksDB caches. The returned
+/// handle keeps its value storage pinned for the handle's lifetime.
 #[implement(super::Map)]
 #[tracing::instrument(skip(self, key), name = "blocking", level = "trace")]
 pub fn get_blocking<K>(&self, key: &K) -> Result<Handle<'_>>
@@ -72,6 +75,10 @@ where
 	handle_from(res)
 }
 
+/// Performs a pinned point read with explicit RocksDB read options.
+///
+/// The raw RocksDB result distinguishes absence from storage failure for the
+/// caller to classify.
 #[implement(super::Map)]
 fn get_blocking_opts<K>(
 	&self,
@@ -86,6 +93,10 @@ where
 		.get_pinned_cf_opt(&self.cf(), key, read_options)
 }
 
+/// Converts a RocksDB point-read result into a required value handle.
+///
+/// Missing values become the database not-found error, while RocksDB failures
+/// use the shared error mapping.
 #[inline]
 pub(super) fn handle_from(
 	result: Result<Option<DBPinnableSlice<'_>>, rocksdb::Error>,
@@ -96,6 +107,10 @@ pub(super) fn handle_from(
 		.ok_or(err!(Request(NotFound("Not found in database"))))
 }
 
+/// Classifies a block-cache point-read result.
+///
+/// `Ok(None)` represents a cache miss, a cached absence becomes not-found, and
+/// other RocksDB failures use the shared error mapping.
 #[inline]
 pub(super) fn cached_handle_from(
 	result: Result<Option<DBPinnableSlice<'_>>, rocksdb::Error>,

@@ -1,6 +1,4 @@
-#![type_length_limit = "32768"] //TODO: reduce me
-#![expect(clippy::duration_suboptimal_units)] // remove after MSRV 1.91
-
+mod handle;
 mod layers;
 mod request;
 mod router;
@@ -9,7 +7,7 @@ mod serve;
 
 use std::{panic::AssertUnwindSafe, pin::Pin, sync::Arc};
 
-use futures::{Future, FutureExt, TryFutureExt};
+use futures::{FutureExt, TryFutureExt};
 use log as _;
 use tuwunel_core::{Error, Result, Server};
 use tuwunel_service::Services;

@@ -1,7 +1,12 @@
+//! Encodes room state snapshots as compact parent-linked deltas.
+//!
+//! Each state entry combines a short state key with a short event ID in a
+//! fixed-width record. Reconstructed parent chains are cached to make repeated
+//! state resolution inexpensive while bounding persistent diff depth.
+
 use std::{
 	collections::{BTreeSet, HashMap},
 	fmt::{Debug, Write},
-	mem::size_of,
 	sync::{Arc, Mutex},
 };
 
@@ -15,11 +20,17 @@ use tuwunel_core::{
 	at, checked, err, expected, implement, utils,
 	utils::{bytes, math::usize_from_f64, stream::IterStream},
 };
-use tuwunel_database::Map;
+use tuwunel_database::{Map, Txn};
 
 use crate::rooms::short::{ShortEventId, ShortId, ShortStateHash, ShortStateKey};
 
+/// Persists, reconstructs, and caches compressed room state snapshots.
+///
+/// New snapshots are stored as bounded delta chains and flattened when their
+/// depth or relative size becomes inefficient. Cached chain entries include
+/// both each frame's delta and its fully materialized state.
 pub struct Service {
+	/// Reconstructed state chains keyed by their requested short state hash.
 	pub stateinfo_cache: Mutex<StateInfoLruCache>,
 	db: Data,
 	services: Arc<crate::services::OnceServices>,
@@ -29,25 +40,55 @@ struct Data {
 	shortstatehash_statediff: Arc<Map>,
 }
 
+/// One state as a delta against a parent state.
+///
+/// `added` and `removed` are the compressed entries this state adds to and
+/// removes from its parent chain's accumulation; a `None` parent makes
+/// `added` the full state.
 #[derive(Clone)]
-struct StateDiff {
-	parent: Option<ShortStateHash>,
-	added: Arc<CompressedState>,
-	removed: Arc<CompressedState>,
+pub(crate) struct StateDiff {
+	/// Parent snapshot against which this delta is applied, if any.
+	pub(crate) parent: Option<ShortStateHash>,
+
+	/// Compressed entries added to the parent snapshot.
+	pub(crate) added: Arc<CompressedState>,
+
+	/// Compressed entries removed from the parent snapshot.
+	pub(crate) removed: Arc<CompressedState>,
 }
 
+/// Describes one materialized frame in a compressed state chain.
+///
+/// Frames are ordered from the root snapshot toward the requested snapshot.
+/// Each frame retains its local delta alongside the resulting full state.
 #[derive(Clone, Default)]
 pub struct ShortStateInfo {
+	/// Short hash identifying this state frame.
 	pub shortstatehash: ShortStateHash,
+
+	/// Fully materialized state after applying this frame.
 	pub full_state: Arc<CompressedState>,
+
+	/// Entries added by this frame relative to its parent.
 	pub added: Arc<CompressedState>,
+
+	/// Entries removed by this frame relative to its parent.
 	pub removed: Arc<CompressedState>,
 }
 
+/// Reports a saved snapshot and its change from the room's previous state.
+///
+/// An unchanged snapshot reuses its short hash and returns empty added and
+/// removed sets.
 #[derive(Clone, Default)]
 pub struct HashSetCompressStateEvent {
+	/// Short hash identifying the saved snapshot.
 	pub shortstatehash: ShortStateHash,
+
+	/// Entries present only in the saved snapshot.
 	pub added: Arc<CompressedState>,
+
+	/// Entries present only in the previous snapshot.
 	pub removed: Arc<CompressedState>,
 }
 
@@ -55,7 +96,16 @@ type StateInfoLruCache = LruCache<ShortStateHash, ShortStateInfoVec>;
 type ShortStateInfoVec = Vec<ShortStateInfo>;
 type ParentStatesVec = Vec<ShortStateInfo>;
 
+/// Ordered set of compressed state-key and event-ID pairs.
+///
+/// Ordering makes hashing, differences, and persistent serialization
+/// deterministic for the same logical state.
 pub type CompressedState = BTreeSet<CompressedStateEvent>;
+
+/// Fixed-width encoding of one short state key and short event ID.
+///
+/// The first eight big-endian bytes hold the state key and the remaining eight
+/// hold the event ID.
 pub type CompressedStateEvent = [u8; 2 * size_of::<ShortId>()];
 
 #[async_trait]
@@ -98,7 +148,7 @@ impl crate::Service for Service {
 			.fold(0_usize, usize::saturating_add);
 
 		let bytes = bytes::pretty(bytes);
-		writeln!(out, "stateinfo_cache: {cache_len} {ents_len} ({bytes})")?;
+		writeln!(out, "- stateinfo_cache: {cache_len} entries, {ents_len} states ({bytes})")?;
 
 		Ok(())
 	}
@@ -110,13 +160,14 @@ impl crate::Service for Service {
 			.clear();
 	}
 
-	fn name(&self) -> &str {
-		crate::service::make_name(std::module_path!())
-	}
+	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
 }
 
-/// Returns a stack with info on shortstatehash, full state, added diff and
-/// removed diff for the selected shortstatehash and each parent layer.
+/// Loads and materializes the parent chain for a short state hash.
+///
+/// The returned frames are ordered root-first and include each frame's full
+/// state plus its added and removed entries. A previously reconstructed chain
+/// is returned from the LRU cache.
 #[implement(Service)]
 #[tracing::instrument(name = "load", level = "debug", skip(self))]
 pub async fn load_shortstatehash_info(
@@ -141,8 +192,9 @@ pub async fn load_shortstatehash_info(
 	Ok(stack)
 }
 
-/// Returns a stack with info on shortstatehash, full state, added diff and
-/// removed diff for the selected shortstatehash and each parent layer.
+/// Caches a reconstructed state chain under its requested short hash.
+///
+/// Lock poisoning is reported without modifying the cache.
 #[implement(Service)]
 #[tracing::instrument(
 		name = "cache",
@@ -181,7 +233,8 @@ async fn new_shortstatehash_info(
 		}]);
 	};
 
-	let mut stack = Box::pin(self.load_shortstatehash_info(parent)).await?;
+	let mut stack = Box::pin(self.load_shortstatehash_info(parent)).await?; // recursion cycle
+
 	let top = stack.last().expect("at least one frame");
 
 	let mut full_state = (*top.full_state).clone();
@@ -202,6 +255,10 @@ async fn new_shortstatehash_info(
 	Ok(stack)
 }
 
+/// Compresses a stream of state-key and event-ID pairs.
+///
+/// Missing short event IDs are allocated as the returned stream is polled, and
+/// each result packs both short IDs into the fixed-width representation.
 #[implement(Service)]
 pub fn compress_state_events<'a, I>(
 	&'a self,
@@ -224,6 +281,9 @@ where
 		.map(|(shortstatekey, shorteventid)| compress_state_event(*shortstatekey, shorteventid))
 }
 
+/// Compresses one state key and event ID into its fixed-width representation.
+///
+/// A short event ID is allocated first when the event has not been seen.
 #[implement(Service)]
 pub async fn compress_state_event(
 	&self,
@@ -239,27 +299,15 @@ pub async fn compress_state_event(
 	compress_state_event(shortstatekey, shorteventid)
 }
 
-/// Creates a new shortstatehash that often is just a diff to an already
-/// existing shortstatehash and therefore very efficient.
+/// Stages a compressed state delta under a new short state hash.
 ///
-/// There are multiple layers of diffs. The bottom layer 0 always contains
-/// the full state. Layer 1 contains diffs to states of layer 0, layer 2
-/// diffs to layer 1 and so on. If layer n > 0 grows too big, it will be
-/// combined with layer n-1 to create a new diff on layer n-1 that's
-/// based on layer n-2. If that layer is also too big, it will recursively
-/// fix above layers too.
-///
-/// * `shortstatehash` - Shortstatehash of this state
-/// * `statediffnew` - Added to base. Each vec is shortstatekey+shorteventid
-/// * `statediffremoved` - Removed from base. Each vec is
-///   shortstatekey+shorteventid
-/// * `diff_to_sibling` - Approximately how much the diff grows each time for
-///   this layer
-/// * `parent_states` - A stack with info on shortstatehash, full state, added
-///   diff and removed diff for each parent layer
+/// The caller-owned transaction receives the row but is not executed here.
+/// Chains deeper than three parent frames, or deltas too large relative to
+/// their parent, are recursively flattened into an earlier layer.
 #[implement(Service)]
 pub fn save_state_from_diff(
 	&self,
+	txn: &mut Txn,
 	shortstatehash: ShortStateHash,
 	statediffnew: Arc<CompressedState>,
 	statediffremoved: Arc<CompressedState>,
@@ -299,6 +347,7 @@ pub fn save_state_from_diff(
 		}
 
 		self.save_state_from_diff(
+			txn,
 			shortstatehash,
 			Arc::new(parent_new),
 			Arc::new(parent_removed),
@@ -311,14 +360,11 @@ pub fn save_state_from_diff(
 
 	if parent_states.is_empty() {
 		// There is no parent layer, create a new state
-		self.save_statediff(
-			shortstatehash,
-			&StateDiff {
-				parent: None,
-				added: statediffnew,
-				removed: statediffremoved,
-			},
-		);
+		self.save_statediff(txn, shortstatehash, &StateDiff {
+			parent: None,
+			added: statediffnew,
+			removed: statediffremoved,
+		});
 
 		return Ok(());
 	}
@@ -330,6 +376,7 @@ pub fn save_state_from_diff(
 	let parent = parent_states
 		.pop()
 		.expect("parent must have a state");
+
 	let parent_added_len = parent.added.len();
 	let parent_removed_len = parent.removed.len();
 	let parent_diff = checked!(parent_added_len + parent_removed_len)?;
@@ -358,6 +405,7 @@ pub fn save_state_from_diff(
 		}
 
 		self.save_state_from_diff(
+			txn,
 			shortstatehash,
 			Arc::new(parent_new),
 			Arc::new(parent_removed),
@@ -366,21 +414,21 @@ pub fn save_state_from_diff(
 		)?;
 	} else {
 		// Diff small enough, we add diff as layer on top of parent
-		self.save_statediff(
-			shortstatehash,
-			&StateDiff {
-				parent: Some(parent.shortstatehash),
-				added: statediffnew,
-				removed: statediffremoved,
-			},
-		);
+		self.save_statediff(txn, shortstatehash, &StateDiff {
+			parent: Some(parent.shortstatehash),
+			added: statediffnew,
+			removed: statediffremoved,
+		});
 	}
 
 	Ok(())
 }
 
-/// Returns the new shortstatehash, and the state diff from the previous
-/// room state
+/// Saves a complete compressed snapshot and reports its previous-state delta.
+///
+/// An existing content hash is reused; otherwise the short hash and delta row
+/// are created together. Failure to reconstruct the previous chain is treated
+/// as an absent parent, while an exactly unchanged snapshot returns empty sets.
 #[implement(Service)]
 #[tracing::instrument(skip(self, new_state_ids_compressed), level = "debug")]
 pub async fn save_state(
@@ -401,13 +449,16 @@ pub async fn save_state(
 			.map(|bytes| &bytes[..]),
 	);
 
-	let (new_shortstatehash, already_existed) = self
+	let existing_shortstatehash = self
 		.services
 		.short
-		.get_or_create_shortstatehash(&state_hash)
-		.await;
+		.get_shortstatehash(&state_hash)
+		.await
+		.ok();
 
-	if Some(new_shortstatehash) == previous_shortstatehash {
+	if let Some(new_shortstatehash) = existing_shortstatehash
+		.filter(|&new_shortstatehash| previous_shortstatehash.eq(&Some(new_shortstatehash)))
+	{
 		return Ok(HashSetCompressStateEvent {
 			shortstatehash: new_shortstatehash,
 			..Default::default()
@@ -439,15 +490,24 @@ pub async fn save_state(
 		(new_state_ids_compressed, Arc::new(CompressedState::new()))
 	};
 
-	if !already_existed {
-		self.save_state_from_diff(
-			new_shortstatehash,
-			statediffnew.clone(),
-			statediffremoved.clone(),
-			2, // every state change is 2 event changes on average
-			states_parents,
-		)?;
-	}
+	let new_shortstatehash = if let Some(new_shortstatehash) = existing_shortstatehash {
+		new_shortstatehash
+	} else {
+		self.services
+			.short
+			.get_or_create_shortstatehash(&state_hash, |txn, shortstatehash| {
+				self.save_state_from_diff(
+					txn,
+					shortstatehash,
+					statediffnew.clone(),
+					statediffremoved.clone(),
+					2, // every state change is 2 event changes on average
+					states_parents,
+				)
+			})
+			.await?
+			.0
+	};
 
 	Ok(HashSetCompressStateEvent {
 		shortstatehash: new_shortstatehash,
@@ -456,9 +516,17 @@ pub async fn save_state(
 	})
 }
 
+/// Reads one state's delta row into its typed form.
+///
+/// Rows round-trip through [`save_statediff`], the pair being the only
+/// codec for the statediff encoding.
+///
+/// # Panics
+///
+/// Panics if a stored delta row is shorter than its eight-byte parent prefix.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "debug", name = "get")]
-async fn get_statediff(&self, shortstatehash: ShortStateHash) -> Result<StateDiff> {
+pub(crate) async fn get_statediff(&self, shortstatehash: ShortStateHash) -> Result<StateDiff> {
 	const BUFSIZE: usize = size_of::<ShortStateHash>();
 	const STRIDE: usize = size_of::<ShortStateHash>();
 
@@ -504,15 +572,33 @@ async fn get_statediff(&self, shortstatehash: ShortStateHash) -> Result<StateDif
 	})
 }
 
+/// Serializes one state's delta into the caller's transaction.
+///
+/// Added and removed entries are emitted in sorted set order. The removed run
+/// follows an all-zero sentinel only when it is nonempty, and this method does
+/// not execute the transaction.
 #[implement(Service)]
-fn save_statediff(&self, shortstatehash: ShortStateHash, diff: &StateDiff) {
-	let mut value = Vec::<u8>::with_capacity(
-		2_usize
-			.saturating_add(diff.added.len())
-			.saturating_add(diff.removed.len()),
-	);
+pub(crate) fn save_statediff(
+	&self,
+	txn: &mut Txn,
+	shortstatehash: ShortStateHash,
+	diff: &StateDiff,
+) {
+	let event_count = diff
+		.added
+		.len()
+		.saturating_add(diff.removed.len());
+
+	let event_bytes = event_count.saturating_mul(size_of::<CompressedStateEvent>());
+	let separator_bytes =
+		usize::from(!diff.removed.is_empty()).saturating_mul(size_of::<ShortStateHash>());
+
+	let capacity = size_of::<ShortStateHash>()
+		.saturating_add(event_bytes)
+		.saturating_add(separator_bytes);
 
 	let parent = diff.parent.unwrap_or(0_u64);
+	let mut value = Vec::<u8>::with_capacity(capacity);
 	value.extend_from_slice(&parent.to_be_bytes());
 
 	for new in diff.added.iter() {
@@ -526,11 +612,12 @@ fn save_statediff(&self, shortstatehash: ShortStateHash, diff: &StateDiff) {
 		}
 	}
 
-	self.db
-		.shortstatehash_statediff
-		.insert(&shortstatehash.to_be_bytes(), &value);
+	txn.insert_raw(&self.db.shortstatehash_statediff, shortstatehash.to_be_bytes(), value);
 }
 
+/// Packs a short state key and short event ID into one compressed record.
+///
+/// Both IDs use big-endian encoding so byte ordering follows numeric ordering.
 #[inline]
 #[must_use]
 pub(crate) fn compress_state_event(
@@ -547,6 +634,9 @@ pub(crate) fn compress_state_event(
 		.expect("failed to create CompressedStateEvent")
 }
 
+/// Unpacks a compressed state record into its two short IDs.
+///
+/// This is the inverse of [`compress_state_event`].
 #[inline]
 #[must_use]
 pub(crate) fn parse_compressed_state_event(

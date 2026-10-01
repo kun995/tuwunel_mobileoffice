@@ -1,94 +1,83 @@
 use std::{
-	net::SocketAddr,
-	sync::{Arc, atomic::Ordering},
+	net::{SocketAddr, TcpListener},
+	path::Path,
 };
 
-use axum::Router;
-use axum_server::Handle as ServerHandle;
+use axum::{Router, extract::connect_info::IntoMakeServiceWithConnectInfo};
+use axum_server::{Handle, from_tcp_rustls};
 use axum_server_dual_protocol::{
-	ServerExt,
-	axum_server::{bind_rustls, tls_rustls::RustlsConfig},
+	ServerExt, axum_server::tls_rustls::RustlsConfig, from_tcp_dual_protocol,
 };
-use tokio::task::JoinSet;
-use tuwunel_core::{Result, Server, debug, debug_info, err, info, warn};
+use futures::{FutureExt, future::BoxFuture};
+use tuwunel_core::{Result, debug, err, info};
 
-pub(super) async fn serve(
-	server: &Arc<Server>,
-	app: Router,
-	handle: ServerHandle,
-	addrs: Vec<SocketAddr>,
-) -> Result {
-	let tls = &server.config.tls;
-	let certs = tls.certs.as_ref().ok_or_else(|| {
-		err!(Config("tls.certs", "Missing required value in tls config section"))
-	})?;
-	let key = tls
-		.key
-		.as_ref()
-		.ok_or_else(|| err!(Config("tls.key", "Missing required value in tls config section")))?;
-
+pub(super) async fn serve<'a>(
+	app: &Router,
+	handle: &Handle<SocketAddr>,
+	cert: &Path,
+	key: &Path,
+	dual_protocol: bool,
+	listeners: impl Iterator<Item = TcpListener>,
+) -> Result<Vec<BoxFuture<'a, Result<(), std::io::Error>>>> {
 	info!(
 		"Note: It is strongly recommended that you use a reverse proxy instead of running \
 		 tuwunel directly with TLS."
 	);
-	debug!("Using direct TLS. Certificate path {certs} and certificate private key path {key}",);
-	let conf = RustlsConfig::from_pem_file(certs, key)
+
+	debug!(
+		"Using direct TLS. Certificate path {cert:?} and certificate private key path {key:?}"
+	);
+
+	let conf = RustlsConfig::from_pem_file(cert, key)
 		.await
 		.map_err(|e| err!(Config("tls", "Failed to load certificates or key: {e}")))?;
 
-	let mut join_set = JoinSet::new();
-	let app = app.into_make_service_with_connect_info::<SocketAddr>();
-	if tls.dual_protocol {
-		for addr in &addrs {
-			join_set.spawn_on(
-				axum_server_dual_protocol::bind_dual_protocol(*addr, conf.clone())
-					.set_upgrade(false)
-					.handle(handle.clone())
-					.serve(app.clone()),
-				server.runtime(),
-			);
-		}
+	let app = app
+		.clone()
+		.into_make_service_with_connect_info::<SocketAddr>();
+
+	if dual_protocol {
+		serve_dual_protocol(&app, &conf, handle, listeners)
 	} else {
-		for addr in &addrs {
-			join_set.spawn_on(
-				bind_rustls(*addr, conf.clone())
-					.handle(handle.clone())
-					.serve(app.clone()),
-				server.runtime(),
-			);
-		}
+		serve_tls(&app, &conf, handle, listeners)
 	}
+}
 
-	if tls.dual_protocol {
-		warn!(
-			"Listening on {addrs:?} with TLS certificate {certs} and supporting plain text \
-			 (HTTP) connections too (insecure!)",
-		);
-	} else {
-		info!("Listening on {addrs:?} with TLS certificate {certs}");
-	}
+fn serve_dual_protocol<'a>(
+	app: &IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
+	conf: &RustlsConfig,
+	handle: &Handle<SocketAddr>,
+	listeners: impl Iterator<Item = TcpListener>,
+) -> Result<Vec<BoxFuture<'a, Result<(), std::io::Error>>>> {
+	listeners
+		.map(|listener| {
+			// Pinned against an upstream default flip: a plain request is answered,
+			// never redirected to the https scheme.
+			let acceptor = from_tcp_dual_protocol(listener, conf.clone())?
+				.set_upgrade(false)
+				.handle(handle.clone())
+				.serve(app.clone())
+				.boxed();
 
-	while join_set.join_next().await.is_some() {}
+			Ok(acceptor)
+		})
+		.collect()
+}
 
-	let handle_active = server
-		.metrics
-		.requests_handle_active
-		.load(Ordering::Acquire);
+fn serve_tls<'a>(
+	app: &IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
+	conf: &RustlsConfig,
+	handle: &Handle<SocketAddr>,
+	listeners: impl Iterator<Item = TcpListener>,
+) -> Result<Vec<BoxFuture<'a, Result<(), std::io::Error>>>> {
+	listeners
+		.map(|listener| {
+			let acceptor = from_tcp_rustls(listener, conf.clone())?
+				.handle(handle.clone())
+				.serve(app.clone())
+				.boxed();
 
-	debug_info!(
-		handle_finished = server
-			.metrics
-			.requests_handle_finished
-			.load(Ordering::Acquire),
-		panics = server
-			.metrics
-			.requests_panic
-			.load(Ordering::Acquire),
-		handle_active,
-		"Stopped listening on {addrs:?}",
-	);
-
-	debug_assert_eq!(0, handle_active, "active request handles still pending");
-
-	Ok(())
+			Ok(acceptor)
+		})
+		.collect()
 }

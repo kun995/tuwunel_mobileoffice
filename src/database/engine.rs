@@ -1,47 +1,94 @@
+//! RocksDB engine: database-wide operations and shared resources.
+//!
+//! `Engine` owns the opened RocksDB instance together with the worker pool, the
+//! shared open-time context, and the flags fixed at open (read-only, secondary,
+//! checksums). Per-column-family reads and writes go through `Map`; the methods
+//! here act on the database as a whole: WAL flush and sync, memtable flush,
+//! manual compaction and primary catch-up, checkpoints, property queries, and
+//! the cork counter that coalesces WAL writes (see the `cork` module).
+
 mod backup;
 mod cf_opts;
 pub(crate) mod context;
 mod db_opts;
 pub(crate) mod descriptor;
+mod env;
+mod events;
 mod files;
 mod logger;
 mod memory_usage;
 mod open;
 mod repair;
+#[cfg(test)]
+mod tests;
 
 use std::{
+	collections::BTreeMap,
 	ffi::CStr,
+	path::Path,
 	sync::{
-		Arc,
+		Arc, OnceLock, Weak,
 		atomic::{AtomicU32, Ordering},
 	},
 };
 
 use rocksdb::{
-	AsColumnFamilyRef, BoundColumnFamily, DBCommon, DBWithThreadMode, MultiThreaded,
-	WaitForCompactOptions,
+	AsColumnFamilyRef, BoundColumnFamily, DBCommon, DBWithThreadMode, FlushOptions,
+	MultiThreaded, WaitForCompactOptions, WriteOptions, checkpoint::Checkpoint,
 };
-use tuwunel_core::{Err, Result, debug, info, warn};
+use tuwunel_core::{Err, Result, debug, implement, info, warn};
 
 use crate::{
-	Context,
+	Context, Map,
 	pool::Pool,
 	util::{map_err, result},
 };
 
+pub(crate) type CfIndex = BTreeMap<u32, Weak<Map>>;
+
+/// Handle to the opened RocksDB database and its shared resources.
+///
+/// One `Engine` exists per database, shared behind an `Arc` by every `Map`.
 pub struct Engine {
+	/// The opened RocksDB instance.
 	pub(crate) db: Db,
+
+	/// Thread pool offloading uncached, blocking database requests from the
+	/// tokio workers.
 	pub(crate) pool: Arc<Pool>,
+
+	/// Resources constructed before the database is opened and outliving it
+	/// (block caches, environment, column descriptors).
 	pub(crate) ctx: Arc<Context>,
+
+	/// Database was opened read-only; writes are rejected.
 	pub(super) read_only: bool,
+
+	/// Database was opened as a secondary follower of a primary instance.
 	pub(super) secondary: bool,
+
+	/// Verify block checksums on read.
 	pub(crate) checksums: bool,
+
+	/// Shared write options for atomic batch commits.
+	pub(crate) write_options: WriteOptions,
+
+	/// Resolves catalog column ids for post-commit watcher notification.
+	/// Runtime migration column families are intentionally absent.
+	cf_index: OnceLock<CfIndex>,
+
+	/// Live cork count; nonzero suppresses the per-write WAL flush.
 	corks: AtomicU32,
 }
 
+/// Backing RocksDB type: multi-threaded column-family access, no transactions.
 pub(crate) type Db = DBWithThreadMode<MultiThreaded>;
 
 impl Engine {
+	/// Block until outstanding background compactions finish.
+	///
+	/// Waits without a timeout and does not flush first; aborts the wait if
+	/// compaction has been paused.
 	#[tracing::instrument(
 		level = "info",
 		skip_all,
@@ -58,6 +105,18 @@ impl Engine {
 		self.db.wait_for_compact(&opts).map_err(map_err)
 	}
 
+	/// Flush every column family's memtable to SST files (a RocksDB LSM-tree
+	/// flush).
+	///
+	/// Forces buffered writes out of memory into the on-disk LSM tree for all
+	/// opened families in one request, atomically when `rocksdb_atomic_flush`
+	/// is set. An LSM flush, not a libc `fflush(3)` or `fsync(2)`, and distinct
+	/// from the `flush` and `sync` methods here, which act on the write-ahead
+	/// log.
+	///
+	/// # Panics
+	///
+	/// Panics on a read-only or secondary database, which cannot flush.
 	#[tracing::instrument(
 		level = "info",
 		skip_all,
@@ -66,10 +125,38 @@ impl Engine {
 		),
 	)]
 	pub fn sort(&self) -> Result {
-		let flushoptions = rocksdb::FlushOptions::default();
-		result(DBCommon::flush_opt(&self.db, &flushoptions))
+		assert!(!self.is_read_only(), "memtables cannot be flushed on a read-only database");
+
+		let cfs: Vec<_> = self
+			.db
+			.cf_names()
+			.iter()
+			.filter_map(|name| self.db.cf_handle(name))
+			.collect();
+
+		let cfs: Vec<&_> = cfs.iter().collect();
+		let opts = FlushOptions::default();
+
+		result(DBCommon::flush_cfs_opt(&self.db, &cfs, &opts))
 	}
 
+	/// Creates a physical checkpoint of the database at `path`.
+	///
+	/// `log_size` is forwarded to RocksDB as the write-ahead log size threshold
+	/// for flushing before checkpoint creation. A value of zero forces a flush.
+	#[tracing::instrument(level = "info", skip(self))]
+	pub fn checkpoint(&self, path: &Path, log_size: u64) -> Result {
+		let checkpoint = Checkpoint::new(&self.db).map_err(map_err)?;
+
+		checkpoint
+			.create_checkpoint_with_log_size(path, log_size)
+			.map_err(map_err)
+	}
+
+	/// Catch a secondary instance up to the primary's latest writes.
+	///
+	/// Replays the primary's newly appended WAL into this instance's view;
+	/// meaningful only when the database was opened as a secondary.
 	#[tracing::instrument(
 		level = "debug",
 		skip_all,
@@ -83,18 +170,36 @@ impl Engine {
 			.map_err(map_err)
 	}
 
+	/// Flush the write-ahead log and fsync it to disk.
+	///
+	/// Once this returns the buffered writes survive power loss. Heavier than
+	/// `flush`, which stops at the OS page cache.
 	#[tracing::instrument(level = "info", skip_all)]
 	pub fn sync(&self) -> Result { result(DBCommon::flush_wal(&self.db, true)) }
 
+	/// Flush the buffered write-ahead log to the OS without an fsync.
+	///
+	/// Pushes WAL bytes to the page cache (durable against process crash, not
+	/// power loss). This is the per-write flush that corking suppresses.
 	#[tracing::instrument(level = "debug", skip_all)]
 	pub fn flush(&self) -> Result { result(DBCommon::flush_wal(&self.db, false)) }
 
+	/// Increment the cork count, suppressing the per-write WAL flush.
 	#[inline]
 	pub(crate) fn cork(&self) { self.corks.fetch_add(1, Ordering::Relaxed); }
 
+	/// Decrement the cork count; the per-write flush resumes at zero.
 	#[inline]
 	pub(crate) fn uncork(&self) { self.corks.fetch_sub(1, Ordering::Relaxed); }
 
+	/// Whether any cork is currently held.
+	///
+	/// When true, `Map` insert and remove skip their post-write WAL flush so
+	/// the records coalesce into one batch. Corking is purely a backend
+	/// write-buffering signal: it never changes application logic or any
+	/// observable database API behavior, because a write lands in the memtable
+	/// synchronously and reads back regardless of WAL flush state. See the
+	/// `cork` module.
 	#[inline]
 	pub fn corked(&self) -> bool { self.corks.load(Ordering::Relaxed) > 0 }
 
@@ -116,12 +221,33 @@ impl Engine {
 			.and_then(|val| val.map_or_else(|| Err!("Property {name:?} not found."), Ok))
 	}
 
+	/// Look up a column-family handle by name.
+	///
+	/// The handle refers to a family opened with this database and remains tied
+	/// to the engine's lifetime.
+	///
+	/// # Panics
+	///
+	/// Panics if the family was not described before the database was opened.
 	pub(crate) fn cf(&self, name: &str) -> Arc<BoundColumnFamily<'_>> {
 		self.db
 			.cf_handle(name)
 			.expect("column must be described prior to database open")
 	}
 
+	/// Reports whether a column family with this name exists.
+	///
+	/// The lookup consults the handles currently opened by RocksDB. It does not
+	/// create a missing family.
+	#[inline]
+	#[must_use]
+	pub fn has_cf(&self, name: &str) -> bool { self.db.cf_handle(name).is_some() }
+
+	/// Returns the latest RocksDB sequence number.
+	///
+	/// RocksDB assigns sequence numbers to committed writes, so this value
+	/// marks the engine's current write position. The number is local to this
+	/// database.
 	#[inline]
 	#[must_use]
 	#[tracing::instrument(
@@ -139,13 +265,38 @@ impl Engine {
 		sequence
 	}
 
+	/// Reports whether this engine rejects writes.
+	///
+	/// Both read-only and secondary opens reject writes through their database
+	/// handle. A writable primary open returns false.
 	#[inline]
 	#[must_use]
 	pub fn is_read_only(&self) -> bool { self.secondary || self.read_only }
 
+	/// Reports whether the database follows a primary as a secondary.
+	///
+	/// A secondary advances its view when [`Self::update`] catches up with the
+	/// primary. Writes through the secondary handle are rejected.
 	#[inline]
 	#[must_use]
 	pub fn is_secondary(&self) -> bool { self.secondary }
+}
+
+#[implement(Engine)]
+pub(crate) fn set_cf_index(&self, index: CfIndex) {
+	self.cf_index
+		.set(index)
+		.expect("cf_index initialized twice");
+}
+
+#[implement(Engine)]
+#[inline]
+pub(crate) fn map_by_cf_id(&self, cf_id: u32) -> Option<Arc<Map>> {
+	self.cf_index
+		.get()
+		.expect("cf_index initialized before writes")
+		.get(&cf_id)
+		.and_then(Weak::upgrade)
 }
 
 impl Drop for Engine {

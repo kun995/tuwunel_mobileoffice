@@ -8,8 +8,7 @@ use axum_extra::{
 	TypedHeader,
 	headers::{Authorization, authorization::Bearer},
 };
-use futures::StreamExt;
-use ruma::{OwnedRoomId, OwnedUserId, UserId, api::client::error::ErrorKind};
+use ruma::{OwnedUserId, UserId, api::error::ErrorKind};
 use serde::{Deserialize, Serialize};
 use tuwunel_core::{Err, Error, Result, err, info, utils};
 use tuwunel_service::{Services, users::Register};
@@ -152,7 +151,7 @@ pub(crate) async fn get_user_workspaces_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
@@ -161,12 +160,12 @@ pub(crate) async fn get_user_workspaces_route(
 		return Err!(Request(NotFound("User does not exist.")));
 	}
 
-	let workspace_ids = services
-		.workspace
-		.user_workspaces(&sender_user)
-		.await;
+	let workspace_ids = services.workspace.user_workspaces(&sender_user).await;
 
-	Ok(Json(UserWorkspacesResponse { user_id: sender_user, workspace_ids }))
+	Ok(Json(UserWorkspacesResponse {
+		user_id: sender_user,
+		workspace_ids,
+	}))
 }
 
 /// # `GET /_matrix/client/unstable/org.tuwunel/users/{userId}/workspaces`
@@ -184,14 +183,16 @@ pub(crate) async fn get_user_workspaces_admin_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
 	let sender_user_ref: &UserId = sender_user.as_ref();
-	if !services.users.is_admin(sender_user_ref).await {
-		return Err!(Request(Forbidden("You do not have permission to view workspace users.")));
+	if !services.admin.user_is_admin(sender_user_ref).await {
+		return Err!(Request(Forbidden(
+			"You do not have permission to view workspace users."
+		)));
 	}
 
 	let user_id_ref: &UserId = user_id.as_ref();
@@ -199,12 +200,12 @@ pub(crate) async fn get_user_workspaces_admin_route(
 		return Err!(Request(NotFound("User does not exist.")));
 	}
 
-	let workspace_ids = services
-		.workspace
-		.user_workspaces(user_id_ref)
-		.await;
+	let workspace_ids = services.workspace.user_workspaces(user_id_ref).await;
 
-	Ok(Json(UserWorkspacesResponse { user_id, workspace_ids }))
+	Ok(Json(UserWorkspacesResponse {
+		user_id,
+		workspace_ids,
+	}))
 }
 
 /// # `GET /_matrix/client/unstable/org.tuwunel/users/{userId}`
@@ -221,14 +222,16 @@ pub(crate) async fn get_user_info_admin_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
 	let sender_user_ref: &UserId = sender_user.as_ref();
-	if !services.users.is_admin(sender_user_ref).await {
-		return Err!(Request(Forbidden("You do not have permission to view user information.")));
+	if !services.admin.user_is_admin(sender_user_ref).await {
+		return Err!(Request(Forbidden(
+			"You do not have permission to view user information."
+		)));
 	}
 
 	let user_id_ref: &UserId = user_id.as_ref();
@@ -236,17 +239,14 @@ pub(crate) async fn get_user_info_admin_route(
 		return Err!(Request(NotFound("User does not exist.")));
 	}
 
-	let displayname = services.users.displayname(user_id_ref).await.ok();
+	let displayname = services.profile.displayname(user_id_ref).await.ok();
 	let avatar_url = services
-		.users
+		.profile
 		.avatar_url(user_id_ref)
 		.await
 		.ok()
 		.map(|avatar_url| avatar_url.to_string());
-	let workspace_ids = services
-		.workspace
-		.user_workspaces(user_id_ref)
-		.await;
+	let workspace_ids = services.workspace.user_workspaces(user_id_ref).await;
 
 	Ok(Json(AdminUserInfoResponse {
 		user_id,
@@ -270,7 +270,7 @@ pub(crate) async fn update_user_workspaces_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
@@ -284,7 +284,10 @@ pub(crate) async fn update_user_workspaces_route(
 		.add_user_workspace(&sender_user, &body.workspace_id)
 		.await;
 
-	Ok(Json(UserWorkspacesResponse { user_id: sender_user, workspace_ids }))
+	Ok(Json(UserWorkspacesResponse {
+		user_id: sender_user,
+		workspace_ids,
+	}))
 }
 
 /// # `PUT /_matrix/client/unstable/org.tuwunel/workspaces/{workspaceId}/users`
@@ -303,14 +306,16 @@ pub(crate) async fn update_workspace_users_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
 	let sender_user_ref: &UserId = sender_user.as_ref();
-	if !services.users.is_admin(sender_user_ref).await {
-		return Err!(Request(Forbidden("You do not have permission to update workspace users.")));
+	if !services.admin.user_is_admin(sender_user_ref).await {
+		return Err!(Request(Forbidden(
+			"You do not have permission to update workspace users."
+		)));
 	}
 
 	let workspace_id = workspace_id.trim().to_owned();
@@ -337,7 +342,10 @@ pub(crate) async fn update_workspace_users_route(
 			.await;
 	}
 
-	Ok(Json(WorkspaceUsersResponse { workspace_id, user_ids }))
+	Ok(Json(WorkspaceUsersResponse {
+		workspace_id,
+		user_ids,
+	}))
 }
 
 /// # `POST /_matrix/client/unstable/org.tuwunel/users/bulk_create`
@@ -358,23 +366,22 @@ pub(crate) async fn bulk_create_users_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
 	let sender_user_ref: &UserId = sender_user.as_ref();
-	if !services.users.is_admin(sender_user_ref).await {
-		return Err!(Request(Forbidden("You do not have permission to create users.")));
+	if !services.admin.user_is_admin(sender_user_ref).await {
+		return Err!(Request(Forbidden(
+			"You do not have permission to create users."
+		)));
 	}
 
 	let workspace_id = body
 		.workspace_id
 		.map(|workspace_id| workspace_id.trim().to_owned());
-	if workspace_id
-		.as_ref()
-		.is_some_and(String::is_empty)
-	{
+	if workspace_id.as_ref().is_some_and(String::is_empty) {
 		return Err!(Request(InvalidParam("workspace_id must not be empty.")));
 	}
 
@@ -402,11 +409,11 @@ pub(crate) async fn bulk_create_users_route(
 
 		let user_id =
 			match UserId::parse_with_server_name(&localpart, services.globals.server_name()) {
-				| Ok(user_id) => user_id,
-				| Err(e) => {
+				Ok(user_id) => user_id,
+				Err(e) => {
 					validation_errors.push(format!("users[{index}].localpart is invalid: {e}"));
 					continue;
-				},
+				}
 			};
 
 		if let Err(e) = user_id.validate_strict()
@@ -419,13 +426,14 @@ pub(crate) async fn bulk_create_users_route(
 		}
 
 		if services.users.exists(&user_id).await {
-			validation_errors
-				.push(format!("users[{index}].localpart already exists as {user_id}."));
+			validation_errors.push(format!(
+				"users[{index}].localpart already exists as {user_id}."
+			));
 			continue;
 		}
 
 		let displayname = match entry.displayname {
-			| Some(displayname) => {
+			Some(displayname) => {
 				let displayname = displayname.trim().to_owned();
 				if displayname.is_empty() {
 					validation_errors
@@ -434,20 +442,20 @@ pub(crate) async fn bulk_create_users_route(
 				}
 
 				Some(displayname)
-			},
-			| None => None,
+			}
+			None => None,
 		};
 
 		let (password, generated_password) = match entry.password {
-			| Some(password) if password.trim().is_empty() => {
+			Some(password) if password.trim().is_empty() => {
 				validation_errors.push(format!("users[{index}].password must not be empty."));
 				continue;
-			},
-			| Some(password) => (password, None),
-			| None => {
+			}
+			Some(password) => (password, None),
+			None => {
 				let password = utils::random_string(AUTO_GEN_PASSWORD_LENGTH);
 				(password.clone(), Some(password))
-			},
+			}
 		};
 
 		validated_users.push(ValidatedBulkCreateUser {
@@ -502,7 +510,7 @@ pub(crate) async fn bulk_create_users_route(
 
 	for user in validated_users {
 		let user_id_ref: &UserId = user.user_id.as_ref();
-		let displayname = services.users.displayname(user_id_ref).await.ok();
+		let displayname = services.profile.displayname(user_id_ref).await.ok();
 
 		created_users.push(BulkCreatedUser {
 			user_id: user.user_id,
@@ -512,7 +520,10 @@ pub(crate) async fn bulk_create_users_route(
 		});
 	}
 
-	Ok(Json(BulkCreateUsersResponse { workspace_id, users: created_users }))
+	Ok(Json(BulkCreateUsersResponse {
+		workspace_id,
+		users: created_users,
+	}))
 }
 
 /// # `PUT /_matrix/client/unstable/org.tuwunel/users/displaynames`
@@ -529,13 +540,13 @@ pub(crate) async fn update_user_displaynames_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
 	let sender_user_ref: &UserId = sender_user.as_ref();
-	if !services.users.is_admin(sender_user_ref).await {
+	if !services.admin.user_is_admin(sender_user_ref).await {
 		return Err!(Request(Forbidden(
 			"You do not have permission to update user display names."
 		)));
@@ -563,19 +574,19 @@ pub(crate) async fn update_user_displaynames_route(
 	let mut updated = Vec::with_capacity(deduped.len());
 	for (user_id, displayname) in deduped {
 		let user_id_ref: &UserId = user_id.as_ref();
-		let all_joined_rooms: Vec<OwnedRoomId> = services
-			.state_cache
-			.rooms_joined(user_id_ref)
-			.map(ToOwned::to_owned)
-			.collect()
-			.await;
-
 		services
-			.users
-			.update_displayname(user_id_ref, Some(displayname.as_str()), &all_joined_rooms)
-			.await;
+			.profile
+			.set_displayname(
+				user_id_ref,
+				Some(displayname.as_str()),
+				Some(tuwunel_service::profile::Propagation::All),
+			)
+			.await?;
 
-		updated.push(UserDisplaynameUpdate { user_id, displayname });
+		updated.push(UserDisplaynameUpdate {
+			user_id,
+			displayname,
+		});
 	}
 
 	Ok(Json(UpdateUserDisplaynamesResponse { users: updated }))
@@ -600,7 +611,9 @@ pub(crate) async fn purge_user_route(
 	}
 
 	validate_purge_target(&services, &sender_user, &target_user).await?;
-	Ok(Json(purge_validated_user(&services, &sender_user, target_user).await?))
+	Ok(Json(
+		purge_validated_user(&services, &sender_user, target_user).await?,
+	))
 }
 
 /// # `DELETE /_matrix/client/unstable/org.tuwunel/users`
@@ -620,7 +633,9 @@ pub(crate) async fn bulk_purge_users_route(
 		return Err!(Request(InvalidParam("user_ids must not be empty.")));
 	}
 	if body.user_ids.len() > 100 {
-		return Err!(Request(InvalidParam("user_ids must contain at most 100 users.")));
+		return Err!(Request(InvalidParam(
+			"user_ids must contain at most 100 users."
+		)));
 	}
 
 	let mut targets = body.user_ids;
@@ -645,14 +660,14 @@ pub(crate) async fn bulk_purge_users_route(
 	for target_user in targets {
 		let user_id = target_user.clone();
 		match purge_validated_user(&services, &sender_user, target_user).await {
-			| Ok(result) => users.push(BulkPurgeUserResult {
+			Ok(result) => users.push(BulkPurgeUserResult {
 				user_id: result.user_id,
 				purged: true,
 				recreatable: result.recreatable,
 				removed_records: Some(result.removed_records),
 				error: None,
 			}),
-			| Err(error) => {
+			Err(error) => {
 				let recreatable = !services.users.exists(&user_id).await;
 				users.push(BulkPurgeUserResult {
 					user_id,
@@ -661,14 +676,11 @@ pub(crate) async fn bulk_purge_users_route(
 					removed_records: None,
 					error: Some(error.to_string()),
 				});
-			},
+			}
 		}
 	}
 
-	let purged = users
-		.iter()
-		.filter(|result| result.purged)
-		.count();
+	let purged = users.iter().filter(|result| result.purged).count();
 	Ok(Json(BulkPurgeUsersResponse {
 		total,
 		purged,
@@ -679,18 +691,16 @@ pub(crate) async fn bulk_purge_users_route(
 }
 
 async fn authenticated_admin(services: &Services, token: &str) -> Result<OwnedUserId> {
-	let (sender_user, ..) = services
-		.users
-		.find_from_token(token)
-		.await
-		.map_err(|_| {
-			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
-				"Unknown access token.",
-			)
-		})?;
-	if !services.users.is_admin(&sender_user).await {
-		return Err!(Request(Forbidden("You do not have permission to purge users.")));
+	let (sender_user, ..) = services.users.find_from_token(token).await.map_err(|_| {
+		Error::BadRequest(
+			ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
+			"Unknown access token.",
+		)
+	})?;
+	if !services.admin.user_is_admin(&sender_user).await {
+		return Err!(Request(Forbidden(
+			"You do not have permission to purge users."
+		)));
 	}
 	Ok(sender_user)
 }
@@ -704,15 +714,19 @@ async fn validate_purge_target(
 		return Err!(Request(InvalidParam("Only local users can be purged.")));
 	}
 	if target_user == sender_user {
-		return Err!(Request(Forbidden("An administrator cannot purge their own account.")));
+		return Err!(Request(Forbidden(
+			"An administrator cannot purge their own account."
+		)));
 	}
 	if target_user.as_str() == services.globals.server_user.as_str() {
-		return Err!(Request(Forbidden("The server service account cannot be purged.")));
+		return Err!(Request(Forbidden(
+			"The server service account cannot be purged."
+		)));
 	}
 	if !services.users.exists(target_user).await {
 		return Err!(Request(NotFound("User does not exist.")));
 	}
-	if services.users.is_admin(target_user).await {
+	if services.admin.user_is_admin(target_user).await {
 		return Err!(Request(Forbidden(
 			"Administrator accounts must have admin privileges revoked before purge."
 		)));
@@ -725,17 +739,13 @@ async fn purge_validated_user(
 	sender_user: &UserId,
 	target_user: OwnedUserId,
 ) -> Result<PurgeUserResponse> {
-	services
-		.deactivate
-		.full_deactivate(&target_user)
-		.await?;
-	let removed_records = services
-		.users
-		.purge_account_records(&target_user)
-		.await;
+	services.deactivate.full_deactivate(&target_user, false).await?;
+	let removed_records = services.users.purge_account_records(&target_user).await;
 	let recreatable = !services.users.exists(&target_user).await;
 	if !recreatable {
-		return Err!(Request(Unknown("Account purge did not remove the user identity record.")));
+		return Err!(Request(Unknown(
+			"Account purge did not remove the user identity record."
+		)));
 	}
 
 	info!(

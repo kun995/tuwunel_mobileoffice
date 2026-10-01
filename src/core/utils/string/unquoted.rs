@@ -5,13 +5,18 @@ use serde::{Deserialize, Deserializer, de};
 use super::Unquote;
 use crate::{Result, err};
 
-/// Unquoted string which deserialized from a quoted string. Construction from a
-/// &str is infallible such that the input can already be unquoted. Construction
-/// from serde deserialization is fallible and the input must be quoted.
+/// A string view with surrounding quotes removed when present.
+///
+/// Conversion from `&str` is infallible and accepts already unquoted input.
+/// Deserialization requires quoted input and fails otherwise.
 #[repr(transparent)]
 pub struct Unquoted(str);
 
 impl<'a> Unquoted {
+	/// Returns the underlying string view without surrounding quotes.
+	///
+	/// The returned slice borrows the transparent wrapper and performs no
+	/// allocation or copy. Its lifetime is tied to the wrapper reference.
 	#[inline]
 	#[must_use]
 	pub fn as_str(&'a self) -> &'a str { &self.0 }

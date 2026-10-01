@@ -1,87 +1,17 @@
-# Tuwunel 1.5.0
+# Tuwunel 1.9.3
 
-January 31, 2025
+September 25, 2026
 
 ### New Features & Enhancements
 
-- SSO/OIDC support. This feature allows users to register and login via authorizations from OIDC Identity Providers. For example, you can now use your GitHub account to register on the server. Tuwunel implements the OIDC client protocol directly. This is referred to as "legacy SSO" in the Matrix specification; Matrix client support is widespread. Credit to @samip5 for opening the feature-issue (#7), the most 👍 feature of the project.
-
-- [MSC2815](https://github.com/matrix-org/matrix-spec-proposals/pull/2815) has been implemented, allowing configurable redacted event retention and retrieval by room admins. The content of redacted events is persisted for sixty days by default. Redacted events can be viewed using Gomuks.
-
-- Secure limited-use registration token support was implemented by @dasha-uwu building off earlier work by @gingershaped in (56f3f5ea154). Use this feature with the new `!admin token` set of commands.
-
-- An outstanding major rework of the presence system by @lhjt in (#264) coordinates conflicting updates from multiple devices and further builds on push suppression features first introduced by @tototomate123.
-
-- [MSC3706](https://github.com/matrix-org/matrix-spec-proposals/pull/3706) has been implemented, improving the performance and reliability of joining rooms over federation (b33e73672b).
-
-- @VlaDexa implemented reading the `client_secret` configuration for an SSO Identity Provider from a separate file; a recommended secure practice (#256).
-
-- Special thanks to @winyadepla for adding highly sought Matrix RTC (Element Call) documentation for Tuwunel in (#265) and for having a kind heart to follow up with maintenance in (#270).
-
-- Thank you @Xerusion for documenting Traefik for deploying Tuwunel in (#259). This will save a lot of time and headache for many new users!
-
-- At the request of @ChronosXYZ in (#260), @dasha-uwu implemented a configurable feature to include all local users in search results, rather than limiting to those in public or shared rooms (95121ad905fb).
-
-- Thanks to a collaboration by @x86pup and @VlaDexa working through Nix maintenance we can now upgrade the MSRV to 1.91.1 (#275).
-
-- Thank you @scvalex for updating the README indicating Tuwunel is in stable NixOS (#233).
-
-- Thank you @divideableZero for updating the README with great news about an [Alpine Package](https://pkgs.alpinelinux.org/package/edge/testing/x86_64/tuwunel) (#248).
-
-- Storage hardware characteristics for mdraid devices on Linux are now detected. On these systems we can now shape database requests to increase performance above generic defaults.
-
-- EdDSA is now a supported algorithm for JWT logins. Thank you @vnhdx for the excellent report in (#258).
-
-- Optimizations were made to maximize concurrency and cache performance when gathering the `auth_chain`.
-
-- An admin command to manually remove a pusher is available (note: not intended for normal use).
-
-- An admin command to list local users by recent activity was added.
+- Remote profiles can be refreshed on demand, graciously contributed by @x86pup (64e1226c0, b1157d870). `!admin users refresh-profile <user>` fetches a remote user's profile from their own server and drops every cached field that server no longer serves, such as a status the user has since cleared; local clients see the removal on their next sync. `!admin users set-profile-key` can now also clear one cached field of a remote user, and the value returns on the next ordinary lookup if their server still serves it. Neither command runs automatically, and both accept only remote users this server already knows. See `docs/moderation.md`.
 
 ### Bug Fixes
 
-- LDAP users are now auto-joined to configured rooms upon creation. Thank you @yefimg for (#234), we especially appreciate help from domain-experts on these features.
+- **Sliding Sync works again for users with old-format join records.** In 1.9.2, a user holding a join record written by Conduit, conduwuit, another Conduit-lineage fork, or Tuwunel before 1.4.3.1, and not rewritten since, got a 500 on every Sliding Sync request, logged as `u64 buffer underflow`, and Element X sat in a restart loop. Legacy `/sync` failed the same way for clients that request `profile_fields` in their filter. Such a record now reads as the earliest join position. The condition is per record, not per database: a join event processed by Tuwunel 1.4.3.1 or later rewrites the record, and a display name or avatar change sends one into every joined room, so a user who had changed their profile on such a release was spared while a neighbor with a stable profile on the same database was not. Upgrading is the whole fix; nothing migrates and nobody needs to rejoin. @drrossum reported the restart loop in (#598), @Reaster0 confirmed it on a database migrated from a Conduit-lineage fork, and @scvalex hit it while testing the nixpkgs backport of 1.9.2; the fix is courtesy of @x86pup. Sincere apologies to everyone whose Element X could not get past a sync.
 
-- A surgical fix by @kuhnchris in (#254) addressed a pesky bug where LDAP logins would result in admin privileges being removed for the user. Thank you @foxing-quietly for reporting in (#236).
+- **OIDC sessions carried over from a Conduit-lineage fork survive the upgrade again.** The 1.9.2 migration that preserved imported token expiries stamped each such session with its long-past origin expiry, so its first request drew a soft logout (`M_UNKNOWN_TOKEN`) and deleted its token. With no OIDC provider here, the default, the client could neither refresh nor sign out cleanly; the reporter's Element X sat in a 401 loop for forty minutes before a password sign-in. Adoption now waits until this server runs its own OIDC provider (`well_known.client` plus an `identity_provider` or `oidc_native_auth`); until then those sessions keep their origin lifetime, and enabling a provider signs them out once, cleanly. On a server without a provider, a database that already ran 1.9.2 is repaired on its first 1.9.3 start for every migrated session not used since, and each restored device is logged. A session used under 1.9.2 was deleted at that request; neither this release nor a rollback to 1.9.1 brings it back. **Do not roll back to 1.9.2 after that first 1.9.3 start:** 1.9.2 would stamp the restored sessions again and delete each at its next request, and the repair does not run a second time, so those sessions are lost. 1.9.1 and earlier are safe to return to. Thanks to @Reaster0, who reported (#602) with a proxy-log timeline and a code-level diagnosis and proposed the repair for databases 1.9.2 had already stamped; shipped by @x86pup. Sincere apologies to everyone 1.9.2 signed out.
 
-- @OptimoSupreme fixed issues with unread notification counting, including eliminating one of the last remaining non-async database calls in the codebase in (#253).
+- The Synapse-compatible admin join, `POST /_synapse/admin/v1/join/{room_id_or_alias}`, no longer answers 403 "cannot join a room that is not `public`" for a private room. When this server is in the room and its join rule would refuse the user uninvited, the requesting admin now invites them first, matching Synapse; a restricted room gets the invite only when the user is outside its allowed rooms. The admin must be joined there with power to invite, and the `!admin users` force-join console commands are unchanged. Thank you @arnolicious for reporting (#603); credit to @x86pup for the fix.
 
-- @x86pup fixed linker issues for platforms without static builds of `io_uring`. Thanks @darix for reporting in (#238).
-
-- @x86pup fixed compatibility for our optimized jemalloc build on macOS (#239).
-
-- @dasha-uwu made Livekit operate properly even when federation is disabled (b5f50c3fda3). Thank you @apodavalov for reporting in (#240).
-
-- Thank you @VlaDexa for updating the `Cache-Control` header to cache media as `private` which is more appropriate now in the Authenticated Media era.
-
-- Appservices now receive events properly matching on the sender MXID's localpart thanks to @dasha-uwu (c5508bba58d0).
-
-- Additional PDU format and compliance checks were added by @dasha-uwu (7b2079f71499).
-
-- Codepaths in sync systems which assumed `device_id` from appservices were fixed by @dasha-uwu.
-
-- Auto-joining version 12 rooms was inhibited from a bug fixed by @dasha-uwu in (7115fb2796f).
-
-- Thank you @x86pup for updating our ldap3 dependency with SSL/TLS enhancements in (#243) and fixing errors reported by @fruzitent in (#108).
-
-- Thanks to @x86pup `join_rule` is now properly defaulted in `/publicRooms` responses in (#244); additional compliance tests now pass!
-
-- Thank you @bdfd9 for reporting a regression where tracing spans around registrations did not filter out passwords from the list of fields.
-
-- The timezone and extended profile features were not correctly stabilized last summer and the `m.tz` field was incorrectly labeled `tz`. Thank you @bunnyblack:matrix.org for reporting in #tuwunel:matrix.org.
-
-- @dasha-uwu fixed git tags not being pulled and applied to CI builds (eadc9e782d8).
-
-- @dasha-uwu fixed a bug in sliding-sync which may result in lost invites (fd519ff7f174).
-
-- `since` tokens in legacy sync are now clamped to a maximum when the client sends a value greater than expected, preventing a possibility of missing events during the request.
-
-- Media deletion commands which are time-based suffered a bug from incorrect creation timestamps on some filesystems. This was resolved by exclusively using the `mtime` attribute, which is acceptable because Matrix media is immutable.
-
-- Queries for the deprecated `_matrix._tcp` SRV record have been reactivated due to an ineffective and unenforced sunset by the specification and other implementations.
-
-- Thank you @x86pup and @dasha-uwu for various maintenance and linting efforts for the latest rustc versions and in general.
-
-### Honorable Mentions
-
-- Please take a moment to recognize how lucky we are to have @scvalex as our NixOS package maintainer. From having the wherewithal to rise above the noise and lend this project trust from the very first days, time and again this gentleman has gone above and beyond on our behalf. Thank you @symphorien at NixOS as well for the patch applied surgically in https://github.com/NixOS/nixpkgs/pull/462394.
+- Debian and RPM upgrades skip the recursive ownership walk over a database directory already owned by `tuwunel:tuwunel`, unless a legacy database was just adopted. The server keeps running until the package restarts it, so a file RocksDB removed mid-walk could fail the `chown`; on Debian that aborted package configuration, while the RPM script ignored the failure. Tip of the hat to @x86pup (afc1116b7).

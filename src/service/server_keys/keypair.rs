@@ -1,3 +1,8 @@
+//! Local Ed25519 keypair persistence and initialization.
+//!
+//! A missing database entry is generated and stored. An invalid stored entry is
+//! deleted and reported as an error so a later service start can regenerate it.
+
 use std::sync::Arc;
 
 use ruma::{api::federation::discovery::VerifyKey, serde::Base64, signatures::Ed25519KeyPair};
@@ -6,6 +11,10 @@ use tuwunel_database::Database;
 
 use super::VerifyKeys;
 
+/// Initializes the local keypair and its active verify-key map.
+///
+/// A missing keypair is generated immediately. If a stored keypair cannot be
+/// decoded, its row is removed but the current call still returns that error.
 pub(super) fn init(db: &Arc<Database>) -> Result<(Box<Ed25519KeyPair>, VerifyKeys)> {
 	let keypair = load(db).inspect_err(|_e| {
 		error!("Keypair invalid. Deleting...");
@@ -46,8 +55,7 @@ fn load(db: &Arc<Database>) -> Result<Box<Ed25519KeyPair>> {
 }
 
 fn create(db: &Arc<Database>) -> Result<(String, Vec<u8>)> {
-	let keypair = Ed25519KeyPair::generate()
-		.map_err(|e| err!("Failed to generate new ed25519 keypair: {e:?}"))?;
+	let keypair = Ed25519KeyPair::generate();
 
 	let id = utils::rand::string(8);
 	debug_info!("Generated new Ed25519 keypair: {id:?}");

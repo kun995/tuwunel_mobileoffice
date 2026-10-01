@@ -109,16 +109,12 @@ impl Service {
 			return false;
 		};
 
-		let pdus = self
-			.services
-			.timeline
-			.pdus(None, room_id, Some(PduCount::Normal(deleted_before)));
+		let pdus =
+			self.services
+				.timeline
+				.pdus(None, room_id, Some(PduCount::Normal(deleted_before)));
 		pin_mut!(pdus);
-		let first_after_delete = pdus
-			.try_next()
-			.await
-			.ok()
-			.flatten();
+		let first_after_delete = pdus.try_next().await.ok().flatten();
 
 		matches!(first_after_delete, Some((PduCount::Normal(count), _)) if count > since && count <= next_batch)
 	}
@@ -140,7 +136,7 @@ pub fn is_after_deleted_before(count: PduCount, deleted_before: Option<u64>) -> 
 	};
 
 	match count {
-		| PduCount::Normal(count) => count > deleted_before,
-		| PduCount::Backfilled(_) => false,
+		PduCount::Normal(count) => count > deleted_before,
+		PduCount::Backfilled(_) => false,
 	}
 }

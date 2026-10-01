@@ -1,0 +1,203 @@
+name: Compliance
+
+on:
+  workflow_call:
+    inputs:
+      regime:
+        type: string
+        description: Test package name
+      counterparty:
+        type: string
+        description: Client or Server tested with
+      runner:
+        type: string
+        default: 'het'
+        description: Runner mask
+      max_parallel:
+        type: number
+        default: 256
+        description: Maximum concurrent matrix cells
+      script:
+        type: string
+        description: Driver script
+      summariser:
+        type: string
+        description: Summariser script
+      results_path:
+        type: string
+        description: Results jsonl path
+      logs_path:
+        type: string
+        description: Logs jsonl path
+      runtime_metrics_path:
+        type: string
+        description: Runtime metrics archive path
+      verbose:
+        type: string
+        default: 'false'
+        description: Verbose flag
+      results_artifact_prefix:
+        type: string
+        description: Results artifact prefix
+      output_artifact_prefix:
+        type: string
+        description: Log-output artifact prefix
+      metrics_artifact_prefix:
+        type: string
+        description: Runtime-metrics artifact prefix
+      runtime_history:
+        type: boolean
+        default: false
+        description: Maintain a runtime-metrics history digest in the Actions cache
+      complement_perf:
+        type: boolean
+        default: false
+        description: Run the testee under perf stat and emit hardware-counter metrics
+      cargo_profiles:
+        type: string
+      feat_sets:
+        type: string
+      rust_toolchains:
+        type: string
+      rust_targets:
+        type: string
+      sys_names:
+        type: string
+      sys_versions:
+        type: string
+      sys_targets:
+        type: string
+      machines:
+        type: string
+      excludes:
+        type: string
+        default: '[]'
+      includes:
+        type: string
+        default: '[]'
+      checkout:
+        type: string
+        default: ${{github.sha}}
+
+jobs:
+  compliance:
+    name: >
+      ${{inputs.counterparty}}-${{inputs.regime}}
+      ${{matrix.cargo_profile}}
+      ${{matrix.rust_toolchain}}
+      ${{matrix.feat_set}}
+      ${{matrix.sys_name}}
+      ${{matrix.sys_version}}
+      ${{matrix.sys_target}}
+
+    runs-on: ["${{matrix.machine}}", "${{inputs.runner}}"]
+    strategy:
+      fail-fast: false
+      max-parallel: ${{inputs.max_parallel}}
+      matrix:
+        cargo_profile: ${{fromJSON(inputs.cargo_profiles)}}
+        feat_set: ${{fromJSON(inputs.feat_sets)}}
+        rust_toolchain: ${{fromJSON(inputs.rust_toolchains)}}
+        sys_name: ${{fromJSON(inputs.sys_names)}}
+        sys_version: ${{fromJSON(inputs.sys_versions)}}
+        rust_target: ${{fromJSON(inputs.rust_targets)}}
+        sys_target: ${{fromJSON(inputs.sys_targets)}}
+        machine: ${{fromJSON(inputs.machines)}}
+        exclude: ${{fromJSON(inputs.excludes)}}
+        include: ${{fromJSON(inputs.includes)}}
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{inputs.checkout || github.sha}}
+
+    - name: Execute
+      id: execute
+      env:
+        cargo_profile: ${{matrix.cargo_profile}}
+        rust_toolchain: ${{matrix.rust_toolchain}}
+        rust_target: ${{matrix.rust_target}}
+        feat_set: ${{matrix.feat_set}}
+        sys_name: ${{matrix.sys_name}}
+        sys_target: ${{matrix.sys_target}}
+        sys_version: ${{matrix.sys_version}}
+        machine: ${{matrix.machine}}
+        complement_verbose: ${{inputs.verbose && 1 || 0}}
+        complement_crypto_verbose: ${{inputs.verbose && 1 || 0}}
+        complement_perf: ${{inputs.complement_perf && '1' || '0'}}
+
+      run: |
+        ${{inputs.script}}
+
+    - if: inputs.runtime_history && (success() || (failure() && steps.execute.outcome == 'failure'))
+      name: Restore Runtime History
+      uses: actions/cache/restore@v5
+      with:
+        path: _ci_digest/${{github.ref_name}}.json
+        key: rt-digest-${{github.ref_name}}-${{inputs.metrics_artifact_prefix}}-${{matrix.feat_set}}-${{matrix.sys_name}}-${{matrix.sys_target}}-${{github.run_id}}-${{github.run_attempt}}
+        restore-keys: |
+          rt-digest-${{github.ref_name}}-${{inputs.metrics_artifact_prefix}}-${{matrix.feat_set}}-${{matrix.sys_name}}-${{matrix.sys_target}}-
+
+    - if: inputs.runtime_history && github.ref_name != (github.event.repository.default_branch || 'main') && (success() || (failure() && steps.execute.outcome == 'failure'))
+      name: Restore Main Baseline
+      uses: actions/cache/restore@v5
+      with:
+        path: _ci_digest/${{github.event.repository.default_branch || 'main'}}.json
+        key: rt-digest-${{github.event.repository.default_branch || 'main'}}-${{inputs.metrics_artifact_prefix}}-${{matrix.feat_set}}-${{matrix.sys_name}}-${{matrix.sys_target}}-readonly
+        restore-keys: |
+          rt-digest-${{github.event.repository.default_branch || 'main'}}-${{inputs.metrics_artifact_prefix}}-${{matrix.feat_set}}-${{matrix.sys_name}}-${{matrix.sys_target}}-
+
+    - if: success() || (failure() && steps.execute.outcome == 'failure')
+      name: Summarise
+      id: summarise
+      env:
+        cargo_profile: ${{matrix.cargo_profile}}
+        feat_set: ${{matrix.feat_set}}
+        sys_name: ${{matrix.sys_name}}
+        sys_target: ${{matrix.sys_target}}
+        GH_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        execute_outcome: ${{steps.execute.outcome}}
+        RUNTIME_DIGEST_OWN: ${{inputs.runtime_history && format('{0}/_ci_digest/{1}.json', github.workspace, github.ref_name) || ''}}
+        RUNTIME_DIGEST_MAIN: ${{(inputs.runtime_history && github.ref_name != (github.event.repository.default_branch || 'main')) && format('{0}/_ci_digest/{1}.json', github.workspace, github.event.repository.default_branch || 'main') || ''}}
+        RUNTIME_DIGEST_KEEP: ${{github.ref_name == (github.event.repository.default_branch || 'main') && '1' || '3'}}
+      run: |
+        ${{inputs.summariser}}
+
+    - if: success() || failure() && steps.execute.outcome == 'failure'
+      name: Upload New Results
+      id: upload-result
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{inputs.results_artifact_prefix}}-${{matrix.feat_set}}-${{matrix.sys_name}}-${{matrix.sys_target}}.jsonl
+        path: ./${{inputs.results_path}}
+
+    - if: success() || (failure() && steps.execute.outcome == 'failure')
+      name: Upload Log Output
+      id: upload-output
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{inputs.output_artifact_prefix}}-${{matrix.feat_set}}-${{matrix.sys_name}}-${{matrix.sys_target}}.jsonl
+        path: ./${{inputs.logs_path}}
+        if-no-files-found: ignore
+
+    - if: success() || (failure() && steps.execute.outcome == 'failure')
+      name: Upload Runtime Metrics
+      id: upload-metrics
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{inputs.metrics_artifact_prefix}}-${{matrix.feat_set}}-${{matrix.sys_name}}-${{matrix.sys_target}}.tar.zst
+        path: ./${{inputs.runtime_metrics_path}}
+        if-no-files-found: ignore
+
+    - if: inputs.runtime_history && steps.execute.outcome == 'success'
+      name: Save Runtime History
+      continue-on-error: true
+      uses: actions/cache/save@v5
+      with:
+        path: _ci_digest/${{github.ref_name}}.json
+        key: rt-digest-${{github.ref_name}}-${{inputs.metrics_artifact_prefix}}-${{matrix.feat_set}}-${{matrix.sys_name}}-${{matrix.sys_target}}-${{github.run_id}}-${{github.run_attempt}}
+
+    - name: Accept
+      id: accept
+      run: |
+        git diff --exit-code --color --color-moved

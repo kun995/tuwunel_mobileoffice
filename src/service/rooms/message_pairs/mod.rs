@@ -39,8 +39,7 @@ impl crate::Service for Service {
 impl Service {
 	pub fn insert(&self, pair: &MessagePair) {
 		let key = pair_key(&pair.sender, &pair.room_id, &pair.event_id);
-		self.userroomid_messagepairs
-			.raw_put(key, Json(pair));
+		self.userroomid_messagepairs.raw_put(key, Json(pair));
 	}
 
 	pub async fn get(
@@ -50,10 +49,7 @@ impl Service {
 		event_id: &EventId,
 	) -> Result<MessagePair> {
 		let key = pair_key(owner, room_id, event_id);
-		self.userroomid_messagepairs
-			.get(&key)
-			.await
-			.deserialized()
+		self.userroomid_messagepairs.get(&key).await.deserialized()
 	}
 
 	pub async fn list(&self, owner: &UserId, room_id: &RoomId) -> Result<Vec<MessagePair>> {

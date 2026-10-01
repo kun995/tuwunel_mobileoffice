@@ -1,4 +1,25 @@
-use crate::utils;
+use std::{
+	future::Ready,
+	panic::{AssertUnwindSafe, catch_unwind},
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
+	task::{Context, Waker},
+	time::Duration,
+};
+
+use futures::future::{OptionFuture, ready};
+
+use crate::{
+	Error, Result,
+	utils::{
+		self, MutexMap, debug::str_truncated, future::OptionFutureExt, math::usize_from_f64,
+		time::pretty, two_phase_counter::Counter, url::hostname_matches_domain,
+	},
+};
+
+type CounterCallback = Box<dyn Fn(u64) -> Result + Send + Sync>;
 
 #[test]
 fn increment_none() {
@@ -53,10 +74,60 @@ fn checked_add_overflow() {
 	assert_eq!(res, 0);
 }
 
+#[test]
+fn usize_from_f64_truncates() {
+	assert_eq!(usize_from_f64(42.75).unwrap(), 42);
+	assert_eq!(usize_from_f64(-0.0).unwrap(), 0);
+}
+
+#[test]
+fn usize_from_f64_rejects_invalid_values() {
+	for value in [-1.0, -0.25, f64::NEG_INFINITY, f64::NAN, f64::INFINITY] {
+		assert!(matches!(usize_from_f64(value), Err(Error::Arithmetic(_))), "accepted {value:?}");
+	}
+}
+
+#[test]
+fn usize_from_f64_enforces_exclusive_bound() {
+	let exponent = i32::try_from(usize::BITS).expect("usize width fits i32");
+	let bound = 2.0_f64.powi(exponent);
+	let spacing = 1_usize << usize::BITS.saturating_sub(f64::MANTISSA_DIGITS);
+	let preceding = usize::MAX - (spacing - 1);
+
+	assert_eq!(usize_from_f64(bound.next_down()).unwrap(), preceding);
+	assert!(matches!(usize_from_f64(bound), Err(Error::Arithmetic(_))));
+	assert!(matches!(usize_from_f64(bound.next_up()), Err(Error::Arithmetic(_))));
+}
+
+#[test]
+fn pretty_zero_pads_the_fraction() {
+	assert_eq!(pretty(Duration::from_secs(12 * 60 + 3)), "12.05 minutes");
+}
+
+#[test]
+fn pretty_bounds_subsecond_fractions() {
+	assert_eq!(pretty(Duration::from_micros(1_500)), "1.50 milliseconds");
+	assert_eq!(pretty(Duration::from_nanos(2_250)), "2.25 microseconds");
+	assert_eq!(pretty(Duration::from_millis(250)), "250.00 milliseconds");
+	assert_eq!(pretty(Duration::from_micros(2)), "2.00 microseconds");
+	assert_eq!(pretty(Duration::from_micros(999)), "999.00 microseconds");
+	assert_eq!(pretty(Duration::from_millis(1)), "1.00 milliseconds");
+	assert_eq!(pretty(Duration::from_millis(999)), "999.00 milliseconds");
+	assert_eq!(pretty(Duration::from_secs(1)), "1.00 seconds");
+}
+
+#[test]
+fn str_truncated_rounds_inside_middle_scalar() {
+	assert_eq!(format!("{:?}", str_truncated("aéz", 2)), "\"aé\"...");
+}
+
+#[test]
+fn str_truncated_rounds_inside_final_scalar() {
+	assert_eq!(format!("{:?}", str_truncated("aé", 2)), "\"aé\"...");
+}
+
 #[tokio::test]
 async fn mutex_map_cleanup() {
-	use crate::utils::MutexMap;
-
 	let map = MutexMap::<String, ()>::new();
 
 	let lock = map.lock("foo").await;
@@ -71,8 +142,6 @@ async fn mutex_map_contend() {
 	use std::sync::Arc;
 
 	use tokio::sync::Barrier;
-
-	use crate::utils::MutexMap;
 
 	let map = Arc::new(MutexMap::<String, ()>::new());
 	let seq = Arc::new([Barrier::new(2), Barrier::new(2)]);
@@ -104,6 +173,33 @@ async fn mutex_map_contend() {
 
 	tokio::try_join!(join_b, join_a).expect("joined");
 	assert!(map.is_empty(), "Must be empty");
+}
+
+#[tokio::test]
+async fn mutex_map_cancel() {
+	let map = MutexMap::<String, ()>::new();
+
+	let lock = map.lock("foo").await;
+	let mut contend = Box::pin(map.lock("foo"));
+	let mut cx = Context::from_waker(Waker::noop());
+
+	assert!(contend.as_mut().poll(&mut cx).is_pending(), "must contend");
+
+	drop(lock);
+	drop(contend);
+	assert!(map.is_empty(), "map must be empty");
+}
+
+#[tokio::test]
+async fn mutex_map_try_cleanup() {
+	let map = MutexMap::<String, ()>::new();
+
+	let lock = map.lock("foo").await;
+	assert!(map.try_lock("foo").is_err(), "must contend");
+	assert!(map.try_try_lock("foo").is_err(), "must contend");
+
+	drop(lock);
+	assert!(map.is_empty(), "map must be empty");
 }
 
 #[test]
@@ -245,33 +341,33 @@ async fn set_intersection_sorted_stream2() {
 	let r = intersection_sorted_stream2(a.iter().stream(), b.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	assert!(r.eq(&["bar"]));
+	assert_eq!(r, &["bar"]);
 
 	let r = intersection_sorted_stream2(b.iter().stream(), a.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	assert!(r.eq(&["bar"]));
+	assert_eq!(r, &["bar"]);
 
 	let a = ["aaa", "ccc", "xxx", "yyy"];
 	let b = ["hhh", "iii", "jjj", "zzz"];
 	let r = intersection_sorted_stream2(a.iter().stream(), b.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	assert!(r.is_empty());
+	assert!(r.is_empty(), "{r:?}");
 
 	let a = ["aaa", "ccc", "eee", "ggg"];
 	let b = ["aaa", "bbb", "ccc", "ddd", "eee"];
 	let r = intersection_sorted_stream2(a.iter().stream(), b.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	assert!(r.eq(&["aaa", "ccc", "eee"]));
+	assert_eq!(r, &["aaa", "ccc", "eee"]);
 
 	let a = ["aaa", "ccc", "eee", "ggg", "hhh", "iii"];
 	let b = ["bbb", "ccc", "ddd", "fff", "ggg", "iii"];
 	let r = intersection_sorted_stream2(a.iter().stream(), b.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	assert!(r.eq(&["ccc", "ggg", "iii"]));
+	assert_eq!(r, &["ccc", "ggg", "iii"]);
 }
 
 #[tokio::test]
@@ -284,36 +380,106 @@ async fn set_difference_sorted_stream2() {
 	let r = difference_sorted_stream2(a.iter().stream(), b.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	println!("{r:?}");
-	assert!(r.eq(&["foo"]));
+	assert_eq!(r, &["foo"]);
 
 	let r = difference_sorted_stream2(b.iter().stream(), a.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	println!("{r:?}");
-	assert!(r.is_empty());
+	assert!(r.is_empty(), "{r:?}");
 
 	let a = ["aaa", "ccc", "xxx", "yyy"];
 	let b = ["hhh", "iii", "jjj", "zzz"];
 	let r = difference_sorted_stream2(a.iter().stream(), b.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	println!("{r:?}");
-	assert!(r.eq(&["aaa", "ccc", "xxx", "yyy"]));
+	assert_eq!(r, &["aaa", "ccc", "xxx", "yyy"]);
 
 	let a = ["aaa", "ccc", "eee", "ggg"];
 	let b = ["aaa", "bbb", "ccc", "ddd", "eee"];
 	let r = difference_sorted_stream2(a.iter().stream(), b.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	println!("{r:?}");
-	assert!(r.eq(&["ggg"]));
+	assert_eq!(r, &["ggg"]);
 
 	let a = ["aaa", "ccc", "eee", "ggg", "hhh", "iii"];
 	let b = ["bbb", "ccc", "ddd", "fff", "ggg", "iii"];
 	let r = difference_sorted_stream2(a.iter().stream(), b.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	println!("{r:?}");
-	assert!(r.eq(&["aaa", "eee", "hhh"]));
+	assert_eq!(r, &["aaa", "eee", "hhh"]);
+}
+
+#[test]
+fn page_size() {
+	use crate::utils::sys::page_size;
+
+	let val = page_size().expect("Failed to get system page size");
+	println!("{val:?}");
+
+	assert!(val != 0, "page size was zero");
+}
+
+#[test]
+fn two_phase_counter_recovers_from_panicking_commit() {
+	let refuse = Arc::new(AtomicBool::new(false));
+	let refuse_in_commit = refuse.clone();
+	let commit: CounterCallback = Box::new(move |count| {
+		assert!(
+			!refuse_in_commit.load(Ordering::Relaxed),
+			"commit refused sequence number {count}"
+		);
+
+		Ok(())
+	});
+
+	let release: CounterCallback = Box::new(|_| Ok(()));
+	let counter = Counter::new(0, commit, release);
+	let first = counter.next().expect("first sequence number");
+
+	assert_eq!(*first, 1, "the first sequence number dispatched is one");
+	drop(first);
+
+	refuse.store(true, Ordering::Relaxed);
+	catch_unwind(AssertUnwindSafe(|| drop(counter.next())))
+		.expect_err("a panicking commit callback unwinds out of the counter");
+
+	refuse.store(false, Ordering::Relaxed);
+	let second = counter
+		.next()
+		.expect("the counter outlives a poisoned lock");
+
+	assert_eq!(*second, 2, "the failed dispatch consumed no sequence number");
+	assert_eq!(counter.current(), 1, "the retirement value trails the pending permit");
+}
+
+#[test]
+fn hostname_domain_matching_is_case_insensitive_and_label_bounded() {
+	for (hostname, domain, expected) in [
+		("example.com", "example.com", true),
+		("EXAMPLE.COM", ".example.com", true),
+		("sub.example.com", "example.com", true),
+		("sub.example.com", ".EXAMPLE.COM", true),
+		("notexample.com", "example.com", false),
+		("example.org", "example.com", false),
+		("example.com.", ".", true),
+		("example.com", ".", false),
+		("example.com", "", false),
+	] {
+		assert_eq!(
+			hostname_matches_domain(hostname, domain),
+			expected,
+			"hostname {hostname}, domain {domain}",
+		);
+	}
+}
+
+#[tokio::test]
+async fn option_future_unwrap_or_else_async() {
+	let present: OptionFuture<_> = Some(ready(1)).into();
+
+	assert_eq!(present.unwrap_or_else_async(|| ready(2)).await, 1);
+
+	let absent: OptionFuture<_> = None::<Ready<i32>>.into();
+
+	assert_eq!(absent.unwrap_or_else_async(|| ready(2)).await, 2);
 }

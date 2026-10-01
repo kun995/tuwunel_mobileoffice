@@ -7,7 +7,10 @@ use tuwunel_core::{
 	utils::{BoolExt, FutureBoolExt, TryFutureExtExt, future::OptionFutureExt},
 };
 
-use crate::{Ruma, client::is_ignored_pdu};
+use crate::{
+	Ruma,
+	client::{annotate_membership, is_ignored_pdu},
+};
 
 /// # `GET /_matrix/client/r0/rooms/{roomId}/event/{eventId}`
 ///
@@ -25,36 +28,36 @@ pub(crate) async fn get_room_event_route(
 		.get_pdu(event_id)
 		.map_err(|_| err!(Request(NotFound("Event {} not found.", event_id))));
 
-	let retained_event = body
-		.include_unredacted_content
-		.then_async(async || {
-			let is_admin = services.admin.user_is_admin(sender_user);
+	let retained_event = body.include_unredacted_content.then_async(async || {
+		let is_admin = services.admin.user_is_admin(sender_user);
 
-			let can_redact = services
-				.config
-				.allow_room_admins_to_request_unredacted_events
-				.then_async(|| {
-					services
-						.state_accessor
-						.get_power_levels(room_id)
-						.map_ok_or(false, |power_levels| {
-							power_levels.for_user(sender_user) >= power_levels.redact
-						})
-				})
-				.unwrap_or(false);
-
-			pin_mut!(is_admin, can_redact);
-
-			if is_admin.or(can_redact).await {
+		let can_redact = services
+			.config
+			.allow_room_admins_to_request_unredacted_events
+			.then_async(|| {
 				services
-					.retention
-					.get_original_pdu(event_id)
-					.await
-					.map_err(|_| err!(Request(NotFound("Event {} not found.", event_id))))
-			} else {
-				Err!(Request(Forbidden("You are not allowed to see the original event")))
-			}
-		});
+					.state_accessor
+					.get_power_levels(room_id)
+					.map_ok_or(false, |power_levels| {
+						power_levels.for_user(sender_user) >= power_levels.redact
+					})
+			})
+			.unwrap_or(false);
+
+		pin_mut!(is_admin, can_redact);
+
+		if is_admin.or(can_redact).await {
+			services
+				.retention
+				.get_original_pdu(event_id)
+				.await
+				.map_err(|_| err!(Request(NotFound("Event {} not found.", event_id))))
+		} else {
+			Err!(Request(Forbidden(
+				"You are not allowed to see the original event"
+			)))
+		}
+	});
 
 	let visible = services
 		.state_accessor
@@ -70,11 +73,7 @@ pub(crate) async fn get_room_event_route(
 	}
 
 	let mut event = event?;
-	let event_count = services
-		.timeline
-		.get_pdu_count(event_id)
-		.await
-		.ok();
+	let event_count = services.timeline.get_pdu_count(event_id).await.ok();
 
 	let hidden_by_checkpoint = if let Some(event_count) = event_count {
 		services
@@ -89,7 +88,9 @@ pub(crate) async fn get_room_event_route(
 		|| !visible
 		|| is_ignored_pdu(&services, &event, body.sender_user()).await
 	{
-		return Err!(Request(Forbidden("You don't have permission to view this event.")));
+		return Err!(Request(Forbidden(
+			"You don't have permission to view this event."
+		)));
 	}
 
 	debug_assert!(
@@ -99,5 +100,16 @@ pub(crate) async fn get_room_event_route(
 
 	event.add_age().ok();
 
-	Ok(get_room_event::v3::Response { event: event.into_format() })
+	let encrypted = services.state_accessor.is_encrypted_room(room_id).await;
+
+	annotate_membership(&services, &mut event, sender_user, encrypted).await;
+
+	let event = services
+		.pdu_metadata
+		.bundle_aggregations(sender_user, event)
+		.await;
+
+	Ok(get_room_event::v3::Response {
+		event: event.into_format(),
+	})
 }

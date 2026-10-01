@@ -3,10 +3,10 @@
 use std::{
 	collections::VecDeque,
 	ops::{Deref, Range},
-	sync::{Arc, RwLock},
+	sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
-use crate::{Result, checked, is_equal_to};
+use crate::{Result, checked, error, is_equal_to};
 
 /// Two-Phase Counter.
 ///
@@ -22,13 +22,13 @@ use crate::{Result, checked, is_equal_to};
 /// value, but that value has no Pdu found because its write has not been
 /// completed with global visibility. Client-sync will then move on to the next
 /// counter value having missed the data from the current one.
-pub struct Counter<F: Fn(u64) -> Result + Sync> {
-	/// Self is intended to be Arc<Counter> with inner state mutable via Lock.
+pub struct Counter<F: Fn(u64) -> Result + Send + Sync> {
+	/// Self is intended to be `Arc<Counter>` with inner state mutable via Lock.
 	inner: RwLock<State<F>>,
 }
 
 /// Inner protected state for Two-Phase Counter.
-pub struct State<F: Fn(u64) -> Result + Sync> {
+pub struct State<F: Fn(u64) -> Result + Send + Sync> {
 	/// Monotonic counter. The next sequence number is drawn by adding one to
 	/// this value. That number will be persisted and added to `pending`.
 	dispatched: u64,
@@ -47,7 +47,13 @@ pub struct State<F: Fn(u64) -> Result + Sync> {
 	release: F,
 }
 
-pub struct Permit<F: Fn(u64) -> Result + Sync> {
+#[clippy::has_significant_drop]
+/// Holds a dispatched sequence number until its write operation retires.
+///
+/// The permit dereferences to its unique sequence number and records the
+/// retirement frontier sampled at dispatch. Dropping it retires the sequence
+/// through the shared counter so the retirement frontier advances in order.
+pub struct Permit<F: Fn(u64) -> Result + Send + Sync> {
 	/// Link back to the shared-state.
 	state: Arc<Counter<F>>,
 
@@ -59,7 +65,7 @@ pub struct Permit<F: Fn(u64) -> Result + Sync> {
 	id: u64,
 }
 
-impl<F: Fn(u64) -> Result + Sync> Counter<F> {
+impl<F: Fn(u64) -> Result + Send + Sync> Counter<F> {
 	/// Construct a new Two-Phase counter state. The value of `init` is
 	/// considered retired, and the next sequence number dispatched will be one
 	/// greater.
@@ -71,7 +77,7 @@ impl<F: Fn(u64) -> Result + Sync> Counter<F> {
 
 	/// Obtain a sequence number to conduct write operations for the scope.
 	pub fn next(self: &Arc<Self>) -> Result<Permit<F>> {
-		let (retired, id) = self.inner.write()?.dispatch()?;
+		let (retired, id) = self.write().dispatch()?;
 
 		Ok(Permit::<F> { state: self.clone(), retired, id })
 	}
@@ -79,7 +85,7 @@ impl<F: Fn(u64) -> Result + Sync> Counter<F> {
 	/// Load the current and dispatched values simultaneously
 	#[inline]
 	pub fn range(&self) -> Range<u64> {
-		let inner = self.inner.read().expect("locked for reading");
+		let inner = self.read();
 
 		Range {
 			start: inner.retired(),
@@ -90,25 +96,38 @@ impl<F: Fn(u64) -> Result + Sync> Counter<F> {
 	/// Load the highest sequence number safe for reading, also known as the
 	/// retirement value with writes "globally visible."
 	#[inline]
-	pub fn current(&self) -> u64 {
-		self.inner
-			.read()
-			.expect("locked for reading")
-			.retired()
-	}
+	pub fn current(&self) -> u64 { self.read().retired() }
 
 	/// Load the highest sequence number (dispatched); may still be pending or
 	/// may be retired.
 	#[inline]
-	pub fn dispatched(&self) -> u64 {
+	pub fn dispatched(&self) -> u64 { self.read().dispatched }
+
+	/// Borrow the state for reading, tolerating a poisoned lock.
+	///
+	/// Poisoning carries no information here: `commit` runs before any mutation
+	/// and `release` after all of them, so an unwind through either callback
+	/// leaves the state consistent. Honoring the flag instead turns a single
+	/// failed write into a permanent outage of every sequence number.
+	#[inline]
+	fn read(&self) -> RwLockReadGuard<'_, State<F>> {
 		self.inner
 			.read()
-			.expect("locked for reading")
-			.dispatched
+			.unwrap_or_else(PoisonError::into_inner)
+	}
+
+	/// Borrow the state for writing, tolerating a poisoned lock.
+	///
+	/// The reasoning is the same as [`Self::read`].
+	#[inline]
+	fn write(&self) -> RwLockWriteGuard<'_, State<F>> {
+		self.inner
+			.write()
+			.unwrap_or_else(PoisonError::into_inner)
 	}
 }
 
-impl<F: Fn(u64) -> Result + Sync> State<F> {
+impl<F: Fn(u64) -> Result + Send + Sync> State<F> {
 	/// Create new state, starting from `init`. The next sequence number
 	/// dispatched will be one greater than `init`.
 	fn new(dispatched: u64, commit: F, release: F) -> Self {
@@ -132,25 +151,28 @@ impl<F: Fn(u64) -> Result + Sync> State<F> {
 		);
 
 		(self.commit)(dispatched)?;
+		self.pending.push_back(dispatched);
 		self.dispatched = dispatched;
-		self.pending.push_back(self.dispatched);
-		Ok((retired, self.dispatched))
+
+		Ok((retired, dispatched))
 	}
 
 	/// Retire the sequence number `id`.
+	///
+	/// This runs from a destructor, so outside debug assertions a
+	/// desynchronized pending list or a failing release callback is logged
+	/// rather than raised as a panic.
 	fn retire(&mut self, id: u64) {
-		debug_assert!(self.check_pending(id), "sequence number must be currently pending",);
+		debug_assert!(self.check_pending(id), "sequence number must be currently pending");
 
-		let index = self
-			.pending_index(id)
-			.expect("sequence number must be found as pending");
+		let Some(index) = self.pending_index(id) else {
+			error!(id, "Sequence number was not pending for retirement.");
+			return;
+		};
 
-		let removed = self
-			.pending
-			.remove(index)
-			.expect("sequence number at index must be removed");
+		let removed = self.pending.remove(index);
 
-		debug_assert_eq!(removed, id, "sequence number removed must match id");
+		debug_assert_eq!(removed, Some(id), "sequence number removed must match id");
 
 		// release only occurs when the oldest value retires
 		if index != 0 {
@@ -162,7 +184,9 @@ impl<F: Fn(u64) -> Result + Sync> State<F> {
 
 		debug_assert!(release >= id, "sequence number released must not be less than id");
 
-		(self.release)(release).expect("release callback should not error");
+		(self.release)(release)
+			.inspect_err(|error| error!(release, %error, "Failed to release sequence number."))
+			.ok();
 	}
 
 	/// Calculate the retired sequence number, one less than the lowest pending
@@ -195,7 +219,7 @@ impl<F: Fn(u64) -> Result + Sync> State<F> {
 	fn check_pending(&self, id: u64) -> bool { self.pending.iter().any(is_equal_to!(&id)) }
 }
 
-impl<F: Fn(u64) -> Result + Sync> Permit<F> {
+impl<F: Fn(u64) -> Result + Send + Sync> Permit<F> {
 	/// Access the retired sequence number sampled at this permit's creation.
 	/// This may be outdated prior to access. Obtained as a courtesy under lock.
 	#[inline]
@@ -208,19 +232,13 @@ impl<F: Fn(u64) -> Result + Sync> Permit<F> {
 	pub fn id(&self) -> &u64 { &self.id }
 }
 
-impl<F: Fn(u64) -> Result + Sync> Deref for Permit<F> {
+impl<F: Fn(u64) -> Result + Send + Sync> Deref for Permit<F> {
 	type Target = u64;
 
 	#[inline]
 	fn deref(&self) -> &Self::Target { self.id() }
 }
 
-impl<F: Fn(u64) -> Result + Sync> Drop for Permit<F> {
-	fn drop(&mut self) {
-		self.state
-			.inner
-			.write()
-			.expect("locked for writing")
-			.retire(self.id);
-	}
+impl<F: Fn(u64) -> Result + Send + Sync> Drop for Permit<F> {
+	fn drop(&mut self) { self.state.write().retire(self.id); }
 }

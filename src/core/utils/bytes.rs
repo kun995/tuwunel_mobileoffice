@@ -1,6 +1,33 @@
-use bytesize::ByteSize;
+//! Byte-size parsing, display, and integer encoding helpers.
+//!
+//! The module handles human-readable sizes alongside fixed-width big-endian
+//! counters. Its size deserializers integrate human-readable values with Serde.
 
-use crate::{Result, err};
+use bytesize::ByteSize;
+use serde::{Deserialize, Deserializer, de};
+
+use crate::{Result, at, err};
+
+/// Accepts an integer byte count or a string with SI/IEC suffix (e.g. "24 MiB")
+/// and returns a `usize`.
+pub fn deserialize_bytesize_usize<'de, D>(de: D) -> Result<usize, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	ByteSize::deserialize(de)
+		.map(at!(0))
+		.map(usize::try_from)?
+		.map_err(de::Error::custom)
+}
+
+/// Accepts an integer byte count or a string with SI/IEC suffix (e.g. "32 MiB")
+/// and returns a `u64`.
+pub fn deserialize_bytesize_u64<'de, D>(de: D) -> Result<u64, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	ByteSize::deserialize(de).map(at!(0))
+}
 
 /// Parse a human-writable size string w/ si-unit suffix into integer
 #[inline]
@@ -28,6 +55,10 @@ pub fn pretty(bytes: usize) -> String {
 	ByteSize::b(bytes).display().iec().to_string()
 }
 
+/// Increments an optional big-endian counter with wrapping arithmetic.
+///
+/// Missing or malformed input is treated as zero. The returned array contains
+/// the incremented value in big-endian byte order.
 #[inline]
 #[must_use]
 pub fn increment(old: Option<&[u8]>) -> [u8; 8] {

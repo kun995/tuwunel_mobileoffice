@@ -1,0 +1,103 @@
+name: Bug Report
+description: Something in Tuwunel isn't right.
+labels: ["bug"]
+type: Bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please search
+        [existing issues](https://github.com/matrix-construct/tuwunel/issues)
+        first to avoid duplicates.
+
+        **Do not report security vulnerabilities here.** Use one of the
+        private channels in our
+        [security policy](https://github.com/matrix-construct/tuwunel/blob/main/SECURITY.md)
+        instead.
+  - type: dropdown
+    id: main-branch
+    attributes:
+      label: Tested against main
+      description: >-
+        Fixes reach the `main` branch before they reach a tagged release,
+        so a bug in your version may already be gone. Every merge to
+        `main` is published as an image, so testing it usually costs a
+        pull rather than a build: `ghcr.io/matrix-construct/tuwunel:main`
+        or `docker.io/jevolk/tuwunel:main`.
+      options:
+        - "Yes, I reproduced it on a build of the main branch"
+        - "No, I could not run main; the version below is what I tested"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Tuwunel version
+      description: >-
+        From `tuwunel --version`, the `!admin server version` command, or
+        the image tag you are running.
+      placeholder: "1.8.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - Docker / OCI image
+        - Debian package
+        - Static binary from a release
+        - Built from source
+        - Distribution or third-party package
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and OS
+      placeholder: "Debian 13 on x86_64"
+  - type: dropdown
+    id: database-origin
+    attributes:
+      label: Database origin
+      description: >-
+        Was this database created by Tuwunel, or migrated from another
+        server implementation? Pick the exact one you migrated from; each
+        origin has its own schema history and its own class of bugs.
+      options:
+        - Created by Tuwunel
+        - Migrated from Conduit
+        - Migrated from conduwuit
+        - Migrated from a conduwuit-lineage fork
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: >-
+        Describe the bug and its impact. If a client or another homeserver
+        is involved, name it; some issues are client or federation specific.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output or configuration
+      description: >-
+        Paste relevant log lines and any non-default config options.
+        Redact secrets, tokens, and anything private.
+      render: shell

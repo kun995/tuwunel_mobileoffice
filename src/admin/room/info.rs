@@ -1,85 +1,144 @@
-use clap::Subcommand;
-use futures::StreamExt;
-use ruma::OwnedRoomId;
-use tuwunel_core::{Err, Result, utils::ReadyExt};
-
-use crate::{admin_command, admin_command_dispatch};
-
-#[admin_command_dispatch]
-#[derive(Debug, Subcommand)]
-pub(crate) enum RoomInfoCommand {
-	/// - List joined members in a room
-	ListJoinedMembers {
-		room_id: OwnedRoomId,
-
-		/// Lists only our local users in the specified room
-		#[arg(long)]
-		local_only: bool,
+use futures::{FutureExt, StreamExt, TryFutureExt, join};
+use ruma::{
+	OwnedRoomAliasId, OwnedRoomOrAliasId, RoomAliasId,
+	events::{
+		StateEventType,
+		room::{canonical_alias::RoomCanonicalAliasEventContent, power_levels::UserPowerLevel},
 	},
+};
+use tuwunel_core::{Err, Result, utils::TryFutureExtExt};
 
-	/// - Displays room topic
-	///
-	/// Room topics can be huge, so this is in its
-	/// own separate command
-	ViewRoomTopic {
-		room_id: OwnedRoomId,
-	},
-}
+use crate::admin_command;
 
 #[admin_command]
-async fn list_joined_members(&self, room_id: OwnedRoomId, local_only: bool) -> Result {
-	let room_name = self
+pub(super) async fn room_info(&self, room: OwnedRoomOrAliasId) -> Result {
+	let room_id = self.services.alias.maybe_resolve(&room).await?;
+
+	if !self.services.metadata.exists(&room_id).await {
+		return Err!("Room {room_id} is not known to this server.");
+	}
+
+	let create_event = self
+		.services
+		.state_accessor
+		.get_create(&room_id)
+		.boxed();
+
+	let name = self
 		.services
 		.state_accessor
 		.get_name(&room_id)
-		.await
-		.unwrap_or_else(|_| room_id.to_string());
+		.unwrap_or_else(|_| "(none)".to_owned())
+		.boxed();
 
-	let member_info: Vec<_> = self
-		.services
-		.state_cache
-		.room_members(&room_id)
-		.ready_filter(|user_id| {
-			local_only
-				.then(|| self.services.globals.user_is_local(user_id))
-				.unwrap_or(true)
-		})
-		.map(ToOwned::to_owned)
-		.filter_map(async |user_id| {
-			Some((
-				self.services
-					.users
-					.displayname(&user_id)
-					.await
-					.unwrap_or_else(|_| user_id.to_string()),
-				user_id,
-			))
-		})
-		.collect()
-		.await;
-
-	let num = member_info.len();
-	let body = member_info
-		.into_iter()
-		.map(|(displayname, mxid)| format!("{mxid} | {displayname}"))
-		.collect::<Vec<_>>()
-		.join("\n");
-
-	self.write_str(&format!("{num} Members in Room \"{room_name}\":\n```\n{body}\n```",))
-		.await
-}
-
-#[admin_command]
-async fn view_room_topic(&self, room_id: OwnedRoomId) -> Result {
-	let Ok(room_topic) = self
+	let topic = self
 		.services
 		.state_accessor
 		.get_room_topic(&room_id)
-		.await
-	else {
-		return Err!("Room does not have a room topic set.");
-	};
+		.unwrap_or_else(|_| "(none)".to_owned())
+		.boxed();
 
-	self.write_str(&format!("Room topic:\n```\n{room_topic}\n```"))
-		.await
+	let canonical_alias = self
+		.services
+		.state_accessor
+		.room_state_get_content(&room_id, &StateEventType::RoomCanonicalAlias, "")
+		.map_ok(|content: RoomCanonicalAliasEventContent| (content.alias, content.alt_aliases))
+		.unwrap_or_default()
+		.boxed();
+
+	let aliases = self
+		.services
+		.alias
+		.local_aliases_for_room(&room_id)
+		.map(Into::into)
+		.collect::<Vec<OwnedRoomAliasId>>()
+		.boxed();
+
+	let power_levels = self
+		.services
+		.state_accessor
+		.get_power_levels(&room_id)
+		.boxed();
+
+	let (create_event, name, topic, (canonical_alias, alt_aliases), mut aliases, power_levels) =
+		join!(create_event, name, topic, canonical_alias, aliases, power_levels);
+
+	let create_event = create_event?;
+	let power_levels = power_levels?;
+
+	let room_version = create_event.room_version()?;
+
+	aliases.sort();
+
+	// Local aliases not published in the canonical alias event.
+	let unlisted: Vec<_> = aliases
+		.iter()
+		.filter(|&alias| canonical_alias.as_ref() != Some(alias) && !alt_aliases.contains(alias))
+		.collect();
+
+	let state_default = power_levels.state_default;
+
+	let mut admins: Vec<_> = power_levels
+		.users
+		.keys()
+		.chain(
+			power_levels
+				.rules
+				.privileged_creators
+				.iter()
+				.flatten(),
+		)
+		.map(|user_id| (user_id, power_levels.for_user(user_id)))
+		.filter(|&(_, pl)| pl >= state_default)
+		.collect();
+
+	admins.sort_by(|(user_a, pl_a), (user_b, pl_b)| {
+		pl_b.cmp(pl_a).then_with(|| user_a.cmp(user_b))
+	});
+
+	writeln!(self, "```\nRoom information for {room_id}\n").await?;
+
+	writeln!(self, "Room version: {room_version}\n").await?;
+
+	writeln!(self, "Name: {name}").await?;
+	writeln!(self, "Topic: \n{topic}\n").await?;
+
+	writeln!(self, "Aliases:").await?;
+	let canonical_alias = canonical_alias
+		.as_deref()
+		.map(RoomAliasId::as_str)
+		.unwrap_or("none");
+	writeln!(self, "  Canonical: {canonical_alias}").await?;
+
+	writeln!(self, "  Alternative:").await?;
+	if alt_aliases.is_empty() {
+		writeln!(self, "    none").await?;
+	} else {
+		for alias in &alt_aliases {
+			writeln!(self, "    - {alias}").await?;
+		}
+	}
+
+	writeln!(self, "  Local unlisted:").await?;
+	if unlisted.is_empty() {
+		writeln!(self, "    none").await?;
+	} else {
+		for alias in unlisted {
+			writeln!(self, "    - {alias}").await?;
+		}
+	}
+
+	writeln!(self, "\nAdmins (power level >= {state_default}):").await?;
+	for (user_id, pl) in &admins {
+		let pl = match pl {
+			| UserPowerLevel::Int(pl) => pl.to_string(),
+			| UserPowerLevel::Infinite => "creator".to_owned(),
+		};
+
+		writeln!(self, "  - {user_id} ({pl})").await?;
+	}
+
+	writeln!(self, "```").await?;
+
+	Ok(())
 }

@@ -1,90 +1,129 @@
+mod create;
 mod dehydrated_device;
 pub mod device;
+mod invite_filter;
 mod keys;
 mod ldap;
-mod profile;
 mod register;
+mod server_user;
 
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt, TryFutureExt};
 use ruma::{
-	OwnedRoomId, OwnedUserId, UserId,
+	MilliSecondsSinceUnixEpoch, OwnedUserId, UserId,
 	api::client::filter::FilterDefinition,
-	events::{GlobalAccountDataEventType, ignored_user_list::IgnoredUserListEvent},
+	events::{
+		GlobalAccountDataEventType,
+		ignored_user_list::{IgnoredUserListEvent, IgnoredUserListEventContent},
+	},
 };
+use serde::{Deserialize, Serialize};
 use tuwunel_core::{
 	Err, Result, debug_warn, err, is_equal_to,
-	pdu::PduBuilder,
+	matrix::pdu::PduCount,
 	trace,
-	utils::{self, ReadyExt, stream::TryIgnore},
-	warn,
+	utils::{
+		self, BoolExt, MutexMap, ReadyExt, hash::password as hash_password, stream::TryIgnore,
+	},
 };
 use tuwunel_database::{Database, Deserialized, Json, Map, SEP};
 
-pub use self::{keys::parse_master_key, register::Register};
+pub use self::{
+	dehydrated_device::DehydratedDevice,
+	invite_filter::InviteFilter,
+	keys::{DeviceListChange, DeviceListRecord, parse_master_key},
+	register::Register,
+	server_user::SERVER_USER_KEY,
+};
+
+pub const PASSWORD_SENTINEL: &str = "*";
+pub const PASSWORD_DISABLED: &str = "";
+
+/// Forensic record for a moderation action (MSC3823 suspend, MSC3939 lock).
+/// Presence of the row is the load-bearing fact; this body is written but
+/// never read on the hot path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Moderation {
+	pub when: MilliSecondsSinceUnixEpoch,
+	pub by: OwnedUserId,
+}
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
 	db: Data,
+	device_list_mutex: MutexMap<OwnedUserId, ()>,
 }
 
 struct Data {
 	database: Arc<Database>,
+	keychangeid_devicechange: Arc<Map>,
 	keychangeid_userid: Arc<Map>,
 	keyid_key: Arc<Map>,
-	onetimekeyid_onetimekeys: Arc<Map>,
+	onetimekeyid4225_otk: Option<Arc<Map>>,
 	openidtoken_expiresatuserid: Arc<Map>,
 	logintoken_expiresatuserid: Arc<Map>,
 	todeviceid_events: Arc<Map>,
+	spentrefresh_userdeviceid: Arc<Map>,
 	token_userdeviceid: Arc<Map>,
 	userdeviceid_metadata: Arc<Map>,
 	userdeviceid_token: Arc<Map>,
+	userdeviceidtoken_index: Arc<Map>,
 	userdeviceid_refresh: Arc<Map>,
+	userdeviceid_spentrefresh: Arc<Map>,
+	userdeviceidalgorithm_fallback: Arc<Map>,
+	oidcdevice_userdeviceid: Arc<Map>,
+	oidccskeybypass_userid: Arc<Map>,
 	userfilterid_filter: Arc<Map>,
-	userid_avatarurl: Arc<Map>,
-	userid_blurhash: Arc<Map>,
 	userid_dehydrateddevice: Arc<Map>,
 	userid_devicelistversion: Arc<Map>,
-	userid_displayname: Arc<Map>,
+	userid_erased: Arc<Map>,
 	userid_lastonetimekeyupdate: Arc<Map>,
+	userid_locked: Arc<Map>,
 	userid_masterkeyid: Arc<Map>,
 	userid_password: Arc<Map>,
 	userid_origin: Arc<Map>,
 	userid_selfsigningkeyid: Arc<Map>,
+	userid_suspended: Arc<Map>,
 	userid_usersigningkeyid: Arc<Map>,
-	useridprofilekey_value: Arc<Map>,
 }
 
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			services: args.services.clone(),
+			device_list_mutex: MutexMap::new(),
 			db: Data {
 				database: args.db.clone(),
+				keychangeid_devicechange: args.db["keychangeid_devicechange"].clone(),
 				keychangeid_userid: args.db["keychangeid_userid"].clone(),
 				keyid_key: args.db["keyid_key"].clone(),
-				onetimekeyid_onetimekeys: args.db["onetimekeyid_onetimekeys"].clone(),
+				onetimekeyid4225_otk: args.db.get("onetimekeyid4225_otk").ok().cloned(),
 				openidtoken_expiresatuserid: args.db["openidtoken_expiresatuserid"].clone(),
 				logintoken_expiresatuserid: args.db["logintoken_expiresatuserid"].clone(),
+				oidcdevice_userdeviceid: args.db["oidcdevice_userdeviceid"].clone(),
+				oidccskeybypass_userid: args.db["oidccskeybypass_userid"].clone(),
 				todeviceid_events: args.db["todeviceid_events"].clone(),
+				spentrefresh_userdeviceid: args.db["spentrefresh_userdeviceid"].clone(),
 				token_userdeviceid: args.db["token_userdeviceid"].clone(),
 				userdeviceid_metadata: args.db["userdeviceid_metadata"].clone(),
 				userdeviceid_token: args.db["userdeviceid_token"].clone(),
+				userdeviceidtoken_index: args.db["userdeviceidtoken_index"].clone(),
 				userdeviceid_refresh: args.db["userdeviceid_refresh"].clone(),
+				userdeviceid_spentrefresh: args.db["userdeviceid_spentrefresh"].clone(),
+				userdeviceidalgorithm_fallback: args.db["userdeviceidalgorithm_fallback"].clone(),
 				userfilterid_filter: args.db["userfilterid_filter"].clone(),
-				userid_avatarurl: args.db["userid_avatarurl"].clone(),
-				userid_blurhash: args.db["userid_blurhash"].clone(),
 				userid_dehydrateddevice: args.db["userid_dehydrateddevice"].clone(),
 				userid_devicelistversion: args.db["userid_devicelistversion"].clone(),
-				userid_displayname: args.db["userid_displayname"].clone(),
+				userid_erased: args.db["userid_erased"].clone(),
 				userid_lastonetimekeyupdate: args.db["userid_lastonetimekeyupdate"].clone(),
+				userid_locked: args.db["userid_locked"].clone(),
 				userid_masterkeyid: args.db["userid_masterkeyid"].clone(),
 				userid_password: args.db["userid_password"].clone(),
 				userid_origin: args.db["userid_origin"].clone(),
 				userid_selfsigningkeyid: args.db["userid_selfsigningkeyid"].clone(),
+				userid_suspended: args.db["userid_suspended"].clone(),
 				userid_usersigningkeyid: args.db["userid_usersigningkeyid"].clone(),
-				useridprofilekey_value: args.db["useridprofilekey_value"].clone(),
 			},
 		}))
 	}
@@ -98,23 +137,27 @@ impl Service {
 	/// Returns true/false based on whether the recipient/receiving user has
 	/// blocked the sender
 	pub async fn user_is_ignored(&self, sender_user: &UserId, recipient_user: &UserId) -> bool {
-		self.services
-			.account_data
-			.get_global(recipient_user, GlobalAccountDataEventType::IgnoredUserList)
+		self.ignored_users(recipient_user)
 			.await
-			.is_ok_and(|ignored: IgnoredUserListEvent| {
+			.is_some_and(|ignored| {
 				ignored
-					.content
 					.ignored_users
 					.keys()
 					.any(|blocked_user| blocked_user == sender_user)
 			})
 	}
 
-	/// Check if a user is an admin
-	#[inline]
-	pub async fn is_admin(&self, user_id: &UserId) -> bool {
-		self.services.admin.user_is_admin(user_id).await
+	/// The users a user ignores account-wide.
+	///
+	/// Callers testing one list against many users take this rather than
+	/// [`Self::user_is_ignored`], which re-reads the list per test.
+	pub async fn ignored_users(&self, user_id: &UserId) -> Option<IgnoredUserListEventContent> {
+		self.services
+			.account_data
+			.get_global(user_id, GlobalAccountDataEventType::IgnoredUserList)
+			.await
+			.map(|ignored: IgnoredUserListEvent| ignored.content)
+			.ok()
 	}
 
 	/// Create a new user account on this homeserver.
@@ -130,6 +173,12 @@ impl Service {
 		origin: Option<&str>,
 	) -> Result {
 		let origin = origin.unwrap_or("password");
+
+		if password.is_none() {
+			self.create_disabled(user_id, origin);
+			return Ok(());
+		}
+
 		self.db.userid_origin.insert(user_id, origin);
 		self.set_password(user_id, password).await
 	}
@@ -137,10 +186,7 @@ impl Service {
 	/// Deactivate account
 	pub async fn deactivate_account(&self, user_id: &UserId) -> Result {
 		// Revoke any SSO authorizations
-		self.services
-			.oauth
-			.revoke_user_tokens(user_id)
-			.await;
+		self.services.oauth.revoke_user_tokens(user_id).await;
 
 		// Remove all associated devices
 		self.all_device_ids(user_id)
@@ -213,6 +259,9 @@ impl Service {
 			"userid_masterkeyid",
 			"userid_oauthid",
 			"userid_origin",
+            "userid_locked",
+            "userid_suspended",
+            "userid_erased",
 			"userid_presenceid",
 			"userid_selfsigningkeyid",
 			"userid_usersigningkeyid",
@@ -258,36 +307,23 @@ impl Service {
 			.collect::<Vec<_>>()
 			.await;
 		for pushkey in &pushkeys {
-			self.services
-				.pusher
-				.delete_pusher(user_id, pushkey)
-				.await;
+			self.services.pusher.delete_pusher(user_id, pushkey).await;
 		}
-		self.services
-			.oauth
-			.delete_user_sessions(user_id)
-			.await;
-		self.services
-			.presence
-			.remove_presence(user_id)
-			.await;
-		let reminder_count = self
-			.services
-			.reminders
-			.purge_user_reminders(user_id)
-			.await;
+		self.services.oauth.delete_user_sessions(user_id).await;
+		self.services.presence.remove_presence(user_id).await;
+		let reminder_count = self.services.reminders.purge_user_reminders(user_id).await;
 		let uiaa_request_count = self.services.uiaa.clear_user_requests(user_id);
 
 		let _cork = self.db.database.cork_and_flush();
 		let mut removed = pushkeys.len() + reminder_count + uiaa_request_count;
 		for map_name in USER_PREFIX_MAPS {
-			removed += remove_user_prefix_rows(&self.db.database[*map_name], user_id).await;
+			if let Ok(map) = self.db.database.get(map_name) { removed += remove_user_prefix_rows(map, user_id).await; }
 		}
 		for map_name in USER_REVERSE_KEY_MAPS {
-			removed += remove_user_keyed_rows(&self.db.database[*map_name], user_id).await;
+			if let Ok(map) = self.db.database.get(map_name) { removed += remove_user_keyed_rows(map, user_id).await; }
 		}
 		for map_name in USER_VALUE_MAPS {
-			removed += remove_user_value_rows(&self.db.database[*map_name], user_id).await;
+			if let Ok(map) = self.db.database.get(map_name) { removed += remove_user_value_rows(map, user_id).await; }
 		}
 
 		// The existence check and all registration paths use userid_password as
@@ -301,10 +337,142 @@ impl Service {
 		removed
 	}
 
+	/// Gate an LDAP-authenticated login into an existing local account.
+	///
+	/// Only a deactivated account is rejected. A password-origin account
+	/// passes, since a successful bind establishes the caller's identity
+	/// however their account was created, and a localpart with no local
+	/// account passes on its way to registration.
+	pub async fn check_ldap_login(&self, user_id: &UserId) -> Result {
+		self.is_deactivated(user_id)
+			.unwrap_or_else(|_| false)
+			.await
+			.is_false()
+			.ok_or_else(|| err!(Request(UserDeactivated("This user has been deactivated."))))
+	}
+
+	/// MSC3823: account is suspended (read-mostly mode, sessions retained).
+	pub async fn is_suspended(&self, user_id: &UserId) -> bool {
+		self.db.userid_suspended.get(user_id).await.is_ok()
+	}
+
+	/// MSC3939: reject a request from a locked account.
+	///
+	/// The rejection maps to 401 `M_USER_LOCKED` with `soft_logout: true`, so
+	/// the client retains its session and polls for the unlock. The login
+	/// route and the request middleware share this gate.
+	pub async fn locked_check(&self, user_id: &UserId) -> Result {
+		self.is_locked(user_id)
+			.await
+			.is_false()
+			.ok_or_else(|| err!(Request(UserLocked("This account has been locked."))))
+	}
+
+	/// MSC3939: account is locked (401 + soft_logout, sessions retained).
+	///
+	/// The row's presence is the entire state, and locking never invalidates
+	/// access tokens, so clearing the row restores every session intact.
+	/// Both `locked_check` and the admin lock surfaces read it.
+	pub async fn is_locked(&self, user_id: &UserId) -> bool {
+		self.db.userid_locked.get(user_id).await.is_ok()
+	}
+
+	/// MSC4025: the user's events serve as pruned copies to recipients not
+	/// joined at the event. Presence-only for the serving gate.
+	pub async fn is_erased(&self, user_id: &UserId) -> bool {
+		self.db.userid_erased.get(user_id).await.is_ok()
+	}
+
+	/// MSC4025: the global count recorded at erasure, for admin surfacing;
+	/// the serving gate never reads it.
+	pub async fn erasure_count(&self, user_id: &UserId) -> Option<PduCount> {
+		self.db
+			.userid_erased
+			.get(user_id)
+			.await
+			.deserialized()
+			.map(PduCount::from_unsigned)
+			.ok()
+	}
+
+	/// MSC3823: forensic record for the active suspension, if any.
+	pub async fn get_suspension(&self, user_id: &UserId) -> Option<Moderation> {
+		self.db
+			.userid_suspended
+			.get(user_id)
+			.await
+			.deserialized::<Json<_>>()
+			.map(|Json(m)| m)
+			.ok()
+	}
+
+	/// MSC3939: forensic record for the active lock, if any.
+	pub async fn get_lock(&self, user_id: &UserId) -> Option<Moderation> {
+		self.db
+			.userid_locked
+			.get(user_id)
+			.await
+			.deserialized::<Json<_>>()
+			.map(|Json(m)| m)
+			.ok()
+	}
+
+	pub fn set_suspended(&self, user_id: &UserId, by: &UserId) {
+		let entry = Moderation {
+			when: MilliSecondsSinceUnixEpoch::now(),
+			by: by.to_owned(),
+		};
+
+		self.db.userid_suspended.raw_put(user_id, Json(entry));
+	}
+
+	pub fn clear_suspended(&self, user_id: &UserId) {
+		self.db.userid_suspended.remove(user_id);
+	}
+
+	/// MSC4025: mark the user erased, recording the current global count.
+	pub fn set_erased(&self, user_id: &UserId) {
+		let count = self.services.globals.current_count();
+
+		self.db.userid_erased.raw_put(user_id, count);
+	}
+
+	/// MSC4025: erasure is reversible; clearing the marker restores the
+	/// unredacted view.
+	pub fn clear_erased(&self, user_id: &UserId) {
+		self.db.userid_erased.remove(user_id);
+	}
+
+	pub fn set_locked(&self, user_id: &UserId, by: &UserId) {
+		let entry = Moderation {
+			when: MilliSecondsSinceUnixEpoch::now(),
+			by: by.to_owned(),
+		};
+
+		self.db.userid_locked.raw_put(user_id, Json(entry));
+	}
+
+	pub fn clear_locked(&self, user_id: &UserId) {
+		self.db.userid_locked.remove(user_id);
+	}
+
 	/// Returns the number of users registered on this server.
 	#[inline]
 	pub async fn count(&self) -> usize {
 		self.db.userid_password.count().await
+	}
+
+	/// Returns whether the user table contains no accounts.
+	///
+	/// The lookup stops after the first account and propagates storage errors.
+	#[tracing::instrument(level = "trace", skip_all)]
+	pub async fn is_empty(&self) -> Result<bool> {
+		self.db
+			.userid_password
+			.keys()
+			.take(1)
+			.ready_fold(Ok(true), |_, user: Result<&UserId>| user.map(|_| false))
+			.await
 	}
 
 	/// Returns an iterator over all users on this homeserver.
@@ -326,23 +494,28 @@ impl Service {
 
 	/// Returns the origin of the user (password/LDAP/...).
 	pub async fn origin(&self, user_id: &UserId) -> Result<String> {
-		self.db
-			.userid_origin
-			.get(user_id)
+		self.db.userid_origin.get(user_id).await.deserialized()
+	}
+
+	/// Returns whether the user has a password. Disabled accounts and
+	/// registrations setting a sentinel password will return false here.
+	pub async fn has_password(&self, user_id: &UserId) -> Result<bool> {
+		self.password_hash(user_id)
+			.map_ok(|value| value != PASSWORD_DISABLED && value != PASSWORD_SENTINEL)
 			.await
-			.deserialized()
 	}
 
 	/// Returns the password hash for the given user.
 	pub async fn password_hash(&self, user_id: &UserId) -> Result<String> {
-		self.db
-			.userid_password
-			.get(user_id)
-			.await
-			.deserialized()
+		self.db.userid_password.get(user_id).await.deserialized()
 	}
 
-	/// Hash and set the user's password to the Argon2 hash
+	/// Hashes and stores the user's password.
+	///
+	/// A real password is hashed at the configured Argon2id cost and marks the
+	/// account as password-origin. `None` stores the disabled marker and the
+	/// sentinel is stored verbatim; neither is hashed. Changing the password of
+	/// an account whose origin is neither password nor SSO is rejected.
 	pub async fn set_password(&self, user_id: &UserId, password: Option<&str>) -> Result {
 		// Cannot change the password of a LDAP user. There are two special cases :
 		// - a `None` password can be used to deactivate a LDAP user
@@ -352,10 +525,7 @@ impl Service {
 		// exception is made for that origin in the condition below. Note that users
 		// with no origin are also password-origin users.
 		let allowed_origins = ["password", "sso"];
-
-		if let Some(password) = password
-			&& password != "*"
-		{
+		if password.is_some() && password != Some(PASSWORD_SENTINEL) {
 			let origin = self.origin(user_id).await;
 			let origin = origin.as_deref().unwrap_or("password");
 
@@ -366,19 +536,24 @@ impl Service {
 			}
 		}
 
-		match password.map(utils::hash::password) {
-			| None => {
-				self.db.userid_password.insert(user_id, b"");
-			},
-			| Some(Ok(hash)) => {
+		match password {
+			None => {
+				self.db.userid_password.insert(user_id, PASSWORD_DISABLED);
+			}
+			Some(PASSWORD_SENTINEL) => {
+				self.db.userid_password.insert(user_id, PASSWORD_SENTINEL);
+			}
+			Some(password) => {
+				let cost = self.services.config.password_hash_cost();
+				let hash = hash_password(password, cost).map_err(|e| {
+					err!(Request(InvalidParam(
+						"Password does not meet the requirements: {e}"
+					)))
+				})?;
+
 				self.db.userid_password.insert(user_id, hash);
 				self.db.userid_origin.insert(user_id, "password");
-			},
-			| Some(Err(e)) => {
-				return Err!(Request(InvalidParam(
-					"Password does not meet the requirements: {e}"
-				)));
-			},
+			}
 		}
 
 		Ok(())
@@ -395,17 +570,9 @@ impl Service {
 		filter_id
 	}
 
-	pub async fn get_filter(
-		&self,
-		user_id: &UserId,
-		filter_id: &str,
-	) -> Result<FilterDefinition> {
+	pub async fn get_filter(&self, user_id: &UserId, filter_id: &str) -> Result<FilterDefinition> {
 		let key = (user_id, filter_id);
-		self.db
-			.userfilterid_filter
-			.qry(&key)
-			.await
-			.deserialized()
+		self.db.userfilterid_filter.qry(&key).await.deserialized()
 	}
 
 	/// Creates an OpenID token, which can be used to prove that a user has
@@ -428,26 +595,20 @@ impl Service {
 
 	/// Find out which user an OpenID access token belongs to.
 	pub async fn find_from_openid_token(&self, token: &str) -> Result<OwnedUserId> {
-		let Ok(value) = self
-			.db
-			.openidtoken_expiresatuserid
-			.get(token)
-			.await
-		else {
+		let Ok(value) = self.db.openidtoken_expiresatuserid.get(token).await else {
 			return Err!(Request(Unauthorized("OpenID token is unrecognised")));
 		};
 
 		let (expires_at_bytes, user_bytes) = value.split_at(0_u64.to_be_bytes().len());
-		let expires_at =
-			u64::from_be_bytes(expires_at_bytes.try_into().map_err(|e| {
-				err!(Database("expires_at in openid_userid is invalid u64. {e}"))
-			})?);
+		let expires_at = u64::from_be_bytes(
+			expires_at_bytes
+				.try_into()
+				.map_err(|e| err!(Database("expires_at in openid_userid is invalid u64. {e}")))?,
+		);
 
 		if expires_at < utils::millis_since_unix_epoch() {
 			debug_warn!("OpenID token is expired, removing");
-			self.db
-				.openidtoken_expiresatuserid
-				.remove(token.as_bytes());
+			self.db.openidtoken_expiresatuserid.remove(token.as_bytes());
 
 			return Err!(Request(Unauthorized("OpenID token is expired")));
 		}
@@ -469,22 +630,33 @@ impl Service {
 		let expires_at = Sat(utils::millis_since_unix_epoch()) + Sat(expires_in);
 
 		let value = (expires_at.0, user_id);
-		self.db
-			.logintoken_expiresatuserid
-			.raw_put(token, value);
+		self.db.logintoken_expiresatuserid.raw_put(token, value);
 
 		expires_in
+	}
+
+	/// Verify a login token is valid and return its owner without consuming it.
+	/// Unlike `find_from_login_token`, the token remains in the database
+	/// after this call and can still be consumed later.
+	pub async fn peek_login_token(&self, token: &str) -> Result<OwnedUserId> {
+		let Ok(value) = self.db.logintoken_expiresatuserid.get(token).await else {
+			return Err!(Request(Forbidden("Login token is unrecognised")));
+		};
+		let (expires_at, user_id): (u64, OwnedUserId) = value.deserialized()?;
+
+		if expires_at < utils::millis_since_unix_epoch() {
+			trace!(?user_id, ?token, "Removing expired login token");
+			self.db.logintoken_expiresatuserid.remove(token);
+			return Err!(Request(Forbidden("Login token is expired")));
+		}
+
+		Ok(user_id)
 	}
 
 	/// Find out which user a login token belongs to.
 	/// Removes the token to prevent double-use attacks.
 	pub async fn find_from_login_token(&self, token: &str) -> Result<OwnedUserId> {
-		let Ok(value) = self
-			.db
-			.logintoken_expiresatuserid
-			.get(token)
-			.await
-		else {
+		let Ok(value) = self.db.logintoken_expiresatuserid.get(token).await else {
 			return Err!(Request(Forbidden("Login token is unrecognised")));
 		};
 		let (expires_at, user_id): (u64, OwnedUserId) = value.deserialized()?;
@@ -514,18 +686,10 @@ impl Service {
 		Err!(FeatureDisabled("ldap"))
 	}
 
-	async fn update_all_rooms(&self, user_id: &UserId, rooms: Vec<(PduBuilder, &OwnedRoomId)>) {
-		for (pdu_builder, room_id) in rooms {
-			let state_lock = self.services.state.mutex.lock(room_id).await;
-			if let Err(e) = self
-				.services
-				.timeline
-				.build_and_append_pdu(pdu_builder, user_id, room_id, &state_lock)
-				.await
-			{
-				warn!(%user_id, %room_id, "Failed to update/send new profile join membership update in room: {e}");
-			}
-		}
+	#[cfg(not(feature = "ldap"))]
+	#[must_use]
+	pub fn ldap_bind_dn(&self, _localpart: &str) -> Option<String> {
+		None
 	}
 }
 

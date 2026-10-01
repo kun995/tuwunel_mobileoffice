@@ -1,6 +1,7 @@
 use tuwunel_core::{Result, debug, debug_error, debug_info, debug_warn, implement, trace};
 
 use super::DestString;
+use crate::client::read_response_capped;
 
 #[implement(super::Service)]
 #[tracing::instrument(
@@ -31,12 +32,13 @@ pub(super) async fn request_well_known(&self, dest: &str) -> Result<Option<DestS
 		return Ok(None);
 	}
 
-	let text = response.text().await?;
-	trace!("response text: {text:?}");
-	if text.len() >= 12288 {
-		debug_warn!("response contains junk");
+	let Ok(body) = read_response_capped(response, 12288).await else {
+		debug_warn!("response unreadable or exceeds size limit");
 		return Ok(None);
-	}
+	};
+
+	let text = String::from_utf8_lossy(&body);
+	trace!("response text: {text:?}");
 
 	let body: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
 

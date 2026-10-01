@@ -72,15 +72,9 @@ impl S3Storage {
 	}
 
 	async fn ensure_bucket_exists(&self) -> Result<()> {
-		match self
-			.client
-			.head_bucket()
-			.bucket(&self.bucket)
-			.send()
-			.await
-		{
-			| Ok(_) => Ok(()),
-			| Err(err) if is_bucket_not_found_error(&err) => {
+		match self.client.head_bucket().bucket(&self.bucket).send().await {
+			Ok(_) => Ok(()),
+			Err(err) if is_bucket_not_found_error(&err) => {
 				trace!("S3 bucket missing, creating bucket={}", self.bucket);
 
 				match self
@@ -90,17 +84,17 @@ impl S3Storage {
 					.send()
 					.await
 				{
-					| Ok(_) => Ok(()),
-					| Err(err) if is_bucket_already_exists_error(&err) => Ok(()),
-					| Err(err) => Err(err!(Config(
+					Ok(_) => Ok(()),
+					Err(err) if is_bucket_already_exists_error(&err) => Ok(()),
+					Err(err) => Err(err!(Config(
 						"media_storage.s3",
 						"Failed to create bucket {}: {}",
 						self.bucket,
 						err
 					))),
 				}
-			},
-			| Err(err) => Err(err!(Config(
+			}
+			Err(err) => Err(err!(Config(
 				"media_storage.s3",
 				"Failed to access bucket {}: {}",
 				self.bucket,
@@ -117,14 +111,11 @@ impl S3Storage {
 	///   - With prefix `media`: `media/a3f9d2c1ab8e4f7d...`
 	fn get_s3_key(&self, hash_bytes: &[u8]) -> String {
 		// Hex-encode the raw bytes
-		let hex: String = hash_bytes
-			.iter()
-			.map(|b| format!("{b:02x}"))
-			.collect();
+		let hex: String = hash_bytes.iter().map(|b| format!("{b:02x}")).collect();
 
 		let final_key = match &self.prefix {
-			| Some(prefix) => format!("{prefix}/{hex}"),
-			| None => hex,
+			Some(prefix) => format!("{prefix}/{hex}"),
+			None => hex,
 		};
 
 		// Remove leading slash if somehow present (S3 best practice)
@@ -148,13 +139,13 @@ impl MediaStorage for S3Storage {
 			.map_err(|e| {
 				use aws_sdk_s3::error::SdkError;
 				let error_details = match &e {
-					| SdkError::ServiceError(se) => {
+					SdkError::ServiceError(se) => {
 						format!("HTTP {}: {:?}", se.raw().status(), se.err())
-					},
-					| SdkError::ConstructionFailure(cf) => format!("Construction: {:?}", cf),
-					| SdkError::TimeoutError(_) => "Timeout".to_string(),
-					| SdkError::DispatchFailure(df) => format!("Dispatch: {:?}", df),
-					| _ => format!("{:?}", e),
+					}
+					SdkError::ConstructionFailure(cf) => format!("Construction: {:?}", cf),
+					SdkError::TimeoutError(_) => "Timeout".to_string(),
+					SdkError::DispatchFailure(df) => format!("Dispatch: {:?}", df),
+					_ => format!("{:?}", e),
 				};
 				err!(Database(error!(
 					"S3 put_object failed: bucket={}, key={}, details={}",
@@ -176,7 +167,7 @@ impl MediaStorage for S3Storage {
 			.send()
 			.await
 		{
-			| Ok(output) => {
+			Ok(output) => {
 				let bytes = output
 					.body
 					.collect()
@@ -184,15 +175,15 @@ impl MediaStorage for S3Storage {
 					.map_err(|e| err!(Database(error!("S3 body read failed: {}", e))))?
 					.into_bytes();
 				Ok(Some(bytes))
-			},
-			| Err(e) => {
+			}
+			Err(e) => {
 				// Check if it's a 404 Not Found error
 				if is_not_found_error(&e) {
 					Ok(None)
 				} else {
 					Err(err!(Database(error!("S3 get_object failed: {}", e))))
 				}
-			},
+			}
 		}
 	}
 
@@ -223,15 +214,15 @@ impl MediaStorage for S3Storage {
 			.send()
 			.await
 		{
-			| Ok(_) => {
+			Ok(_) => {
 				trace!("S3 exists: YES key={}", s3_key);
 				Ok(true)
-			},
-			| Err(e) if is_not_found_error(&e) => {
+			}
+			Err(e) if is_not_found_error(&e) => {
 				trace!("S3 exists: NO (404) key={}", s3_key);
 				Ok(false)
-			},
-			| Err(e) => Err(err!(Database(error!("S3 head_object failed: {}", e)))),
+			}
+			Err(e) => Err(err!(Database(error!("S3 head_object failed: {}", e)))),
 		}
 	}
 
@@ -246,7 +237,7 @@ impl MediaStorage for S3Storage {
 			.send()
 			.await
 		{
-			| Ok(output) => {
+			Ok(output) => {
 				let size = output.content_length().unwrap_or(0) as u64;
 				let modified = output
 					.last_modified()
@@ -254,9 +245,9 @@ impl MediaStorage for S3Storage {
 					.unwrap_or_else(SystemTime::now);
 
 				Ok(Some(StorageMetadata { size, modified }))
-			},
-			| Err(e) if is_not_found_error(&e) => Ok(None),
-			| Err(e) => Err(err!(Database(error!("S3 head_object failed: {}", e)))),
+			}
+			Err(e) if is_not_found_error(&e) => Ok(None),
+			Err(e) => Err(err!(Database(error!("S3 head_object failed: {}", e)))),
 		}
 	}
 

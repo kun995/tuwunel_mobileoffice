@@ -1,33 +1,34 @@
+mod attach;
 pub mod console;
+pub mod context;
 pub mod create;
 mod execute;
 mod grant;
+mod notices;
+mod processor;
+mod register;
+mod respond;
 
 use std::{
-	pin::Pin,
-	sync::{Arc, RwLock as StdRwLock},
+	collections::BTreeMap,
+	sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock},
+	time::Instant,
 };
 
 use async_trait::async_trait;
+pub use context::Context;
 pub use create::create_admin_room;
-use futures::{Future, FutureExt, TryFutureExt};
-use ruma::{
-	OwnedEventId, OwnedRoomAliasId, OwnedRoomId, RoomId, UserId,
-	events::room::message::{Relation, RoomMessageEventContent},
-};
-use tokio::sync::{RwLock, mpsc};
-use tuwunel_core::{
-	Err, Error, Event, Result, debug, err, error, error::default_log, pdu::PduBuilder,
-};
-
-use crate::rooms::state::RoomMutexGuard;
+use futures::TryFutureExt;
+use ruma::{OwnedEventId, OwnedRoomAliasId, OwnedRoomId, RoomId, RoomOrAliasId, UserId};
+use tokio::sync::mpsc;
+use tuwunel_core::{Err, Event, Result, debug, err, error::default_log, warn};
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
 	channel: StdRwLock<Option<mpsc::Sender<CommandInput>>>,
-	pub handle: RwLock<Option<Processor>>,
-	pub complete: StdRwLock<Option<Completer>>,
+	pub command: StdRwLock<Option<Arc<dyn Command>>>,
 	pub admin_alias: OwnedRoomAliasId,
+	register_nonces: StdMutex<BTreeMap<String, Instant>>,
 	#[cfg(feature = "console")]
 	pub console: Arc<console::Console>,
 }
@@ -39,25 +40,39 @@ pub struct CommandInput {
 	pub reply_id: Option<OwnedEventId>,
 }
 
-/// Prototype of the tab-completer. The input is buffered text when tab
-/// asserted; the output will fully replace the input buffer.
-pub type Completer = fn(&str) -> String;
+/// Root of a clap command tree installed by a downstream crate.
+#[async_trait]
+pub trait Command: Send + Sync + 'static {
+	/// The clap command tree; equivalent to
+	/// `<C as clap::CommandFactory>::command()`.
+	fn clap(&self) -> clap::Command;
 
-/// Prototype of the command processor. This is a callback supplied by the
-/// reloadable admin module.
-pub type Processor = fn(Arc<crate::Services>, CommandInput) -> ProcessorFuture;
+	/// Dispatch already-parsed argument matches to the matching handler.
+	async fn dispatch(&self, matches: clap::ArgMatches, context: &Context<'_>) -> Result;
+}
 
-/// Return type of the processor
-pub type ProcessorFuture = Pin<Box<dyn Future<Output = ProcessorResult> + Send>>;
+/// Carries a rendered command outcome while preserving its status.
+///
+/// `Ok(Some(output))` reports success, `Err(output)` reports failure, and
+/// `Ok(None)` suppresses the response. Callers do not infer status from text.
+pub type ProcessorResult = Result<Option<CommandOutput>, CommandOutput>;
 
-/// Result wrapping of a command's handling. Both variants are complete message
-/// events which have digested any prior errors. The wrapping preserves whether
-/// the command failed without interpreting the text. Ok(None) outputs are
-/// dropped to produce no response.
-pub type ProcessorResult = Result<Option<CommandOutput>, Box<CommandOutput>>;
+/// Textual output of a completed command. Markdown is the norm; Plain carries
+/// clap usage and error text, which must never be markdown-rendered.
+pub enum CommandOutput {
+	Markdown(String),
+	Plain(String),
+}
 
-/// Alias for the output structure.
-pub type CommandOutput = RoomMessageEventContent;
+impl CommandOutput {
+	#[inline]
+	#[must_use]
+	pub fn as_str(&self) -> &str {
+		match self {
+			| Self::Markdown(text) | Self::Plain(text) => text,
+		}
+	}
+}
 
 /// Maximum number of commands which can be queued for dispatch.
 const COMMAND_QUEUE_LIMIT: usize = 512;
@@ -68,10 +83,10 @@ impl crate::Service for Service {
 		Ok(Arc::new(Self {
 			services: args.services.clone(),
 			channel: StdRwLock::new(None),
-			handle: RwLock::new(None),
-			complete: StdRwLock::new(None),
-			admin_alias: OwnedRoomAliasId::try_from(format!("#admins:{}", &args.server.name))
+			command: StdRwLock::new(None),
+			admin_alias: OwnedRoomAliasId::try_from(format!("#admins:{}", args.server.name))
 				.expect("#admins:server_name is valid alias name"),
+			register_nonces: StdMutex::new(BTreeMap::new()),
 			#[cfg(feature = "console")]
 			console: console::Console::new(args),
 		}))
@@ -86,7 +101,6 @@ impl crate::Service for Service {
 			.expect("locked for writing")
 			.insert(sender);
 
-		self.startup_execute().await?;
 		self.console_auto_start().await;
 
 		loop {
@@ -95,9 +109,8 @@ impl crate::Service for Service {
 					Some(command) => self.handle_command(command).await,
 					None => break,
 				},
-				sig = signals.recv() => match sig {
-					Ok(sig) => self.handle_signal(sig).await,
-					Err(_) => continue,
+				sig = signals.recv() => if let Ok(sig) = sig {
+					self.handle_signal(sig).await;
 				},
 			}
 		}
@@ -124,31 +137,6 @@ impl crate::Service for Service {
 }
 
 impl Service {
-	/// Sends markdown notice to the admin room as the admin user.
-	pub async fn notice(&self, body: &str) {
-		self.send_message(RoomMessageEventContent::notice_markdown(body))
-			.await
-			.ok();
-	}
-
-	/// Sends markdown message (not an m.notice for notification reasons) to the
-	/// admin room as the admin user.
-	pub async fn send_text(&self, body: &str) {
-		self.send_message(RoomMessageEventContent::text_markdown(body))
-			.await
-			.ok();
-	}
-
-	/// Sends a message to the admin room as the admin user (see send_text() for
-	/// convenience).
-	pub async fn send_message(&self, message_content: RoomMessageEventContent) -> Result {
-		let user_id = &self.services.globals.server_user;
-		let room_id = self.get_admin_room().await?;
-		self.respond_to_room(message_content, &room_id, user_id)
-			.boxed()
-			.await
-	}
-
 	/// Posts a command to the command processor queue and returns. Processing
 	/// will take place on the service worker's task asynchronously. Errors if
 	/// the queue is full.
@@ -175,17 +163,18 @@ impl Service {
 		command: String,
 		reply_id: Option<OwnedEventId>,
 	) -> ProcessorResult {
-		self.process_command(CommandInput { command, reply_id })
+		self.process_command(&CommandInput { command, reply_id })
 			.await
 	}
 
 	/// Invokes the tab-completer to complete the command. When unavailable,
 	/// None is returned.
 	pub fn complete_command(&self, command: &str) -> Option<String> {
-		self.complete
+		self.command
 			.read()
 			.expect("locked for reading")
-			.map(|complete| complete(command))
+			.as_ref()
+			.map(|root| processor::complete(root.clap(), command))
 	}
 
 	async fn handle_signal(&self, sig: &'static str) {
@@ -198,31 +187,32 @@ impl Service {
 	}
 
 	async fn handle_command(&self, command: CommandInput) {
-		match self.process_command(command).await {
-			| Err(output) => self.handle_command_output(*output).await,
-			| Ok(Some(output)) => self.handle_command_output(output).await,
+		match self.process_command(&command).await {
 			| Ok(None) => debug!("Command successful with no response"),
+			| Err(output) | Ok(Some(output)) => self
+				.handle_response(output, command.reply_id.as_deref())
+				.await
+				.unwrap_or_else(default_log),
 		}
 	}
 
-	async fn handle_command_output(&self, content: RoomMessageEventContent) {
-		self.handle_response(content)
-			.await
-			.unwrap_or_else(default_log);
-	}
-
-	async fn process_command(&self, command: CommandInput) -> ProcessorResult {
-		let handle = &self
-			.handle
+	async fn process_command(&self, command: &CommandInput) -> ProcessorResult {
+		let root = self
+			.command
 			.read()
-			.await
+			.expect("locked for reading")
+			.clone()
 			.expect("Admin module is not loaded");
 
-		handle(Arc::clone(self.services.get()), command).await
+		processor::handle_command(root, Arc::clone(self.services.get()), command).await
 	}
 
 	/// Checks whether a given user is an admin of this server
 	pub async fn user_is_admin(&self, user_id: &UserId) -> bool {
+		if user_id == self.services.globals.server_user {
+			return true;
+		}
+
 		let Ok(admin_room) = self.get_admin_room().await else {
 			return false;
 		};
@@ -252,86 +242,43 @@ impl Service {
 			.ok_or_else(|| err!(Request(NotFound("Admin user not joined to admin room"))))
 	}
 
-	async fn handle_response(&self, content: RoomMessageEventContent) -> Result {
-		let Some(Relation::Reply { in_reply_to }) = content.relates_to.as_ref() else {
-			return Ok(());
+	/// Gets the room reports are posted to: the configured report room when set
+	/// and usable, otherwise the admin room.
+	pub async fn get_report_room(&self) -> Result<OwnedRoomId> {
+		let Some(report_room) = self.services.server.config.report_room.as_ref() else {
+			return self.get_admin_room().await;
 		};
 
-		let Ok(pdu) = self
-			.services
-			.timeline
-			.get_pdu(&in_reply_to.event_id)
-			.await
-		else {
-			error!(
-				event_id = ?in_reply_to.event_id,
-				"Missing admin command in_reply_to event"
-			);
-			return Ok(());
-		};
-
-		let response_sender = if self.is_admin_room(pdu.room_id()).await {
-			&self.services.globals.server_user
-		} else {
-			pdu.sender()
-		};
-
-		self.respond_to_room(content, pdu.room_id(), response_sender)
-			.boxed()
-			.await
-	}
-
-	async fn respond_to_room(
-		&self,
-		content: RoomMessageEventContent,
-		room_id: &RoomId,
-		user_id: &UserId,
-	) -> Result {
-		assert!(self.user_is_admin(user_id).await, "sender is not admin");
-
-		let state_lock = self.services.state.mutex.lock(room_id).await;
-
-		if let Err(e) = self
-			.services
-			.timeline
-			.build_and_append_pdu(PduBuilder::timeline(&content), user_id, room_id, &state_lock)
-			.await
-		{
-			self.handle_response_error(e, room_id, user_id, &state_lock)
-				.boxed()
-				.await
-				.unwrap_or_else(default_log);
+		match self.resolve_report_room(report_room).await {
+			| Ok(room_id) => Ok(room_id),
+			| Err(e) => {
+				warn!(%report_room, error = %e, "Falling back to the admin room for reports");
+				self.get_admin_room().await
+			},
 		}
-
-		Ok(())
 	}
 
-	async fn handle_response_error(
-		&self,
-		e: Error,
-		room_id: &RoomId,
-		user_id: &UserId,
-		state_lock: &RoomMutexGuard,
-	) -> Result {
-		error!("Failed to build and append admin room response PDU: \"{e}\"");
-		let content = RoomMessageEventContent::text_plain(format!(
-			"Failed to build and append admin room PDU: \"{e}\"\n\nThe original admin command \
-			 may have finished successfully, but we could not return the output."
-		));
-
-		self.services
-			.timeline
-			.build_and_append_pdu(PduBuilder::timeline(&content), user_id, room_id, state_lock)
-			.boxed()
+	async fn resolve_report_room(&self, report_room: &RoomOrAliasId) -> Result<OwnedRoomId> {
+		let room_id = self
+			.services
+			.alias
+			.maybe_resolve(report_room)
 			.await?;
 
-		Ok(())
+		self.services
+			.state_cache
+			.is_joined(&self.services.globals.server_user, &room_id)
+			.await
+			.then_some(room_id)
+			.ok_or_else(|| err!("server user is not joined to the configured report room"))
 	}
 
 	pub async fn is_admin_command<Pdu>(&self, event: &Pdu, body: &str) -> bool
 	where
 		Pdu: Event,
 	{
+		let body = body.trim_start();
+
 		// Server-side command-escape with public echo
 		let is_escape = body.starts_with('\\');
 		let is_public_escape = is_escape

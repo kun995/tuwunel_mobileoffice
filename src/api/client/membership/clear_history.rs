@@ -6,7 +6,7 @@ use axum_extra::{
 	TypedHeader,
 	headers::{Authorization, authorization::Bearer},
 };
-use ruma::{OwnedRoomId, RoomId, UserId, api::client::error::ErrorKind};
+use ruma::{OwnedRoomId, RoomId, UserId, api::error::ErrorKind};
 use serde::Serialize;
 use tuwunel_core::{Err, Error, Result, matrix::pdu::PduCount};
 
@@ -27,7 +27,7 @@ pub(crate) struct ClearRoomHistoryResponse {
 pub(crate) async fn clear_room_history_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
-	Path(room_id): Path<Box<RoomId>>,
+	Path(room_id): Path<ruma::OwnedRoomId>,
 ) -> Result<Json<ClearRoomHistoryResponse>> {
 	let (sender_user, ..) = services
 		.users
@@ -35,7 +35,9 @@ pub(crate) async fn clear_room_history_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData {
+					soft_logout: false,
+				}),
 				"Unknown access token.",
 			)
 		})?;
@@ -71,10 +73,19 @@ pub(crate) async fn clear_room_history_route(
 		.clear_before(sender_user_ref, room_id_ref, cleared_before);
 	services
 		.pusher
-		.reset_notification_counts(sender_user_ref, room_id_ref);
+		.reset_room_notification_counts(sender_user_ref, room_id_ref)
+		.await;
 	services
 		.read_receipt
-		.private_read_set(room_id_ref, sender_user_ref, cleared_before);
+		.private_read_set(tuwunel_service::rooms::read_receipt::PrivateRead {
+			room_id: room_id_ref,
+			user_id: sender_user_ref,
+			count: cleared_before,
+			ts: ruma::MilliSecondsSinceUnixEpoch::now(),
+			thread: &ruma::events::receipt::ReceiptThread::Unthreaded,
+			announce: true,
+		})
+		.await;
 
 	Ok(Json(ClearRoomHistoryResponse {
 		room_id: room_id_ref.to_owned(),

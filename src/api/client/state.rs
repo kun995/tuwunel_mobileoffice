@@ -1,10 +1,15 @@
 use axum::extract::State;
 use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use ruma::{
-	Int, OwnedEventId, OwnedUserId, RoomId, UserId,
-	api::client::state::{get_state_event_for_key, get_state_events, send_state_event},
+	CanonicalJsonObject, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomAliasId, RoomId,
+	UserId,
+	api::client::state::{
+		get_state_event_for_key::{self, v3::StateEventFormat},
+		get_state_events, send_state_event,
+	},
 	events::{
-		AnyStateEventContent, StateEventType, TimelineEventType,
+		AnyStateEventContent, StateEventType,
+		invite_permission_config::InvitePermission,
 		room::{
 			canonical_alias::RoomCanonicalAliasEventContent,
 			history_visibility::{HistoryVisibility, RoomHistoryVisibilityEventContent},
@@ -16,17 +21,22 @@ use ruma::{
 	},
 	serde::Raw,
 };
+use ruma::{Int, OwnedUserId, events::TimelineEventType};
 use serde_json::{json, value::to_raw_value};
 use tuwunel_core::{
 	Err, Result, err, is_false,
-	matrix::{Event, pdu::PduBuilder},
-	utils::BoolExt,
+	matrix::{
+		Event,
+		pdu::{PduBuilder, PduEvent},
+	},
+	result::NotFound,
+	utils::{BoolExt, stream::TryBroadbandExt},
 	warn,
 };
 use tuwunel_service::{Services, rooms::timeline::RoomMutexGuard};
 
 use super::send::ACTIVITY_EVENT_TYPE;
-use crate::{Ruma, RumaResponse};
+use crate::{Ruma, RumaResponse, client::with_membership};
 
 /// # `PUT /_matrix/client/*/rooms/{roomId}/state/{eventType}/{stateKey}`
 ///
@@ -85,17 +95,28 @@ pub(crate) async fn get_state_events_route(
 		.user_can_see_state_events(sender_user, &body.room_id)
 		.await
 	{
-		return Err!(Request(Forbidden("You don't have permission to view the room state.")));
+		return Err!(Request(Forbidden(
+			"You don't have permission to view the room state."
+		)));
 	}
 
-	Ok(get_state_events::v3::Response {
-		room_state: services
-			.state_accessor
-			.room_state_full_pdus(&body.room_id)
-			.map_ok(Event::into_format)
-			.try_collect()
-			.await?,
-	})
+	let encrypted = services
+		.state_accessor
+		.is_encrypted_room(&body.room_id)
+		.await;
+
+	let room_state = services
+		.state_accessor
+		.room_state_full_pdus(&body.room_id)
+		.map_ok(Event::into_pdu)
+		.broad_and_then(async |pdu| {
+			Ok(with_membership(&services, pdu, sender_user, encrypted).await)
+		})
+		.map_ok(Event::into_format)
+		.try_collect()
+		.await?;
+
+	Ok(get_state_events::v3::Response { room_state })
 }
 
 /// # `GET /_matrix/client/v3/rooms/{roomid}/state/{eventType}/{stateKey}`
@@ -126,34 +147,32 @@ pub(crate) async fn get_state_events_for_key_route(
 		.state_accessor
 		.room_state_get(&body.room_id, &body.event_type, &body.state_key)
 		.await
-		.map_err(|_| {
+		.map_err(|e| {
 			err!(Request(NotFound(debug_warn!(
-					room_id = ?body.room_id,
-					event_type = ?body.event_type,
-					"State event not found in room.",
+				room_id = ?body.room_id,
+				event_type = ?body.event_type,
+				"Failed to get state event: {e}.",
 			))))
 		})?;
 
-	let event_format = body
-		.format
-		.as_ref()
-		.is_some_and(|f| f.to_lowercase().eq("event"));
-
-	Ok(get_state_event_for_key::v3::Response {
-		content: event_format.or(|| event.get_content_as_value()),
-		event: event_format.then(|| {
-			json!({
-				"content": event.content(),
-				"event_id": event.event_id(),
-				"origin_server_ts": event.origin_server_ts(),
-				"room_id": event.room_id(),
-				"sender": event.sender(),
-				"state_key": event.state_key(),
-				"type": event.kind(),
-				"unsigned": event.unsigned(),
-			})
+	let event_or_content = match body.format {
+		StateEventFormat::Event => json!({
+			"content": event.content(),
+			"event_id": event.event_id(),
+			"origin_server_ts": event.origin_server_ts(),
+			"room_id": event.room_id(),
+			"sender": event.sender(),
+			"state_key": event.state_key(),
+			"type": event.kind(),
+			"unsigned": event.unsigned(),
 		}),
-	})
+
+		_ => event.get_content_as_value(),
+	};
+
+	let event_or_content = to_raw_value(&event_or_content).expect("serializable JSON value");
+
+	Ok(get_state_event_for_key::v3::Response::new(event_or_content))
 }
 
 /// # `GET /_matrix/client/v3/rooms/{roomid}/state/{eventType}`
@@ -180,12 +199,34 @@ async fn send_state_event_for_key_helper(
 	event_type: &StateEventType,
 	json: &Raw<AnyStateEventContent>,
 	state_key: &str,
-	timestamp: Option<ruma::MilliSecondsSinceUnixEpoch>,
+	timestamp: Option<MilliSecondsSinceUnixEpoch>,
 ) -> Result<OwnedEventId> {
-	allowed_to_send_state_event(services, room_id, event_type, state_key, json).await?;
+	allowed_to_send_state_event(services, sender, room_id, event_type, state_key, json).await?;
 	let role_promotions =
 		room_role_promotions(services, sender, room_id, event_type, state_key, json).await;
 	let state_lock = services.state.mutex.lock(room_id).await;
+
+	let current = match state_dedup_eligible(event_type, timestamp.as_ref()) {
+		false => None,
+		true => services
+			.state_accessor
+			.room_state_get(room_id, event_type, state_key)
+			.await
+			.optional()?,
+	};
+
+	if let Some(current) = current
+		&& current.sender() == sender
+	{
+		let content = json.deserialize_as_unchecked::<CanonicalJsonObject>()?;
+
+		if is_duplicate_state(event_type, sender, &content, &current)?
+			&& services.state_cache.is_joined(sender, room_id).await
+		{
+			return Ok(current.event_id().to_owned());
+		}
+	}
+
 	let event_id = services
 		.timeline
 		.build_and_append_pdu(
@@ -204,14 +245,9 @@ async fn send_state_event_for_key_helper(
 		.await?;
 
 	for new_leader in role_promotions.leaders {
-		if let Err(e) = send_room_leader_assignment_message(
-			services,
-			sender,
-			room_id,
-			&new_leader,
-			&state_lock,
-		)
-		.await
+		if let Err(e) =
+			send_room_leader_assignment_message(services, sender, room_id, &new_leader, &state_lock)
+				.await
 		{
 			warn!(%e, %room_id, %sender, %new_leader, "Failed to send room leader assignment activity");
 		}
@@ -252,10 +288,7 @@ enum AssignedRoomRole {
 	Administrator,
 }
 
-fn newly_assigned_room_role(
-	old_power: UserPowerLevel,
-	new_power: Int,
-) -> Option<AssignedRoomRole> {
+fn newly_assigned_room_role(old_power: UserPowerLevel, new_power: Int) -> Option<AssignedRoomRole> {
 	let administrator_power = Int::from(50);
 	let leader_power = Int::from(100);
 
@@ -288,11 +321,7 @@ async fn room_role_promotions(
 		return RoomRolePromotions::default();
 	};
 
-	let old_power_levels = services
-		.state_accessor
-		.get_power_levels(room_id)
-		.await
-		.ok();
+	let old_power_levels = services.state_accessor.get_power_levels(room_id).await.ok();
 	let mut promotions = RoomRolePromotions::default();
 	for (user_id, new_power) in &new_power_levels.users {
 		let user_id_ref: &UserId = user_id.as_ref();
@@ -300,15 +329,16 @@ async fn room_role_promotions(
 			continue;
 		}
 
-		let old_power = old_power_levels
-			.as_ref()
-			.map_or_else(|| UserPowerLevel::from(Int::from(0)), |old| old.for_user(user_id_ref));
+		let old_power = old_power_levels.as_ref().map_or_else(
+			|| UserPowerLevel::from(Int::from(0)),
+			|old| old.for_user(user_id_ref),
+		);
 		match newly_assigned_room_role(old_power, *new_power) {
-			| Some(AssignedRoomRole::Leader) => promotions.leaders.push(user_id.to_owned()),
-			| Some(AssignedRoomRole::Administrator) => {
+			Some(AssignedRoomRole::Leader) => promotions.leaders.push(user_id.to_owned()),
+			Some(AssignedRoomRole::Administrator) => {
 				promotions.administrators.push(user_id.to_owned());
-			},
-			| None => {},
+			}
+			None => {}
 		}
 	}
 
@@ -323,19 +353,18 @@ async fn send_room_leader_assignment_message(
 	state_lock: &RoomMutexGuard,
 ) -> Result {
 	let old_leader_display = services
-		.users
+		.profile
 		.displayname(sender)
 		.await
 		.unwrap_or_else(|_| sender.to_string());
 	let new_leader_display = services
-		.users
+		.profile
 		.displayname(new_leader)
 		.await
 		.unwrap_or_else(|_| new_leader.to_string());
 
-	let self_text = format!(
-		"[Bạn - {old_leader_display}] đã bổ nhiệm [{new_leader_display}] làm trưởng nhóm"
-	);
+	let self_text =
+		format!("[Bạn - {old_leader_display}] đã bổ nhiệm [{new_leader_display}] làm trưởng nhóm");
 	let other_text =
 		format!("[{old_leader_display}] đã bổ nhiệm [{new_leader_display}] làm trưởng nhóm");
 
@@ -354,7 +383,7 @@ async fn send_room_leader_assignment_message(
 		.build_and_append_pdu(
 			PduBuilder {
 				event_type: TimelineEventType::from(ACTIVITY_EVENT_TYPE),
-				content: to_raw_value(&content)?,
+				content: to_raw_value(&content)?.into(),
 				..Default::default()
 			},
 			sender,
@@ -375,12 +404,12 @@ async fn send_room_administrator_assignment_message(
 	state_lock: &RoomMutexGuard,
 ) -> Result {
 	let assigner_display = services
-		.users
+		.profile
 		.displayname(sender)
 		.await
 		.unwrap_or_else(|_| sender.to_string());
 	let administrator_display = services
-		.users
+		.profile
 		.displayname(new_administrator)
 		.await
 		.unwrap_or_else(|_| new_administrator.to_string());
@@ -406,7 +435,7 @@ async fn send_room_administrator_assignment_message(
 		.build_and_append_pdu(
 			PduBuilder {
 				event_type: TimelineEventType::from(ACTIVITY_EVENT_TYPE),
-				content: to_raw_value(&content)?,
+				content: to_raw_value(&content)?.into(),
 				..Default::default()
 			},
 			sender,
@@ -420,7 +449,7 @@ async fn send_room_administrator_assignment_message(
 }
 
 #[cfg(test)]
-mod tests {
+mod ioffice_tests {
 	use super::{AssignedRoomRole, newly_assigned_room_role};
 	use ruma::Int;
 
@@ -446,212 +475,443 @@ mod tests {
 
 	#[test]
 	fn ignores_existing_roles_and_leader_demotion() {
-		assert_eq!(newly_assigned_room_role(Int::from(50).into(), Int::from(75)), None);
-		assert_eq!(newly_assigned_room_role(Int::from(100).into(), Int::from(100)), None);
-		assert_eq!(newly_assigned_room_role(Int::from(100).into(), Int::from(50)), None);
+		assert_eq!(
+			newly_assigned_room_role(Int::from(50).into(), Int::from(75)),
+			None
+		);
+		assert_eq!(
+			newly_assigned_room_role(Int::from(100).into(), Int::from(100)),
+			None
+		);
+		assert_eq!(
+			newly_assigned_room_role(Int::from(100).into(), Int::from(50)),
+			None
+		);
 	}
+}
+
+fn state_dedup_eligible(
+	event_type: &StateEventType,
+	timestamp: Option<&MilliSecondsSinceUnixEpoch>,
+) -> bool {
+	timestamp.is_none() && !matches!(event_type, StateEventType::RoomMember)
+}
+
+/// Whether an incoming state event is a content-identical resend by its own
+/// author.
+///
+/// The caller's guard returns before `state_res::auth_check` runs, so every
+/// conjunct gating that early return must be a version-invariant fact that can
+/// only suppress a dedup, never permit one. Membership class qualifies; power
+/// levels and per-type rules do not, and wanting an exact status code there is
+/// a reason to move the guard after authorization rather than to add a
+/// conjunct.
+fn is_duplicate_state(
+	event_type: &StateEventType,
+	sender: &UserId,
+	content: &CanonicalJsonObject,
+	current: &PduEvent,
+) -> Result<bool> {
+	if matches!(event_type, StateEventType::RoomMember) || current.sender() != sender {
+		return Ok(false);
+	}
+
+	let current_content = current.content.deserialize()?;
+
+	Ok(current_content == *content)
 }
 
 async fn allowed_to_send_state_event(
 	services: &Services,
+	sender: &UserId,
 	room_id: &RoomId,
 	event_type: &StateEventType,
 	state_key: &str,
 	json: &Raw<AnyStateEventContent>,
 ) -> Result {
+	let suspended = services.users.is_suspended(sender).await;
+
+	if suspended && !matches!(event_type, StateEventType::RoomMember) {
+		return Err!(Request(UserSuspended("Account is suspended.")));
+	}
+
 	match event_type {
-		| StateEventType::RoomCreate => {
-			return Err!(Request(BadJson(debug_warn!(
-				?room_id,
-				"You cannot update m.room.create after a room has been created."
-			))));
-		},
-		| StateEventType::RoomServerAcl => {
-			// prevents common ACL paw-guns as ACL management is difficult and prone to
-			// irreversible mistakes
-			match json.deserialize_as_unchecked::<RoomServerAclEventContent>() {
-				| Ok(acl_content) => {
-					if acl_content.allow_is_empty() {
-						return Err!(Request(BadJson(debug_warn!(
-							?room_id,
-							"Sending an ACL event with an empty allow key will permanently \
-							 brick the room for non-tuwunel's as this equates to no servers \
-							 being allowed to participate in this room."
-						))));
-					}
+		StateEventType::RoomCreate => Err!(Request(BadJson(debug_warn!(
+			?room_id,
+			"You cannot update m.room.create after a room has been created."
+		)))),
+		StateEventType::RoomServerAcl => validate_server_acl(services, room_id, json),
+		StateEventType::RoomEncryption => validate_encryption(services),
+		StateEventType::RoomJoinRules => validate_join_rules(services, room_id, json).await,
+		StateEventType::RoomHistoryVisibility => {
+			validate_history_visibility(services, room_id, json).await
+		}
+		StateEventType::RoomCanonicalAlias => {
+			validate_canonical_alias(services, room_id, json).await
+		}
+		StateEventType::RoomMember => {
+			validate_member(services, sender, room_id, state_key, json, suspended).await
+		}
+		_ => Ok(()),
+	}
+}
 
-					if acl_content.deny_contains("*") && acl_content.allow_contains("*") {
-						return Err!(Request(BadJson(debug_warn!(
-							?room_id,
-							"Sending an ACL event with a deny and allow key value of \"*\" will \
-							 permanently brick the room for non-tuwunel's as this equates to no \
-							 servers being allowed to participate in this room."
-						))));
-					}
+fn validate_encryption(services: &Services) -> Result {
+	services
+		.config
+		.allow_encryption
+		.then_some(())
+		.ok_or_else(|| {
+			err!(Request(Forbidden(
+				"Encryption is disabled on this homeserver."
+			)))
+		})
+}
 
-					if acl_content.deny_contains("*")
-						&& !acl_content.is_allowed(services.globals.server_name())
-						&& !acl_content.allow_contains(services.globals.server_name().as_str())
-					{
-						return Err!(Request(BadJson(debug_warn!(
-							?room_id,
-							"Sending an ACL event with a deny key value of \"*\" and without \
-							 your own server name in the allow key will result in you being \
-							 unable to participate in this room."
-						))));
-					}
+fn validate_server_acl(
+	services: &Services,
+	room_id: &RoomId,
+	json: &Raw<AnyStateEventContent>,
+) -> Result {
+	let acl_content = json
+		.deserialize_as_unchecked::<RoomServerAclEventContent>()
+		.map_err(|e| {
+			err!(Request(BadJson(debug_warn!(
+				"Room server ACL event is invalid: {e}"
+			))))
+		})?;
 
-					if !acl_content.allow_contains("*")
-						&& !acl_content.is_allowed(services.globals.server_name())
-						&& !acl_content.allow_contains(services.globals.server_name().as_str())
-					{
-						return Err!(Request(BadJson(debug_warn!(
-							?room_id,
-							"Sending an ACL event for an allow key without \"*\" and without \
-							 your own server name in the allow key will result in you being \
-							 unable to participate in this room."
-						))));
-					}
-				},
-				| Err(e) => {
-					return Err!(Request(BadJson(debug_warn!(
-						"Room server ACL event is invalid: {e}"
-					))));
-				},
-			}
-		},
-		| StateEventType::RoomEncryption =>
-		// Forbid m.room.encryption if encryption is disabled
-		{
-			if !services.config.allow_encryption {
-				return Err!(Request(Forbidden("Encryption is disabled on this homeserver.")));
-			}
-		},
-		| StateEventType::RoomJoinRules => {
-			// admin room is a sensitive room, it should not ever be made public
-			if let Ok(admin_room_id) = services.admin.get_admin_room().await
-				&& admin_room_id == room_id
-			{
-				match json.deserialize_as_unchecked::<RoomJoinRulesEventContent>() {
-					| Ok(join_rule) => {
-						if join_rule.join_rule == JoinRule::Public {
-							return Err!(Request(Forbidden(
-								"Admin room is a sensitive room, it cannot be made public"
-							)));
-						}
-					},
-					| Err(e) => {
-						return Err!(Request(BadJson(debug_warn!(
-							"Room join rules event is invalid: {e}"
-						))));
-					},
-				}
-			}
-		},
-		| StateEventType::RoomHistoryVisibility => {
-			// admin room is a sensitive room, it should not ever be made world readable
-			if let Ok(admin_room_id) = services.admin.get_admin_room().await {
-				match json.deserialize_as_unchecked::<RoomHistoryVisibilityEventContent>() {
-					| Ok(visibility_content) => {
-						if admin_room_id == room_id
-							&& visibility_content.history_visibility
-								== HistoryVisibility::WorldReadable
-						{
-							return Err!(Request(Forbidden(
-								"Admin room is a sensitive room, it cannot be made world \
-								 readable (public room history)."
-							)));
-						}
-					},
-					| Err(e) => {
-						return Err!(Request(BadJson(debug_warn!(
-							"Room history visibility event is invalid: {e}"
-						))));
-					},
-				}
-			}
-		},
-		| StateEventType::RoomCanonicalAlias => {
-			match json.deserialize_as_unchecked::<RoomCanonicalAliasEventContent>() {
-				| Ok(canonical_alias_content) => {
-					let mut aliases = canonical_alias_content.alt_aliases.clone();
+	if acl_content.allow_is_empty() {
+		return Err!(Request(BadJson(debug_warn!(
+			?room_id,
+			"Sending an ACL event with an empty allow key will permanently brick the room for \
+			 non-tuwunel's as this equates to no servers being allowed to participate in this \
+			 room."
+		))));
+	}
 
-					if let Some(alias) = canonical_alias_content.alias {
-						aliases.push(alias);
-					}
+	if acl_content.deny_contains("*") && acl_content.allow_contains("*") {
+		return Err!(Request(BadJson(debug_warn!(
+			?room_id,
+			"Sending an ACL event with a deny and allow key value of \"*\" will permanently \
+			 brick the room for non-tuwunel's as this equates to no servers being allowed to \
+			 participate in this room."
+		))));
+	}
 
-					for alias in aliases {
-						let (alias_room_id, _servers) = services
-							.alias
-							.resolve_alias(&alias)
-							.await
-							.map_err(|e| {
-								err!(Request(BadAlias("Failed resolving alias \"{alias}\": {e}")))
-							})?;
+	let server_name = services.globals.server_name();
+	let self_allowed =
+		acl_content.is_allowed(server_name) || acl_content.allow_contains(server_name.as_str());
 
-						if alias_room_id != room_id {
-							return Err!(Request(BadAlias(
-								"Room alias {alias} does not belong to room {room_id}"
-							)));
-						}
-					}
-				},
-				| Err(e) => {
-					return Err!(Request(InvalidParam(debug_warn!(
-						"Room canonical alias event is invalid: {e}"
-					))));
-				},
-			}
-		},
-		| StateEventType::RoomMember => {
-			match json.deserialize_as_unchecked::<RoomMemberEventContent>() {
-				| Ok(membership_content) => {
-					let Ok(_state_key) = UserId::parse(state_key) else {
-						return Err!(Request(BadJson(
-							"Membership event has invalid or non-existent state key"
-						)));
-					};
+	if acl_content.deny_contains("*") && !self_allowed {
+		return Err!(Request(BadJson(debug_warn!(
+			?room_id,
+			"Sending an ACL event with a deny key value of \"*\" and without your own server \
+			 name in the allow key will result in you being unable to participate in this room."
+		))));
+	}
 
-					if let Some(authorising_user) =
-						membership_content.join_authorized_via_users_server
-					{
-						if membership_content.membership != MembershipState::Join {
-							return Err!(Request(BadJson(
-								"join_authorised_via_users_server is only for member joins"
-							)));
-						}
-
-						if !services.globals.user_is_local(&authorising_user) {
-							return Err!(Request(InvalidParam(
-								"Authorising user {authorising_user} does not belong to this \
-								 homeserver"
-							)));
-						}
-
-						services
-							.state_cache
-							.is_joined(&authorising_user, room_id)
-							.map(is_false!())
-							.map(BoolExt::into_result)
-							.map_err(|()| {
-								err!(Request(InvalidParam(
-									"Authorising user {authorising_user} is not in the room. \
-									 They cannot authorise the join."
-								)))
-							})
-							.await?;
-					}
-				},
-				| Err(e) => {
-					return Err!(Request(BadJson(
-						"Membership content must have a valid JSON body with at least a valid \
-						 membership state: {e}"
-					)));
-				},
-			}
-		},
-		| _ => (),
+	if !acl_content.allow_contains("*") && !self_allowed {
+		return Err!(Request(BadJson(debug_warn!(
+			?room_id,
+			"Sending an ACL event for an allow key without \"*\" and without your own server \
+			 name in the allow key will result in you being unable to participate in this room."
+		))));
 	}
 
 	Ok(())
+}
+
+async fn validate_join_rules(
+	services: &Services,
+	room_id: &RoomId,
+	json: &Raw<AnyStateEventContent>,
+) -> Result {
+	let Ok(admin_room_id) = services.admin.get_admin_room().await else {
+		return Ok(());
+	};
+
+	if admin_room_id != room_id {
+		return Ok(());
+	}
+
+	let join_rule = json
+		.deserialize_as_unchecked::<RoomJoinRulesEventContent>()
+		.map_err(|e| {
+			err!(Request(BadJson(debug_warn!(
+				"Room join rules event is invalid: {e}"
+			))))
+		})?;
+
+	if join_rule.join_rule == JoinRule::Public {
+		return Err!(Request(Forbidden(
+			"Admin room is a sensitive room, it cannot be made public"
+		)));
+	}
+
+	Ok(())
+}
+
+async fn validate_history_visibility(
+	services: &Services,
+	room_id: &RoomId,
+	json: &Raw<AnyStateEventContent>,
+) -> Result {
+	let Ok(admin_room_id) = services.admin.get_admin_room().await else {
+		return Ok(());
+	};
+
+	let visibility_content = json
+		.deserialize_as_unchecked::<RoomHistoryVisibilityEventContent>()
+		.map_err(|e| {
+			err!(Request(BadJson(debug_warn!(
+				"Room history visibility event is invalid: {e}"
+			))))
+		})?;
+
+	if admin_room_id == room_id
+		&& visibility_content.history_visibility == HistoryVisibility::WorldReadable
+	{
+		return Err!(Request(Forbidden(
+			"Admin room is a sensitive room, it cannot be made world readable (public room \
+			 history)."
+		)));
+	}
+
+	Ok(())
+}
+
+async fn validate_canonical_alias(
+	services: &Services,
+	room_id: &RoomId,
+	json: &Raw<AnyStateEventContent>,
+) -> Result {
+	let canonical_alias_content = json
+		.deserialize_as_unchecked::<RoomCanonicalAliasEventContent>()
+		.map_err(|e| {
+			err!(Request(InvalidParam(debug_warn!(
+				"Room canonical alias event is invalid: {e}"
+			))))
+		})?;
+
+	let current_aliases: Vec<OwnedRoomAliasId> = services
+		.state_accessor
+		.room_state_get_content::<RoomCanonicalAliasEventContent>(
+			room_id,
+			&StateEventType::RoomCanonicalAlias,
+			"",
+		)
+		.await
+		.ok()
+		.map(|content| content.aliases().cloned().collect())
+		.unwrap_or_default();
+
+	let new_aliases = canonical_alias_content
+		.aliases()
+		.filter(|alias| !current_aliases.contains(alias));
+
+	for alias in new_aliases {
+		let (alias_room_id, _servers) = services
+			.alias
+			.resolve_alias(alias)
+			.await
+			.map_err(|e| err!(Request(BadAlias("Failed resolving alias \"{alias}\": {e}"))))?;
+
+		if alias_room_id != room_id {
+			return Err!(Request(BadAlias(
+				"Room alias {alias} does not belong to room {room_id}"
+			)));
+		}
+	}
+
+	Ok(())
+}
+
+async fn validate_member(
+	services: &Services,
+	sender: &UserId,
+	room_id: &RoomId,
+	state_key: &str,
+	json: &Raw<AnyStateEventContent>,
+	suspended: bool,
+) -> Result {
+	let membership_content = json
+		.deserialize_as_unchecked::<RoomMemberEventContent>()
+		.map_err(|e| {
+			err!(Request(BadJson(
+				"Membership content must have a valid JSON body with at least a valid \
+				 membership state: {e}"
+			)))
+		})?;
+
+	let Ok(target_user) = UserId::parse(state_key) else {
+		return Err!(Request(BadJson(
+			"Membership event has invalid or non-existent state key"
+		)));
+	};
+
+	if suspended
+		&& (membership_content.membership != MembershipState::Leave || target_user != sender)
+	{
+		return Err!(Request(UserSuspended("Account is suspended.")));
+	}
+
+	if membership_content.membership == MembershipState::Invite
+		&& services.globals.user_is_local(&target_user)
+		&& services
+			.users
+			.invite_permission(sender, &target_user)
+			.await
+			.eq(&InvitePermission::Block)
+	{
+		return Err!(Request(InviteBlocked(
+			"{target_user} has blocked this invite."
+		)));
+	}
+
+	let Some(authorising_user) = membership_content.join_authorized_via_users_server else {
+		return Ok(());
+	};
+
+	if membership_content.membership != MembershipState::Join {
+		return Err!(Request(BadJson(
+			"join_authorised_via_users_server is only for member joins"
+		)));
+	}
+
+	// Already joined or invited: no restricted-join authorisation needed.
+	if services
+		.state_cache
+		.user_membership(&target_user, room_id)
+		.await
+		.is_some_and(|m| matches!(m, MembershipState::Join | MembershipState::Invite))
+	{
+		return Ok(());
+	}
+
+	if !services.globals.user_is_local(&authorising_user) {
+		return Err!(Request(InvalidParam(
+			"Authorising user {authorising_user} does not belong to this homeserver"
+		)));
+	}
+
+	services
+		.state_cache
+		.is_joined(&authorising_user, room_id)
+		.map(is_false!())
+		.map(BoolExt::into_result)
+		.map_err(|()| {
+			err!(Request(InvalidParam(
+				"Authorising user {authorising_user} is not in the room. They cannot authorise \
+				 the join."
+			)))
+		})
+		.await
+}
+
+#[cfg(test)]
+mod tests {
+	use ruma::user_id;
+	use serde_json::{Value as JsonValue, from_str, from_value};
+
+	use super::*;
+
+	fn current_state(sender: &str, content: &JsonValue) -> PduEvent {
+		from_value(json!({
+			"type": "m.room.history_visibility",
+			"content": content,
+			"state_key": "",
+			"event_id": "$event:example.com",
+			"room_id": "!room:example.com",
+			"sender": sender,
+			"prev_events": [],
+			"auth_events": [],
+			"origin_server_ts": 1,
+			"depth": 1,
+			"hashes": { "sha256": "thishashcoversallfieldsincasethisisredacted" },
+		}))
+		.expect("valid pdu")
+	}
+
+	#[test]
+	fn identical_state_content_is_duplicate() {
+		let sender = user_id!("@alice:example.com");
+		let current = current_state(
+			sender.as_str(),
+			&json!({ "history_visibility": "shared", "extra": true }),
+		);
+
+		let content =
+			from_str::<CanonicalJsonObject>(r#"{ "extra": true, "history_visibility": "shared" }"#)
+				.expect("canonical content");
+
+		assert!(
+			is_duplicate_state(
+				&StateEventType::RoomHistoryVisibility,
+				sender,
+				&content,
+				&current,
+			)
+			.expect("comparison")
+		);
+	}
+
+	#[test]
+	fn changed_state_content_is_not_duplicate() {
+		let sender = user_id!("@alice:example.com");
+		let current = current_state(sender.as_str(), &json!({ "history_visibility": "shared" }));
+		let content =
+			from_str(r#"{ "history_visibility": "world_readable" }"#).expect("canonical content");
+
+		assert!(
+			!is_duplicate_state(
+				&StateEventType::RoomHistoryVisibility,
+				sender,
+				&content,
+				&current,
+			)
+			.expect("comparison")
+		);
+	}
+
+	#[test]
+	fn different_sender_is_not_duplicate() {
+		let current = current_state(
+			"@alice:example.com",
+			&json!({ "history_visibility": "shared" }),
+		);
+
+		let content = from_str(r#"{ "history_visibility": "shared" }"#).expect("canonical content");
+
+		assert!(
+			!is_duplicate_state(
+				&StateEventType::RoomHistoryVisibility,
+				user_id!("@bob:example.com"),
+				&content,
+				&current,
+			)
+			.expect("comparison")
+		);
+	}
+
+	#[test]
+	fn member_state_is_not_duplicate() {
+		let sender = user_id!("@alice:example.com");
+		let current = current_state(sender.as_str(), &json!({ "membership": "join" }));
+		let content = from_str(r#"{ "membership": "join" }"#).expect("canonical content");
+
+		assert!(
+			!is_duplicate_state(&StateEventType::RoomMember, sender, &content, &current)
+				.expect("comparison")
+		);
+	}
+
+	#[test]
+	fn timestamped_state_is_not_eligible_for_dedup() {
+		let event_type = StateEventType::RoomHistoryVisibility;
+		let timestamp = MilliSecondsSinceUnixEpoch::now();
+
+		assert!(state_dedup_eligible(&event_type, None));
+		assert!(!state_dedup_eligible(&event_type, Some(&timestamp)));
+	}
 }

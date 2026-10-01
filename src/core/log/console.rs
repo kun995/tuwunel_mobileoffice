@@ -1,7 +1,16 @@
-use std::{env, io, sync::LazyLock};
+//! Console formatting and output routing.
+//!
+//! The module selects stdout, stderr, or native journal output and formats each
+//! event according to logging configuration.
+
+use std::{
+	env, io,
+	io::{IsTerminal, stdin},
+	sync::LazyLock,
+};
 
 use tracing::{
-	Event, Level, Subscriber,
+	Event, Level, Metadata, Subscriber,
 	field::{Field, Visit},
 };
 use tracing_subscriber::{
@@ -14,35 +23,90 @@ use tracing_subscriber::{
 	registry::LookupSpan,
 };
 
-use crate::{Config, Result, apply, is_equal_to};
+use super::journald::{Entry, Journal, enabled as journald_enabled};
+use crate::{Config, Result, apply, debug, is_equal_to};
 
 static SYSTEMD_MODE: LazyLock<bool> =
 	LazyLock::new(|| env::var("SYSTEMD_EXEC_PID").is_ok() && env::var("JOURNAL_STREAM").is_ok());
 
+static TERMINAL_MODE: LazyLock<bool> = LazyLock::new(|| stdin().is_terminal());
+
+/// Routes formatted tracing events to console streams or the native journal.
+///
+/// Construction detects systemd stream mode and configured output preferences.
+/// Each event can then select a destination through `MakeWriter`.
 pub struct ConsoleWriter {
 	stdout: io::Stdout,
 	stderr: io::Stderr,
 	_journal_stream: [u64; 2],
 	use_stderr: bool,
+	journal: Option<Journal>,
+}
+
+/// Writable destination selected for one formatted tracing event.
+///
+/// Console output delegates to the shared writer while journal output owns an
+/// entry buffer that submits when dropped.
+pub enum Sink<'a> {
+	/// Standard output or standard error through the shared console writer.
+	///
+	/// The writer selects the actual file descriptor from process and
+	/// configuration state.
+	Console(&'a ConsoleWriter),
+
+	/// Native journal entry associated with the event metadata.
+	///
+	/// Formatted bytes accumulate in the entry and are submitted when it is
+	/// dropped.
+	Journal(Entry<'a>),
 }
 
 impl ConsoleWriter {
+	/// Creates an output router from logging configuration and process state.
+	///
+	/// A detected journal stream or explicit setting selects standard error for
+	/// console output. Native journal submission is opened when enabled and
+	/// available.
 	#[must_use]
 	pub fn new(config: &Config) -> Self {
 		let journal_stream = get_journal_stream();
+
 		Self {
 			stdout: io::stdout(),
 			stderr: io::stderr(),
 			_journal_stream: journal_stream.into(),
 			use_stderr: journal_stream.0 != 0 || config.log_to_stderr,
+			journal: Journal::open(config),
 		}
 	}
 }
 
 impl<'a> MakeWriter<'a> for ConsoleWriter {
-	type Writer = &'a Self;
+	type Writer = Sink<'a>;
 
-	fn make_writer(&'a self) -> Self::Writer { self }
+	fn make_writer(&'a self) -> Self::Writer { Sink::Console(self) }
+
+	fn make_writer_for(&'a self, meta: &Metadata<'_>) -> Self::Writer {
+		self.journal
+			.as_ref()
+			.map_or(Sink::Console(self), |journal| Sink::Journal(journal.entry(meta)))
+	}
+}
+
+impl io::Write for Sink<'_> {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		match self {
+			| Self::Console(console) => console.write(buf),
+			| Self::Journal(entry) => entry.write(buf),
+		}
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		match self {
+			| Self::Console(console) => console.flush(),
+			| Self::Journal(entry) => entry.flush(),
+		}
+	}
 }
 
 impl io::Write for &'_ ConsoleWriter {
@@ -63,6 +127,11 @@ impl io::Write for &'_ ConsoleWriter {
 	}
 }
 
+/// Selects the configured tracing formatter for each console event.
+///
+/// Compact mode applies globally. Otherwise non-debug errors use the pretty
+/// formatter and remaining events use the full formatter. ANSI follows
+/// `log_colors` and is disabled for native journal submission.
 pub struct ConsoleFormat {
 	pretty: Format<Pretty>,
 	full: Format<Full>,
@@ -71,12 +140,19 @@ pub struct ConsoleFormat {
 }
 
 impl ConsoleFormat {
+	/// Creates console formatters from logging configuration.
+	///
+	/// The method configures ANSI output, thread identifiers, source locations,
+	/// and compact-mode selection. All formatter variants share the same ANSI
+	/// decision.
 	#[must_use]
 	pub fn new(config: &Config) -> Self {
+		let ansi = ansi_enabled(config);
+
 		Self {
 			pretty: fmt::format()
 				.pretty()
-				.with_ansi(config.log_colors)
+				.with_ansi(ansi)
 				.with_thread_names(true)
 				.with_thread_ids(true)
 				.with_target(true)
@@ -86,11 +162,9 @@ impl ConsoleFormat {
 
 			full: Format::<Full>::default()
 				.with_thread_ids(config.log_thread_ids)
-				.with_ansi(config.log_colors),
+				.with_ansi(ansi),
 
-			compact: fmt::format()
-				.compact()
-				.with_ansi(config.log_colors),
+			compact: fmt::format().compact().with_ansi(ansi),
 
 			compact_mode: config.log_compact,
 		}
@@ -108,7 +182,7 @@ where
 		writer: Writer<'_>,
 		event: &Event<'_>,
 	) -> Result<(), std::fmt::Error> {
-		let is_debug = cfg!(debug_assertions)
+		let is_debug = debug::logging()
 			&& event
 				.fields()
 				.map(|field| field.name())
@@ -163,6 +237,24 @@ fn get_journal_stream() -> (u64, u64) {
 		.unwrap_or((0, 0))
 }
 
+/// Whether to color the formatted line.
+///
+/// The journal takes that line verbatim and classifies a message carrying
+/// control bytes as binary rather than text, so colors are suppressed while
+/// entries are submitted to it.
+#[inline]
+#[must_use]
+pub fn ansi_enabled(config: &Config) -> bool { config.log_colors && !journald_enabled(config) }
+
+/// Whether the process was started by systemd, sampled once.
+///
+/// Both `SYSTEMD_EXEC_PID` and `JOURNAL_STREAM` have to be present, which the
+/// service manager sets for a unit it launched itself.
 #[inline]
 #[must_use]
 pub fn is_systemd_mode() -> bool { *SYSTEMD_MODE }
+
+/// Whether standard input is attached to a terminal, sampled once.
+#[inline]
+#[must_use]
+pub fn is_terminal_mode() -> bool { *TERMINAL_MODE }

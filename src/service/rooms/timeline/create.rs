@@ -1,21 +1,26 @@
+//! Constructs and signs local room events without persisting them.
+//!
+//! The builder derives authorization events, depth, predecessor hashes, and
+//! unsigned prior-state data from the current room. Room-version rules then
+//! govern canonical hashing, signing, event IDs, and room IDs.
+
 use std::cmp;
 
 use futures::{StreamExt, TryStreamExt};
 use ruma::{
-	CanonicalJsonObject, CanonicalJsonValue, MilliSecondsSinceUnixEpoch, OwnedEventId,
-	OwnedRoomId, RoomId, UserId,
-	events::{StateEventType, TimelineEventType, room::create::RoomCreateEventContent},
+	CanonicalJsonObject, CanonicalJsonValue, MilliSecondsSinceUnixEpoch, OwnedRoomId, RoomId,
+	UserId,
+	events::{TimelineEventType, room::create::RoomCreateEventContent},
 	room_version_rules::RoomIdFormatVersion,
 	uint,
 };
 use serde_json::value::to_raw_value;
 use tuwunel_core::{
-	Error, Result, err, implement,
+	Err, Error, Result, err, implement,
 	matrix::{
-		event::{Event, StateKey, TypeExt},
-		pdu::{EventHash, PduBuilder, PduEvent, PrevEvents},
+		event::Event,
+		pdu::{EventHash, PduBuilder, PduEvent, PrevEvents, check_rules},
 		room_version,
-		state_res::{self},
 	},
 	utils::{
 		IterStream, ReadyExt, TryReadyExt, millis_since_unix_epoch, stream::TryIgnore,
@@ -24,7 +29,14 @@ use tuwunel_core::{
 };
 
 use super::RoomMutexGuard;
+use crate::rooms::state_res::auth_check;
 
+/// Builds a canonical signed PDU and its structured representation.
+///
+/// Up to twenty current forward extremities become predecessors, and a
+/// non-create event is rejected when no predecessor is available. The event is
+/// authorization-checked and formatted under the room version, including the
+/// version-specific room-ID rules, but is not persisted here.
 #[implement(super::Service)]
 pub async fn create_hash_and_sign_event(
 	&self,
@@ -43,14 +55,9 @@ pub async fn create_hash_and_sign_event(
 		timestamp,
 	} = pdu_builder;
 
-	let prev_events: PrevEvents = self
-		.services
-		.state
-		.get_forward_extremities(room_id)
-		.take(20)
-		.map(Into::into)
-		.collect()
-		.await;
+	let prev_events = self
+		.compute_prev_events(room_id, &event_type)
+		.await?;
 
 	// If there was no create event yet, assume we are creating a room
 	let (room_version, version_rules) = self
@@ -60,7 +67,7 @@ pub async fn create_hash_and_sign_event(
 		.await
 		.or_else(|_| {
 			if event_type == TimelineEventType::RoomCreate {
-				let content: RoomCreateEventContent = serde_json::from_str(content.get())?;
+				let content: RoomCreateEventContent = serde_json::from_str(content.json().get())?;
 				Ok(content.room_version)
 			} else {
 				Err(Error::InconsistentRoomState(
@@ -81,7 +88,7 @@ pub async fn create_hash_and_sign_event(
 			&event_type,
 			sender,
 			state_key.as_deref(),
-			&content,
+			content.json(),
 			&version_rules.authorization,
 			true,
 		)
@@ -115,7 +122,7 @@ pub async fn create_hash_and_sign_event(
 	let unsigned = unsigned
 		.is_empty()
 		.eq(&false)
-		.then_some(to_raw_value(&unsigned)?);
+		.then_some(to_raw_value(&unsigned)?.into());
 
 	let origin_server_ts = timestamp
 		.as_ref()
@@ -131,15 +138,14 @@ pub async fn create_hash_and_sign_event(
 		room_id: room_id.to_owned(),
 		sender: sender.to_owned(),
 		origin: Some(self.services.globals.server_name().to_owned()),
+		content,
 		origin_server_ts,
 		kind: event_type,
-		content,
 		state_key,
 		depth,
 		redacts,
 		unsigned,
 		hashes: EventHash::default(),
-		signatures: None,
 		prev_events,
 		auth_events: auth_events
 			.values()
@@ -153,20 +159,9 @@ pub async fn create_hash_and_sign_event(
 			.collect(),
 	};
 
-	let auth_fetch = async |k: StateEventType, s: StateKey| {
-		auth_events
-			.get(&k.with_state_key(s.as_str()))
-			.map(ToOwned::to_owned)
-			.ok_or_else(|| err!(Request(NotFound("Missing auth events"))))
-	};
-
-	state_res::auth_check(
-		&version_rules,
-		&pdu,
-		&async |event_id: OwnedEventId| self.get_pdu(&event_id).await,
-		&auth_fetch,
-	)
-	.await?;
+	auth_check(&version_rules, &pdu, self, &auth_events)
+		.await?
+		.into_result()?;
 
 	// Hash and sign
 	let mut pdu_json = to_canonical_object(&pdu).map_err(|e| {
@@ -195,14 +190,34 @@ pub async fn create_hash_and_sign_event(
 		pdu_json.insert("room_id".into(), CanonicalJsonValue::String(pdu.room_id.clone().into()));
 	}
 
-	state_res::check_pdu_format(&pdu_json, &version_rules.event_format)?;
-
-	// Generate short event id
-	let _shorteventid = self
-		.services
-		.short
-		.get_or_create_shorteventid(&pdu.event_id)
-		.await;
+	check_rules(&pdu_json, &version_rules.event_format)?;
 
 	Ok((pdu, pdu_json))
+}
+
+#[implement(super::Service)]
+async fn compute_prev_events(
+	&self,
+	room_id: &RoomId,
+	event_type: &TimelineEventType,
+) -> Result<PrevEvents> {
+	let prev_events: PrevEvents = self
+		.services
+		.state
+		.get_forward_extremities(room_id)
+		.take(20)
+		.map(Into::into)
+		.collect()
+		.await;
+
+	// An empty frontier would sign a detached event, which is valid only for a
+	// room's create event; anything else would silently fork the room.
+	if prev_events.is_empty() && *event_type != TimelineEventType::RoomCreate {
+		let message = "cannot create a non-create event in a room with no forward extremities";
+		let room_id = room_id.to_owned();
+
+		return Err!(InconsistentRoomState(message, room_id));
+	}
+
+	Ok(prev_events)
 }

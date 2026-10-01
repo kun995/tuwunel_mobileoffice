@@ -6,7 +6,7 @@ use axum_extra::{
 	TypedHeader,
 	headers::{Authorization, authorization::Bearer},
 };
-use ruma::{RoomId, api::client::error::ErrorKind};
+use ruma::{RoomId, api::error::ErrorKind};
 use tuwunel_core::{Err, Error, Result};
 
 /// # `GET /_matrix/client/unstable/org.tuwunel/rooms/{roomId}/first_unread_event`
@@ -20,7 +20,7 @@ use tuwunel_core::{Err, Error, Result};
 pub(crate) async fn get_first_unread_event_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
-	Path(room_id): Path<Box<RoomId>>,
+	Path(room_id): Path<ruma::OwnedRoomId>,
 ) -> Result<Json<serde_json::Value>> {
 	// Authenticate user from Bearer token
 	let (sender_user, ..) = services
@@ -29,17 +29,13 @@ pub(crate) async fn get_first_unread_event_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
 	// Verify the user is in the room
-	if !services
-		.state_cache
-		.is_joined(&sender_user, &room_id)
-		.await
-	{
+	if !services.state_cache.is_joined(&sender_user, &room_id).await {
 		return Err!(Request(Forbidden("You are not a member of this room.")));
 	}
 

@@ -1,16 +1,17 @@
 use std::sync::Arc;
 
-use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future::Either};
+use futures::{Stream, StreamExt};
 use rocksdb::Direction;
 use serde::Deserialize;
-use tokio::task;
 use tuwunel_core::{Result, implement};
 
+use super::seek::seek_stream;
 use crate::{keyval, keyval::KeyVal, stream};
 
-/// Iterate key-value entries in the map from the end.
+/// Streams deserialized key-value entries in descending database order.
 ///
-/// - Result is deserialized
+/// Each raw pair is decoded with the database deserializer. Any borrowed key or
+/// value must not be retained across another poll of the stream.
 #[implement(super::Map)]
 pub fn rev_stream<'a, K, V>(
 	self: &'a Arc<Self>,
@@ -23,53 +24,12 @@ where
 		.map(keyval::result_deserialize::<K, V>)
 }
 
-/// Iterate key-value entries in the map from the end.
+/// Streams raw key-value entries in descending database order.
 ///
-/// - Result is raw
+/// The scan begins at the last key in the column family. Yielded keys and
+/// values borrow cursor storage and must not be retained across another poll.
 #[implement(super::Map)]
 #[tracing::instrument(skip(self), fields(%self), level = "trace")]
 pub fn rev_raw_stream(self: &Arc<Self>) -> impl Stream<Item = Result<KeyVal<'_>>> + Send {
-	use crate::pool::Seek;
-
-	let opts = super::iter_options_default(&self.engine);
-	let state = stream::State::new(self, opts);
-	if is_cached(self) {
-		let state = state.init_rev(None);
-		return Either::Left(
-			task::consume_budget()
-				.map(move |()| stream::ItemsRev::<'_>::from(state))
-				.into_stream()
-				.flatten(),
-		);
-	}
-
-	let seek = Seek {
-		map: self.clone(),
-		dir: Direction::Reverse,
-		state: crate::pool::into_send_seek(state),
-		key: None,
-		res: None,
-	};
-
-	Either::Right(
-		self.engine
-			.pool
-			.execute_iter(seek)
-			.ok_into::<stream::ItemsRev<'_>>()
-			.into_stream()
-			.try_flatten(),
-	)
-}
-
-#[tracing::instrument(
-    name = "cached",
-    level = "trace",
-    skip_all,
-    fields(%map),
-)]
-pub(super) fn is_cached(map: &Arc<super::Map>) -> bool {
-	let opts = super::cache_iter_options_default(&map.engine);
-	let state = stream::State::new(map, opts).init_rev(None);
-
-	!state.is_incomplete()
+	seek_stream::<stream::ItemsRev<'_>, _>(self, Direction::Reverse, None)
 }

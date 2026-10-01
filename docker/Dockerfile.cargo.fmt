@@ -5,18 +5,15 @@ ARG rust_toolchain="nightly"
 ARG RUSTUP_HOME
 ARG CARGO_HOME
 ARG fmt_args=""
-
-WORKDIR /
-COPY --link --from=input . .
+ARG sched_policy="--rr"
+ARG sched_prio=1
 
 WORKDIR /usr/src/tuwunel
-RUN \
---mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=shared \
---mount=type=cache,dst=${CARGO_HOME}/registry,sharing=shared \
---mount=type=cache,dst=${CARGO_HOME}/git,sharing=shared \
-<<EOF
+ENV sched_policy=${sched_policy}
+ENV sched_prio=${sched_prio}
+RUN <<EOF
     set -eux
-    rustup run ${rust_toolchain} \
+    rustup run ${rust_toolchain} sched_wrap.sh \
         cargo fmt \
             --all \
             --check \

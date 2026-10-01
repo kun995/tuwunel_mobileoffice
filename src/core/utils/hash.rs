@@ -1,10 +1,10 @@
+//! Password hashing and cryptographic digest utilities.
+//!
+//! Password helpers use Argon2id with a fresh random salt for each new hash.
+//! The SHA-256 submodule provides byte-oriented digest helpers.
+
 mod argon;
+
 pub mod sha256;
 
-use crate::Result;
-
-pub fn verify_password(password: &str, password_hash: &str) -> Result {
-	argon::verify_password(password, password_hash)
-}
-
-pub fn password(password: &str) -> Result<String> { argon::password(password) }
+pub use self::argon::{Cost, PhcString, password, verify_password};

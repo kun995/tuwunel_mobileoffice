@@ -1,22 +1,25 @@
 use axum::extract::State;
-use axum_client_ip::InsecureClientIp;
-use futures::{FutureExt, StreamExt, TryFutureExt, future::join3, stream::FuturesUnordered};
+use futures::{FutureExt, StreamExt, TryFutureExt, future::join3};
 use ruma::{
 	OwnedServerName, RoomId, UserId,
-	api::{
-		client::room::get_summary,
-		federation::space::{SpaceHierarchyParentSummary, get_hierarchy},
-	},
+	api::{client::room::get_summary, federation::space::get_hierarchy},
 	events::room::member::MembershipState,
 	room::{JoinRuleSummary, RoomSummary},
 };
 use tuwunel_core::{
-	Err, Result, debug_warn, trace,
-	utils::{IterStream, future::TryExtExt, option::OptionExt},
+	Err, Result, debug_warn, err, trace,
+	utils::{
+		BoolExt, FutureBoolExt, IterStream,
+		future::{OptionFutureExt, ReadyBoolExt, TryExtExt},
+		option::OptionExt,
+	},
 };
-use tuwunel_service::Services;
+use tuwunel_service::{
+	Services,
+	federation::feds::{Fault, Opts, OutcomeExt, Record},
+};
 
-use crate::{Ruma, RumaResponse};
+use crate::{ClientIp, Ruma, RumaResponse};
 
 /// # `GET /_matrix/client/unstable/im.nheko.summary/rooms/{roomIdOrAlias}/summary`
 ///
@@ -29,10 +32,10 @@ use crate::{Ruma, RumaResponse};
 /// An implementation of [MSC3266](https://github.com/matrix-org/matrix-spec-proposals/pull/3266)
 pub(crate) async fn get_room_summary_legacy(
 	State(services): State<crate::State>,
-	InsecureClientIp(client): InsecureClientIp,
+	ClientIp(client): ClientIp,
 	body: Ruma<get_summary::v1::Request>,
 ) -> Result<RumaResponse<get_summary::v1::Response>> {
-	get_room_summary(State(services), InsecureClientIp(client), body)
+	get_room_summary(State(services), ClientIp(client), body)
 		.boxed()
 		.await
 		.map(RumaResponse)
@@ -46,7 +49,7 @@ pub(crate) async fn get_room_summary_legacy(
 #[tracing::instrument(skip_all, fields(%client), name = "room_summary")]
 pub(crate) async fn get_room_summary(
 	State(services): State<crate::State>,
-	InsecureClientIp(client): InsecureClientIp,
+	ClientIp(client): ClientIp,
 	body: Ruma<get_summary::v1::Request>,
 ) -> Result<get_summary::v1::Response> {
 	let (room_id, servers) = services
@@ -79,9 +82,8 @@ async fn room_summary_response(
 			.await;
 	}
 
-	let summary = remote_room_summary_hierarchy_response(services, room_id, servers, sender_user)
-		.await?
-		.summary;
+	let summary =
+		remote_room_summary_hierarchy_response(services, room_id, servers, sender_user).await?;
 
 	Ok(get_summary::v1::Response {
 		summary,
@@ -208,7 +210,7 @@ async fn remote_room_summary_hierarchy_response(
 	room_id: &RoomId,
 	servers: &[OwnedServerName],
 	sender_user: Option<&UserId>,
-) -> Result<SpaceHierarchyParentSummary> {
+) -> Result<RoomSummary> {
 	trace!(?sender_user, ?servers, "Sending remote room summary response for {room_id:?}");
 	if !services.config.allow_federation {
 		return Err!(Request(Forbidden("Federation is disabled.")));
@@ -220,47 +222,70 @@ async fn remote_room_summary_hierarchy_response(
 		)));
 	}
 
-	let request = get_hierarchy::v1::Request::new(room_id.to_owned());
-
-	let mut requests: FuturesUnordered<_> = servers
-		.iter()
-		.map(|server| {
-			services
-				.federation
-				.execute(server, request.clone())
-		})
-		.collect();
-
-	while let Some(Ok(response)) = requests.next().await {
-		trace!("{response:?}");
-		let room = response.room.clone();
-		let summary = &room.summary;
-		if summary.room_id != room_id {
-			debug_warn!(
-				"Room ID {} returned does not belong to the requested room ID {}",
-				summary.room_id,
-				room_id
-			);
-			continue;
-		}
-
-		return user_can_see_summary(
-			services,
-			room_id,
-			&summary.join_rule,
-			summary.guest_can_join,
-			summary.world_readable,
-			summary.join_rule.allowed_room_ids(),
-			sender_user,
-		)
-		.await
-		.map(|()| room);
+	if servers.is_empty() {
+		return Err!(Request(NotFound(
+			"Room is unknown to this server and no servers were provided to fetch it over \
+			 federation."
+		)));
 	}
 
-	Err!(Request(NotFound(
-		"Room is unknown to this server and was unable to fetch over federation with the \
-		 provided servers available"
-	)))
+	let request = get_hierarchy::v1::Request::new(room_id.to_owned());
+	let opts = Opts {
+		record: Record::Contribute,
+		..Default::default()
+	};
+	let acceptable = |response: &get_hierarchy::v1::Response| {
+		trace!(?response, "federation response");
+		let returned_room_id = &response.room.summary.room_id;
+		let accepted = returned_room_id == room_id;
+
+		if !accepted {
+			debug_warn!(
+				%returned_room_id,
+				requested_room_id = %room_id,
+				"federation room hierarchy response did not match request"
+			);
+		}
+
+		accepted
+	};
+
+	let response = services
+		.federation
+		.fanout_to(servers.iter().cloned().stream(), move |_| request.clone(), opts)
+		.inspect(|outcome| match &outcome.result {
+			| Ok(_) => {},
+			| Err(Fault::Error(e)) => {
+				debug_warn!(?e, "Failed to fetch room hierarchy over federation");
+			},
+			| Err(fault) => {
+				debug_warn!(?fault, "Failed to fetch room hierarchy over federation");
+			},
+		})
+		.first_acceptable(acceptable)
+		.await;
+
+	let Some((_, response)) = response else {
+		return Err!(Request(NotFound(
+			"Room is unknown to this server and was unable to fetch over federation with the \
+			 provided servers available"
+		)));
+	};
+
+	let room = response.room;
+	let summary = &room.summary;
+
+	user_can_see_summary(
+		services,
+		room_id,
+		&summary.join_rule,
+		summary.guest_can_join,
+		summary.world_readable,
+		summary.join_rule.allowed_room_ids(),
+		sender_user,
+	)
+	.await
+	.map(|()| room.summary)
 }
 
 async fn user_can_see_summary<'a, I>(
@@ -280,49 +305,47 @@ where
 		JoinRuleSummary::Public | JoinRuleSummary::Knock | JoinRuleSummary::KnockRestricted(_)
 	);
 
-	match sender_user {
-		| Some(sender_user) => {
-			let user_can_see_state_events = services
-				.state_accessor
-				.user_can_see_state_events(sender_user, room_id);
+	if is_public_room {
+		return Ok(());
+	}
 
-			let is_guest = services
-				.users
-				.is_deactivated(sender_user)
-				.unwrap_or(false);
-
-			let user_in_allowed_restricted_room = allowed_room_ids
-				.stream()
-				.any(|room| services.state_cache.is_joined(sender_user, room));
-
-			let (user_can_see_state_events, is_guest, user_in_allowed_restricted_room) =
-				join3(user_can_see_state_events, is_guest, user_in_allowed_restricted_room)
-					.boxed()
-					.await;
-
-			if user_can_see_state_events
-				|| (is_guest && guest_can_join)
-				|| is_public_room
-				|| user_in_allowed_restricted_room
-			{
-				return Ok(());
-			}
-
-			Err!(Request(Forbidden(
-				"Room is not world readable, not publicly accessible/joinable, restricted room \
-				 conditions not met, and guest access is forbidden. Not allowed to see details \
-				 of this room."
-			)))
-		},
-		| None => {
-			if is_public_room || world_readable {
-				return Ok(());
-			}
-
-			Err!(Request(Forbidden(
+	let Some(sender_user) = sender_user else {
+		return world_readable.ok_or_else(|| {
+			err!(Request(Forbidden(
 				"Room is not world readable or publicly accessible/joinable, authentication is \
 				 required"
 			)))
-		},
-	}
+		});
+	};
+
+	let user_can_see_state_events = services
+		.state_accessor
+		.user_can_see_state_events(sender_user, room_id);
+
+	let guest_admitted = guest_can_join
+		.then_async(|| {
+			services
+				.users
+				.is_deactivated(sender_user)
+				.unwrap_or(false)
+		})
+		.unwrap_or_default();
+
+	let user_in_allowed_restricted_room = services
+		.state_cache
+		.is_joined_any(sender_user, allowed_room_ids);
+
+	// The allowed-room scan trails; either cheap check can admit first.
+	let can_see = user_can_see_state_events
+		.is_false()
+		.and2(guest_admitted.is_false(), user_in_allowed_restricted_room.is_false())
+		.is_false();
+
+	can_see.boxed().await.ok_or_else(|| {
+		err!(Request(Forbidden(
+			"Room is not world readable, not publicly accessible/joinable, restricted room \
+			 conditions not met, and guest access is forbidden. Not allowed to see details of \
+			 this room."
+		)))
+	})
 }

@@ -52,9 +52,7 @@ pub enum ReminderRepeat {
 	None,
 	Daily,
 	Weekly,
-	WeeklyDays {
-		days: Vec<u8>,
-	},
+	WeeklyDays { days: Vec<u8> },
 	Monthly,
 	Yearly,
 }
@@ -218,7 +216,9 @@ pub async fn update_reminder(
 	}
 
 	if reminder.status != ReminderStatus::Active {
-		return Err(err!(Request(InvalidParam("Only active reminders can be updated."))));
+		return Err(err!(Request(InvalidParam(
+			"Only active reminders can be updated."
+		))));
 	}
 
 	let old_remind_at_ms = reminder.remind_at_ms;
@@ -321,12 +321,12 @@ async fn process_due_reminders(&self) -> Result {
 #[implement(Service)]
 async fn process_due_reminder(&self, reminder_id: &str, due_at_ms: u64, now: u64) -> Result {
 	let mut reminder = match self.get_reminder(reminder_id).await {
-		| Ok(reminder) => reminder,
-		| Err(error) => {
+		Ok(reminder) => reminder,
+		Err(error) => {
 			warn!(%reminder_id, %due_at_ms, %error, "Removing stale reminder due index");
 			self.remove_due_index_at(due_at_ms, reminder_id);
 			return Ok(());
-		},
+		}
 	};
 
 	if reminder.remind_at_ms != due_at_ms {
@@ -352,13 +352,13 @@ async fn process_due_reminder(&self, reminder_id: &str, due_at_ms: u64, now: u64
 	reminder.last_triggered_at_ms = Some(now);
 
 	match reminder.scope {
-		| ReminderScope::Room => {
+		ReminderScope::Room => {
 			self.append_reminder_event(&reminder, REMINDER_DUE_EVENT_TYPE)
 				.await?;
-		},
-		| ReminderScope::Me => {
+		}
+		ReminderScope::Me => {
 			self.send_personal_due_push(&reminder).await?;
-		},
+		}
 	}
 
 	self.remove_due_index_at(due_at_ms, reminder_id);
@@ -382,12 +382,7 @@ async fn append_reminder_event(
 	reminder: &Reminder,
 	event_type: &str,
 ) -> Result<OwnedEventId> {
-	let state_lock = self
-		.services
-		.state
-		.mutex
-		.lock(&reminder.room_id)
-		.await;
+	let state_lock = self.services.state.mutex.lock(&reminder.room_id).await;
 	let content = reminder_event_content(reminder, event_type);
 	let content = serde_json::value::to_raw_value(&content)
 		.map_err(|e| err!(Request(BadJson("Failed to serialize reminder event: {e}"))))?;
@@ -398,7 +393,7 @@ async fn append_reminder_event(
 		.build_and_append_pdu(
 			PduBuilder {
 				event_type: TimelineEventType::from(event_type),
-				content,
+				content: content.into(),
 				..Default::default()
 			},
 			&reminder.created_by,
@@ -429,15 +424,14 @@ async fn send_personal_due_push(&self, reminder: &Reminder) -> Result {
 		.services
 		.account_data
 		.is_direct(&reminder.created_by, &reminder.room_id)
-		.await
-		|| self
-			.services
-			.state_accessor
-			.is_direct(&reminder.room_id, &reminder.created_by)
-			.await;
+		.await || self
+		.services
+		.state_accessor
+		.is_direct(&reminder.room_id, &reminder.created_by)
+		.await;
 	let sender_avatar_url = self
 		.services
-		.users
+		.profile
 		.avatar_url(&reminder.created_by)
 		.await
 		.ok()
@@ -451,11 +445,7 @@ async fn send_personal_due_push(&self, reminder: &Reminder) -> Result {
 		.and_then(|content| content.url)
 		.map(|avatar_url| avatar_url.to_string());
 
-	let pushers = self
-		.services
-		.pusher
-		.get_pushers(&reminder.created_by)
-		.await;
+	let pushers = self.services.pusher.get_pushers(&reminder.created_by).await;
 	let mut attempted = false;
 	let mut delivered = false;
 	for pusher in pushers {
@@ -479,8 +469,7 @@ async fn send_personal_due_push(&self, reminder: &Reminder) -> Result {
 			.notification_count(&reminder.created_by, &reminder.room_id)
 			.await;
 
-		let url =
-			push_gateway_notify_url(&http.url, &self.services.config.notification_push_path);
+		let url = push_gateway_notify_url(&http.url, &self.services.config.notification_push_path);
 		let payload = json!({
 			"notification": {
 				"event_id": reminder.event_id.clone(),
@@ -519,15 +508,15 @@ async fn send_personal_due_push(&self, reminder: &Reminder) -> Result {
 			.await;
 
 		match response {
-			| Ok(response) if response.status().is_success() => {
+			Ok(response) if response.status().is_success() => {
 				delivered = true;
-			},
-			| Ok(response) => {
+			}
+			Ok(response) => {
 				info!(%url, status = %response.status(), "Reminder push gateway returned non-success status");
-			},
-			| Err(error) => {
+			}
+			Err(error) => {
 				info!(%url, %error, "Failed to send reminder push");
-			},
+			}
 		}
 	}
 
@@ -550,10 +539,10 @@ async fn send_personal_due_push(&self, reminder: &Reminder) -> Result {
 
 fn reminder_event_content(reminder: &Reminder, event_type: &str) -> JsonValue {
 	let body = match event_type {
-		| REMINDER_CREATED_EVENT_TYPE => format!("Reminder created: {}", reminder.title),
-		| REMINDER_UPDATED_EVENT_TYPE => format!("Reminder updated: {}", reminder.title),
-		| REMINDER_CANCELLED_EVENT_TYPE => format!("Reminder cancelled: {}", reminder.title),
-		| _ => format!("Reminder due: {}", reminder.title),
+		REMINDER_CREATED_EVENT_TYPE => format!("Reminder created: {}", reminder.title),
+		REMINDER_UPDATED_EVENT_TYPE => format!("Reminder updated: {}", reminder.title),
+		REMINDER_CANCELLED_EVENT_TYPE => format!("Reminder cancelled: {}", reminder.title),
+		_ => format!("Reminder due: {}", reminder.title),
 	};
 
 	json!({
@@ -573,14 +562,12 @@ fn reminder_event_content(reminder: &Reminder, event_type: &str) -> JsonValue {
 
 fn next_occurrence(reminder: &Reminder) -> Result<Option<(String, u64)>> {
 	match &reminder.repeat {
-		| ReminderRepeat::None => Ok(None),
-		| ReminderRepeat::Daily => add_days(&reminder.remind_at, 1).map(Some),
-		| ReminderRepeat::Weekly => add_days(&reminder.remind_at, 7).map(Some),
-		| ReminderRepeat::WeeklyDays { days } => {
-			next_weekly_day(&reminder.remind_at, days).map(Some)
-		},
-		| ReminderRepeat::Monthly => add_months(&reminder.remind_at, 1).map(Some),
-		| ReminderRepeat::Yearly => add_months(&reminder.remind_at, 12).map(Some),
+		ReminderRepeat::None => Ok(None),
+		ReminderRepeat::Daily => add_days(&reminder.remind_at, 1).map(Some),
+		ReminderRepeat::Weekly => add_days(&reminder.remind_at, 7).map(Some),
+		ReminderRepeat::WeeklyDays { days } => next_weekly_day(&reminder.remind_at, days).map(Some),
+		ReminderRepeat::Monthly => add_months(&reminder.remind_at, 1).map(Some),
+		ReminderRepeat::Yearly => add_months(&reminder.remind_at, 12).map(Some),
 	}
 }
 
@@ -689,9 +676,10 @@ impl Service {
 		self.db
 			.remindertime_reminderid
 			.put((reminder.remind_at_ms, reminder.reminder_id.as_str()), 0_u8);
-		self.db
-			.roomid_reminderids
-			.raw_put(room_reminder_key(&reminder.room_id, &reminder.reminder_id), 0_u8);
+		self.db.roomid_reminderids.raw_put(
+			room_reminder_key(&reminder.room_id, &reminder.reminder_id),
+			0_u8,
+		);
 	}
 
 	fn store_reminder_only(&self, reminder: &Reminder) {

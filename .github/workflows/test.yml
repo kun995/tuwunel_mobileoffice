@@ -40,8 +40,8 @@ on:
         default: ${{github.event.inputs.pipeline || github.event.workflow_run.head_commit.message}}
       checkout:
         type: string
-        default: 'HEAD'
-      enable_docs:
+        default: ${{github.sha}}
+      enable_doc:
         type: string
         default: 'true'
       enable_unit:
@@ -65,27 +65,83 @@ on:
       enable_complement:
         type: string
         default: 'true'
+      enable_complemau:
+        type: string
+        default: 'true'
+      enable_complement_debug:
+        type: string
+        default: 'true'
       complement_runner:
         type: string
         default: 'het'
       complement_verbose:
         type: string
         default: 'false'
+      enable_complement_crypto:
+        type: string
+        default: 'true'
+      complement_crypto_verbose:
+        type: string
+        default: 'false'
+      enable_complement_interop:
+        type: string
+        default: 'false'
+      enable_complement_interop_inverse:
+        type: string
+        default: 'false'
+      complement_interop_peer:
+        type: string
+        default: 'synapse'
+      complement_interop_run:
+        type: string
+        default: '.*'
+      complement_interop_verbose:
+        type: string
+        default: 'false'
+      enable_mas:
+        type: string
+        default: 'false'
+      mas_verbose:
+        type: string
+        default: 'false'
+      enable_playwright:
+        type: string
+        default: 'false'
+      playwright_runner:
+        type: string
+        default: 'het'
+      playwright_retries:
+        type: string
+        default: '3'
+      playwright_workers:
+        type: string
+        default: '1'
+      playwright_shards:
+        type: string
+        default: '1'
+
+    secrets:
+      cachix_auth_token:
+        required: false
+        description: Write token for the Cachix binary cache.
+      attic_token:
+        required: false
+        description: Write token for the self-hosted binary cache.
 
 jobs:
-  docs:
+  doc:
     if: >
-      fromJSON(inputs.enable_docs)
+      fromJSON(inputs.enable_doc)
       && !contains(inputs.pipeline, '[ci only it]')
-      && contains(fromJSON(inputs.cargo_profiles), fromJSON('["test"]')[0])
+      && contains(fromJSON(inputs.cargo_profiles), fromJSON('["release"]')[0])
       && contains(fromJSON(inputs.feat_sets), fromJSON('["all"]')[0])
       && contains(fromJSON(inputs.rust_toolchains), fromJSON('["nightly"]')[0])
       && contains(fromJSON(inputs.sys_targets), fromJSON('["x86_64-v1-linux-gnu"]')[0])
 
-    name: Docs
+    name: Doc
     uses: ./.github/workflows/bake.yml
     with:
-      bake_targets: '["docs"]'
+      bake_targets: '["doc"]'
       cargo_profiles: '["test"]'
       feat_sets: '["all"]'
       rust_toolchains: '["nightly"]'
@@ -277,6 +333,122 @@ jobs:
       excludes: ${{inputs.excludes}}
       includes: ${{inputs.includes}}
       checkout: ${{inputs.checkout}}
+    secrets:
+      cachix_auth_token: ${{secrets.cachix_auth_token}}
+      attic_token: ${{secrets.attic_token}}
+
+  mas:
+    if: >
+      !failure() && !cancelled()
+      && fromJSON(inputs.enable_mas)
+      && !contains(inputs.pipeline, '[ci no build]')
+      && contains(fromJSON(inputs.cargo_profiles), fromJSON('["bench"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["nightly"]')[0])
+      && contains(fromJSON(inputs.sys_targets), fromJSON('["x86_64-v3-linux-gnu"]')[0])
+
+    name: MAS
+    uses: ./.github/workflows/bake.yml
+    with:
+      bake_targets: '["mas-testee"]'
+      cargo_profiles: '["bench"]'
+      feat_sets: '["logging"]'
+      rust_toolchains: '["nightly"]'
+      sys_names: ${{inputs.sys_names}}
+      sys_versions: ${{inputs.sys_versions}}
+      rust_targets: ${{inputs.rust_targets}}
+      sys_targets: '["x86_64-v3-linux-gnu"]'
+      machines: ${{inputs.machines}}
+      runner: ${{inputs.complement_runner}}
+      excludes: ${{inputs.excludes}}
+      includes: ${{inputs.includes}}
+      checkout: ${{inputs.checkout}}
+
+  playwright:
+    if: >
+      !failure() && !cancelled()
+      && fromJSON(inputs.enable_playwright)
+      && !contains(inputs.pipeline, '[ci no build]')
+      && contains(fromJSON(inputs.cargo_profiles), fromJSON('["bench"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["nightly"]')[0])
+      && contains(fromJSON(inputs.sys_targets), fromJSON('["x86_64-v3-linux-gnu"]')[0])
+
+    name: Playwright
+    uses: ./.github/workflows/bake.yml
+    with:
+      bake_targets: '["playwright-tester", "playwright-testee"]'
+      cargo_profiles: '["bench"]'
+      feat_sets: '["logging"]'
+      rust_toolchains: '["nightly"]'
+      sys_names: ${{inputs.sys_names}}
+      sys_versions: ${{inputs.sys_versions}}
+      rust_targets: ${{inputs.rust_targets}}
+      sys_targets: '["x86_64-v3-linux-gnu"]'
+      machines: ${{inputs.machines}}
+      runner: ${{inputs.playwright_runner}}
+      excludes: ${{inputs.excludes}}
+      includes: ${{inputs.includes}}
+      checkout: ${{inputs.checkout}}
+
+  complement:
+    if: >
+      !failure() && !cancelled()
+      && fromJSON(inputs.enable_complement)
+      && !contains(inputs.pipeline, '[ci no build]')
+      && contains(fromJSON(inputs.cargo_profiles), fromJSON('["bench"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["nightly"]')[0])
+      && contains(fromJSON(inputs.sys_targets), fromJSON('["x86_64-v3-linux-gnu"]')[0])
+
+    name: Complement
+    uses: ./.github/workflows/bake.yml
+    with:
+      bake_targets: '["complement-tester", "complement-testee"]'
+      cargo_profiles: '["test", "bench"]'
+      feat_sets: '["logging"]'
+      rust_toolchains: '["nightly"]'
+      sys_names: ${{inputs.sys_names}}
+      sys_versions: ${{inputs.sys_versions}}
+      rust_targets: '["x86_64-unknown-linux-gnu"]'
+      sys_targets: '["x86_64-v1-linux-gnu", "x86_64-v3-linux-gnu"]'
+      machines: ${{inputs.machines}}
+      runner: ${{inputs.complement_runner}}
+      includes: ${{inputs.includes}}
+      checkout: ${{inputs.checkout}}
+      # Two build cells: debug is test/v1, optimized is bench/v3. The diagonal
+      # excludes drop the off-pairs; the ARM64 excludes keep x86 targets on X64.
+      excludes: >
+        [
+          {"cargo_profile": "test", "sys_target": "x86_64-v3-linux-gnu"},
+          {"cargo_profile": "bench", "sys_target": "x86_64-v1-linux-gnu"},
+          {"sys_target": "x86_64-v1-linux-gnu", "machine": "ARM64"},
+          {"sys_target": "x86_64-v3-linux-gnu", "machine": "ARM64"}
+        ]
+
+  complement-crypto:
+    if: >
+      !failure() && !cancelled()
+      && fromJSON(inputs.enable_complement)
+      && fromJSON(inputs.enable_complement_crypto)
+      && !contains(inputs.pipeline, '[ci no build]')
+      && contains(fromJSON(inputs.cargo_profiles), fromJSON('["bench"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["nightly"]')[0])
+      && contains(fromJSON(inputs.sys_targets), fromJSON('["x86_64-v3-linux-gnu"]')[0])
+
+    name: Complement-Crypto
+    uses: ./.github/workflows/bake.yml
+    with:
+      bake_targets: '["complement-crypto-tester", "complement-testee"]'
+      cargo_profiles: '["bench"]'
+      feat_sets: '["logging"]'
+      rust_toolchains: '["nightly"]'
+      sys_names: ${{inputs.sys_names}}
+      sys_versions: ${{inputs.sys_versions}}
+      rust_targets: ${{inputs.rust_targets}}
+      sys_targets: '["x86_64-v3-linux-gnu"]'
+      machines: ${{inputs.machines}}
+      runner: ${{inputs.complement_runner}}
+      excludes: ${{inputs.excludes}}
+      includes: ${{inputs.includes}}
+      checkout: ${{inputs.checkout}}
 
   rust-sdk-integ:
     if: >
@@ -288,7 +460,6 @@ jobs:
       && contains(fromJSON(inputs.rust_targets), fromJSON('["x86_64-unknown-linux-gnu"]')[0])
 
     name: Matrix SDK Integration
-    needs: [smoke]
     uses: ./.github/workflows/bake.yml
     with:
       #bake_targets: '["rust-sdk-integ", "rust-sdk-valgrind"]'
@@ -331,19 +502,53 @@ jobs:
           {"sys_target": "aarch64-v8-linux-gnu"},
         ]
 
-  complement:
+  acceptance-init:
     if: >
       !failure() && !cancelled()
-      && fromJSON(inputs.enable_complement)
+      && fromJSON(inputs.enable_playwright)
       && !contains(inputs.pipeline, '[ci no build]')
+      && inputs.machines
+      && contains(fromJSON(inputs.cargo_profiles), fromJSON('["bench"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["nightly"]')[0])
+      && contains(fromJSON(inputs.sys_targets), fromJSON('["x86_64-v3-linux-gnu"]')[0])
+      && inputs.playwright_shards > 1
+
+    name: Playwright Sharding
+    runs-on: ["${{fromJSON(inputs.machines)[0]}}", "${{inputs.playwright_runner}}"]
+
+    outputs:
+      ids: ${{steps.gen.outputs.ids}}
+
+    steps:
+    - id: gen
+      name: Generate Shard Matrix
+      env:
+        shards: ${{inputs.playwright_shards}}
+      run: |
+        case "$shards" in ''|*[!0-9]*) echo "invalid shards: '$shards'" >&2; exit 1;; esac
+        test "$shards" -ge 1 || { echo "shards must be >= 1" >&2; exit 1; }
+        echo "ids=[$(seq -s, 1 "$shards")]" >> "$GITHUB_OUTPUT"
+
+  acceptance:
+    if: >
+      !failure() && !cancelled()
+      && fromJSON(inputs.enable_playwright)
+      && !contains(inputs.pipeline, '[ci no build]')
+      && inputs.machines
       && contains(fromJSON(inputs.cargo_profiles), fromJSON('["bench"]')[0])
       && contains(fromJSON(inputs.rust_toolchains), fromJSON('["nightly"]')[0])
       && contains(fromJSON(inputs.sys_targets), fromJSON('["x86_64-v3-linux-gnu"]')[0])
 
-    name: Complement
-    uses: ./.github/workflows/bake.yml
+    name: Acceptance (element-web)
+    needs: [playwright, acceptance-init]
+    uses: ./.github/workflows/acceptance.yml
     with:
-      bake_targets: '["complement-tester", "complement-testee"]'
+      counterparty: element-web
+      runner: ${{inputs.playwright_runner}}
+      workers: ${{inputs.playwright_workers}}
+      retries: ${{inputs.playwright_retries}}
+      shards: ${{inputs.playwright_shards}}
+      shard_ids: ${{needs.acceptance-init.outputs.ids || '[1]'}}
       cargo_profiles: '["bench"]'
       feat_sets: '["logging"]'
       rust_toolchains: '["nightly"]'
@@ -352,7 +557,46 @@ jobs:
       rust_targets: ${{inputs.rust_targets}}
       sys_targets: '["x86_64-v3-linux-gnu"]'
       machines: ${{inputs.machines}}
+      excludes: ${{inputs.excludes}}
+      includes: ${{inputs.includes}}
+      checkout: ${{inputs.checkout}}
+
+  authentication:
+    if: >
+      !failure() && !cancelled()
+      && fromJSON(inputs.enable_mas)
+      && !contains(inputs.pipeline, '[ci no build]')
+      && inputs.machines
+      && contains(fromJSON(inputs.cargo_profiles), fromJSON('["bench"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["nightly"]')[0])
+      && contains(fromJSON(inputs.sys_targets), fromJSON('["x86_64-v3-linux-gnu"]')[0])
+
+    name: Authentication (mas)
+    needs: [mas]
+
+    uses: ./.github/workflows/compliance.yml
+    with:
+      regime: authentication
+      counterparty: mas
       runner: ${{inputs.complement_runner}}
+      script: docker/mas.sh
+      summariser: .github/workflows/summarise/mas.sh
+      results_path: tests/mas/results.jsonl
+      logs_path: tests/mas/tuwunel.log
+      runtime_metrics_path: tests/mas/mas.log
+      verbose: ${{inputs.mas_verbose}}
+      results_artifact_prefix: mas_results
+      output_artifact_prefix: mas_output
+      metrics_artifact_prefix: mas_worker_log
+      runtime_history: false
+      cargo_profiles: '["bench"]'
+      feat_sets: '["logging"]'
+      rust_toolchains: '["nightly"]'
+      sys_names: ${{inputs.sys_names}}
+      sys_versions: ${{inputs.sys_versions}}
+      rust_targets: ${{inputs.rust_targets}}
+      sys_targets: '["x86_64-v3-linux-gnu"]'
+      machines: ${{inputs.machines}}
       excludes: ${{inputs.excludes}}
       includes: ${{inputs.includes}}
       checkout: ${{inputs.checkout}}
@@ -367,74 +611,240 @@ jobs:
       && contains(fromJSON(inputs.rust_toolchains), fromJSON('["nightly"]')[0])
       && contains(fromJSON(inputs.sys_targets), fromJSON('["x86_64-v3-linux-gnu"]')[0])
 
-    name: Matrix Compliance
-    needs: [complement, smoke]
-    runs-on: ["${{matrix.machine}}", "${{inputs.complement_runner}}"]
+    name: Compliance (tuwunel)
+    needs: [complement]
+
+    uses: ./.github/workflows/compliance.yml
+    with:
+      regime: compliance
+      counterparty: tuwunel
+      runner: ${{inputs.complement_runner}}
+      script: docker/complement.sh
+      summariser: .github/workflows/summarise/complement_complement.sh
+      results_path: tests/complement/results.jsonl
+      logs_path: tests/complement/logs.jsonl
+      runtime_metrics_path: tests/complement/runtime_metrics.tar.zst
+      verbose: ${{inputs.complement_verbose}}
+      results_artifact_prefix: complement_results
+      output_artifact_prefix: complement_output
+      metrics_artifact_prefix: complement_runtime_metrics
+      runtime_history: true
+      complement_perf: true
+      cargo_profiles: '["bench"]'
+      feat_sets: '["logging"]'
+      rust_toolchains: '["nightly"]'
+      sys_names: ${{inputs.sys_names}}
+      sys_versions: ${{inputs.sys_versions}}
+      rust_targets: ${{inputs.rust_targets}}
+      sys_targets: '["x86_64-v3-linux-gnu"]'
+      machines: ${{inputs.machines}}
+      excludes: ${{inputs.excludes}}
+      includes: ${{inputs.includes}}
+      checkout: ${{inputs.checkout}}
+
+  compliance-complemau:
+    if: >
+      !failure() && !cancelled()
+      && fromJSON(inputs.enable_complement)
+      && fromJSON(inputs.enable_complemau)
+      && !contains(inputs.pipeline, '[ci no build]')
+      && inputs.machines
+      && contains(fromJSON(inputs.cargo_profiles), fromJSON('["test"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["nightly"]')[0])
+      && contains(fromJSON(inputs.sys_targets), fromJSON('["x86_64-v1-linux-gnu"]')[0])
+
+    name: Compliance (mautrix-go)
+    needs: [complement]
     concurrency:
-      group: complement-cant-walk-and-chew-bubblegum
+      group: complemau
       cancel-in-progress: false
 
-    strategy:
-      fail-fast: false
-      matrix:
-        cargo_profile: ${{fromJSON('["bench"]')}}
-        feat_set: ${{fromJSON('["logging"]')}}
-        rust_toolchain: ${{fromJSON('["nightly"]')}}
-        sys_name: ${{fromJSON(inputs.sys_names)}}
-        sys_version: ${{fromJSON(inputs.sys_versions)}}
-        rust_target: ${{fromJSON(inputs.rust_targets)}}
-        sys_target: ${{fromJSON('["x86_64-v3-linux-gnu"]')}}
-        machine: ${{fromJSON(inputs.machines)}}
-        exclude: ${{fromJSON(inputs.excludes)}}
-        include: ${{fromJSON(inputs.includes)}}
+    uses: ./.github/workflows/compliance.yml
+    with:
+      regime: complemau
+      counterparty: tuwunel
+      runner: ${{inputs.complement_runner}}
+      max_parallel: 1
+      script: docker/complemau.sh
+      summariser: .github/workflows/summarise/complemau.sh
+      results_path: tests/complement/complemau/results.jsonl
+      logs_path: tests/complement/complemau/logs.jsonl
+      runtime_metrics_path: tests/complement/complemau/runtime_metrics.tar.zst
+      verbose: ${{inputs.complement_verbose}}
+      results_artifact_prefix: complemau_results
+      output_artifact_prefix: complemau_output
+      metrics_artifact_prefix: complemau_runtime_metrics
+      cargo_profiles: '["test"]'
+      feat_sets: '["logging"]'
+      rust_toolchains: '["nightly"]'
+      sys_names: ${{inputs.sys_names}}
+      sys_versions: ${{inputs.sys_versions}}
+      rust_targets: ${{inputs.rust_targets}}
+      sys_targets: '["x86_64-v1-linux-gnu"]'
+      machines: ${{inputs.machines}}
+      excludes: ${{inputs.excludes}}
+      includes: ${{inputs.includes}}
+      checkout: ${{inputs.checkout}}
 
-    steps:
-    - uses: actions/checkout@v3
-    - name: Execute
-      id: execute
-      env:
-        complement_verbose: ${{inputs.complement_verbose && 1 || 0}}
-        cargo_profile: ${{matrix.cargo_profile}}
-        rust_toolchain: ${{matrix.rust_toolchain}}
-        rust_target: ${{matrix.rust_target}}
-        feat_set: ${{matrix.feat_set}}
-        sys_name: ${{matrix.sys_name}}
-        sys_target: ${{matrix.sys_target}}
-        sys_version: ${{matrix.sys_version}}
-        machine: ${{matrix.machine}}
+  compliance-debug:
+    if: >
+      !failure() && !cancelled()
+      && fromJSON(inputs.enable_complement)
+      && fromJSON(inputs.enable_complement_debug)
+      && !contains(inputs.pipeline, '[ci no build]')
+      && inputs.machines
+      && contains(fromJSON(inputs.cargo_profiles), fromJSON('["test"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["nightly"]')[0])
+      && contains(fromJSON(inputs.sys_targets), fromJSON('["x86_64-v1-linux-gnu"]')[0])
 
-      run: |
-        docker/complement.sh
+    name: Compliance (tuwunel)
+    needs: [complement]
 
-    - if: success() || failure() && steps.execute.outcome == 'failure'
-      name: Extract
-      id: extract
-      env:
-        name: complement_tester__${{matrix.sys_name}}__${{matrix.sys_version}}__${{matrix.sys_target}}
-        tag: latest
+    uses: ./.github/workflows/compliance.yml
+    with:
+      regime: compliance
+      counterparty: tuwunel
+      runner: ${{inputs.complement_runner}}
+      script: docker/complement.sh
+      summariser: .github/workflows/summarise/complement_complement.sh
+      results_path: tests/complement/results.jsonl
+      logs_path: tests/complement/logs.jsonl
+      runtime_metrics_path: tests/complement/runtime_metrics.tar.zst
+      verbose: ${{inputs.complement_verbose}}
+      results_artifact_prefix: complement_debug_results
+      output_artifact_prefix: complement_debug_output
+      metrics_artifact_prefix: complement_debug_runtime_metrics
+      cargo_profiles: '["test"]'
+      feat_sets: '["logging"]'
+      rust_toolchains: '["nightly"]'
+      sys_names: ${{inputs.sys_names}}
+      sys_versions: ${{inputs.sys_versions}}
+      rust_targets: ${{inputs.rust_targets}}
+      sys_targets: '["x86_64-v1-linux-gnu"]'
+      machines: ${{inputs.machines}}
+      excludes: ${{inputs.excludes}}
+      includes: ${{inputs.includes}}
+      checkout: ${{inputs.checkout}}
 
-      run: |
-        cid=$(cat "$name")
-        docker cp "$cid:/usr/src/complement/new_results.jsonl" tests/complement/results.jsonl
+  compliance-crypto:
+    if: >
+      !failure() && !cancelled()
+      && fromJSON(inputs.enable_complement)
+      && fromJSON(inputs.enable_complement_crypto)
+      && !contains(inputs.pipeline, '[ci no build]')
+      && inputs.machines
+      && contains(fromJSON(inputs.cargo_profiles), fromJSON('["bench"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["nightly"]')[0])
+      && contains(fromJSON(inputs.sys_targets), fromJSON('["x86_64-v3-linux-gnu"]')[0])
 
-    - if: success() || failure() && steps.execute.outcome == 'failure'
-      name: Upload New Results
-      id: upload-result
-      uses: actions/upload-artifact@v4
-      with:
-        name: complement_results-${{matrix.feat_set}}-${{matrix.sys_name}}-${{matrix.sys_target}}.jsonl
-        path: ./tests/complement/results.jsonl
+    name: Cryptography (rust-sdk)
+    needs: [complement-crypto]
 
-    - if: success() || (failure() && steps.execute.outcome == 'failure')
-      name: Upload Log Output
-      id: upload-output
-      uses: actions/upload-artifact@v4
-      with:
-        name: complement_output-${{matrix.feat_set}}-${{matrix.sys_name}}-${{matrix.sys_target}}.jsonl
-        path: ./tests/complement/logs.jsonl
-        if-no-files-found: ignore
+    uses: ./.github/workflows/compliance.yml
+    with:
+      regime: crypto
+      counterparty: rust-sdk
+      runner: ${{inputs.complement_runner}}
+      script: docker/complement-crypto.sh
+      summariser: .github/workflows/summarise/complement_crypto.sh
+      results_path: tests/complement-crypto/results.jsonl
+      logs_path: tests/complement-crypto/logs.jsonl
+      runtime_metrics_path: tests/complement-crypto/runtime_metrics.tar.zst
+      verbose: ${{inputs.complement_crypto_verbose}}
+      results_artifact_prefix: complement_crypto_results
+      output_artifact_prefix: complement_crypto_output
+      metrics_artifact_prefix: complement_crypto_runtime_metrics
+      cargo_profiles: '["bench"]'
+      feat_sets: '["logging"]'
+      rust_toolchains: '["nightly"]'
+      sys_names: ${{inputs.sys_names}}
+      sys_versions: ${{inputs.sys_versions}}
+      rust_targets: ${{inputs.rust_targets}}
+      sys_targets: '["x86_64-v3-linux-gnu"]'
+      machines: ${{inputs.machines}}
+      excludes: ${{inputs.excludes}}
+      includes: ${{inputs.includes}}
+      checkout: ${{inputs.checkout}}
 
-    - name: Accept
-      id: accept
-      run: |
-        git diff --exit-code --color --color-moved
+  compliance-interop:
+    if: >
+      !failure() && !cancelled()
+      && fromJSON(inputs.enable_complement)
+      && fromJSON(inputs.enable_complement_debug)
+      && fromJSON(inputs.enable_complement_interop)
+      && !contains(inputs.pipeline, '[ci no build]')
+      && inputs.machines
+      && contains(fromJSON(inputs.cargo_profiles), fromJSON('["test"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["nightly"]')[0])
+      && contains(fromJSON(inputs.sys_targets), fromJSON('["x86_64-v1-linux-gnu"]')[0])
+
+    name: Interoperability (${{inputs.complement_interop_peer}})
+    needs: [complement]
+
+    uses: ./.github/workflows/compliance.yml
+    with:
+      regime: interop
+      counterparty: ${{inputs.complement_interop_peer}}
+      runner: ${{inputs.complement_runner}}
+      script: interop=${{inputs.complement_interop_peer}} docker/complement.sh "${{inputs.complement_interop_run}}"
+      summariser: .github/workflows/summarise/complement_interop.sh
+      results_path: tests/complement/interop/results.jsonl
+      logs_path: tests/complement/interop/logs.jsonl
+      runtime_metrics_path: tests/complement/interop/runtime_metrics.tar.zst
+      verbose: ${{inputs.complement_interop_verbose}}
+      results_artifact_prefix: complement_interop_results
+      output_artifact_prefix: complement_interop_output
+      metrics_artifact_prefix: complement_interop_runtime_metrics
+      cargo_profiles: '["test"]'
+      feat_sets: '["logging"]'
+      rust_toolchains: '["nightly"]'
+      sys_names: ${{inputs.sys_names}}
+      sys_versions: ${{inputs.sys_versions}}
+      rust_targets: ${{inputs.rust_targets}}
+      sys_targets: '["x86_64-v1-linux-gnu"]'
+      machines: ${{inputs.machines}}
+      excludes: ${{inputs.excludes}}
+      includes: ${{inputs.includes}}
+      checkout: ${{inputs.checkout}}
+
+  compliance-interop-inverse:
+    if: >
+      !failure() && !cancelled()
+      && fromJSON(inputs.enable_complement)
+      && fromJSON(inputs.enable_complement_debug)
+      && fromJSON(inputs.enable_complement_interop)
+      && fromJSON(inputs.enable_complement_interop_inverse)
+      && !contains(inputs.pipeline, '[ci no build]')
+      && inputs.machines
+      && contains(fromJSON(inputs.cargo_profiles), fromJSON('["test"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["nightly"]')[0])
+      && contains(fromJSON(inputs.sys_targets), fromJSON('["x86_64-v1-linux-gnu"]')[0])
+
+    name: Interoperability Inverted (${{inputs.complement_interop_peer}})
+    needs: [complement]
+
+    uses: ./.github/workflows/compliance.yml
+    with:
+      regime: interop
+      counterparty: ${{inputs.complement_interop_peer}}
+      runner: ${{inputs.complement_runner}}
+      script: interop_hs=hs1 interop=${{inputs.complement_interop_peer}} docker/complement.sh "${{inputs.complement_interop_run}}"
+      summariser: .github/workflows/summarise/complement_interop.sh
+      results_path: tests/complement/interop/results.jsonl
+      logs_path: tests/complement/interop/logs.jsonl
+      runtime_metrics_path: tests/complement/interop/runtime_metrics.tar.zst
+      verbose: ${{inputs.complement_interop_verbose}}
+      results_artifact_prefix: complement_interop_inverse_results
+      output_artifact_prefix: complement_interop_inverse_output
+      metrics_artifact_prefix: complement_interop_inverse_runtime_metrics
+      cargo_profiles: '["test"]'
+      feat_sets: '["logging"]'
+      rust_toolchains: '["nightly"]'
+      sys_names: ${{inputs.sys_names}}
+      sys_versions: ${{inputs.sys_versions}}
+      rust_targets: ${{inputs.rust_targets}}
+      sys_targets: '["x86_64-v1-linux-gnu"]'
+      machines: ${{inputs.machines}}
+      excludes: ${{inputs.excludes}}
+      includes: ${{inputs.includes}}
+      checkout: ${{inputs.checkout}}

@@ -1,0 +1,194 @@
+name: Acceptance
+
+on:
+  workflow_call:
+    inputs:
+      regime:
+        type: string
+        description: Test package name
+        default: 'acceptance'
+      counterparty:
+        type: string
+        description: Client software name
+      runner:
+        type: string
+        default: 'het'
+        description: Runner mask
+      workers:
+        type: string
+        default: '1'
+        description: Playwright workers per shard
+      retries:
+        type: string
+        default: '2'
+        description: Playwright retries
+      shards:
+        type: string
+        default: '1'
+        description: Number of test shards
+      shard_ids:
+        type: string
+        default: '[1]'
+        description: Enumeration of [1..shards] identifiers.
+      cargo_profiles:
+        type: string
+      feat_sets:
+        type: string
+      rust_toolchains:
+        type: string
+      rust_targets:
+        type: string
+      sys_names:
+        type: string
+      sys_versions:
+        type: string
+      sys_targets:
+        type: string
+      machines:
+        type: string
+      excludes:
+        type: string
+        default: '[]'
+      includes:
+        type: string
+        default: '[]'
+      checkout:
+        type: string
+        default: ${{github.sha}}
+
+jobs:
+  acceptance:
+    name: >
+      ${{inputs.counterparty}}-${{inputs.regime}}
+      ${{matrix.cargo_profile}}
+      ${{matrix.rust_toolchain}}
+      ${{matrix.feat_set}}
+      ${{matrix.sys_name}}
+      ${{matrix.sys_version}}
+      ${{matrix.sys_target}}
+
+    runs-on: ["${{matrix.machine}}", "${{inputs.runner}}"]
+    concurrency:
+      group: playwright-cant-walk-and-chew-bubblegum-${{matrix.shard}}
+      cancel-in-progress: false
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Shard ids enumerate [1..N] and arrive from the caller; the `shards`
+        # count is the /N split denominator and the summary expectation.
+        shard: ${{fromJSON(inputs.shard_ids)}}
+        cargo_profile: ${{fromJSON(inputs.cargo_profiles)}}
+        feat_set: ${{fromJSON(inputs.feat_sets)}}
+        rust_toolchain: ${{fromJSON(inputs.rust_toolchains)}}
+        sys_name: ${{fromJSON(inputs.sys_names)}}
+        sys_version: ${{fromJSON(inputs.sys_versions)}}
+        rust_target: ${{fromJSON(inputs.rust_targets)}}
+        sys_target: ${{fromJSON(inputs.sys_targets)}}
+        machine: ${{fromJSON(inputs.machines)}}
+        exclude: ${{fromJSON(inputs.excludes)}}
+        include: ${{fromJSON(inputs.includes)}}
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{inputs.checkout || github.sha}}
+
+    - name: Execute
+      id: execute
+      env:
+        playwright_workers: ${{fromJSON(inputs.workers)}}
+        playwright_retries: ${{fromJSON(inputs.retries)}}
+        playwright_shard: ${{matrix.shard}}/${{inputs.shards}}
+        cargo_profile: ${{matrix.cargo_profile}}
+        rust_toolchain: ${{matrix.rust_toolchain}}
+        rust_target: ${{matrix.rust_target}}
+        feat_set: ${{matrix.feat_set}}
+        sys_name: ${{matrix.sys_name}}
+        sys_target: ${{matrix.sys_target}}
+        sys_version: ${{matrix.sys_version}}
+        machine: ${{matrix.machine}}
+
+      run: |
+        docker/playwright.sh
+
+    - if: success() || (failure() && steps.execute.outcome == 'failure')
+      name: Upload Results
+      id: upload-result
+      uses: actions/upload-artifact@v7
+      with:
+        name: playwright_results-${{matrix.feat_set}}-${{matrix.sys_name}}-${{matrix.sys_target}}-shard-${{matrix.shard}}.json
+        path: ./tests/playwright/results.json
+        if-no-files-found: ignore
+        overwrite: true
+
+    - if: success() || (failure() && steps.execute.outcome == 'failure')
+      name: Upload Log Output
+      id: upload-output
+      uses: actions/upload-artifact@v7
+      with:
+        name: playwright_output-${{matrix.feat_set}}-${{matrix.sys_name}}-${{matrix.sys_target}}-shard-${{matrix.shard}}.log
+        path: ./tests/playwright/output.log
+        if-no-files-found: ignore
+        overwrite: true
+
+    - if: success() || (failure() && steps.execute.outcome == 'failure')
+      name: Upload Failure Artifacts
+      id: upload-artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: playwright_artifacts-${{matrix.feat_set}}-${{matrix.sys_name}}-${{matrix.sys_target}}-shard-${{matrix.shard}}
+        path: ./tests/playwright/test-results
+        if-no-files-found: ignore
+        overwrite: true
+
+    - if: >
+        (success() || (failure() && steps.execute.outcome == 'failure'))
+        && inputs.shards > 1
+      name: Gate
+      run: |
+        .github/workflows/summarise/playwright.sh gate
+
+    - if: >
+        (success() || (failure() && steps.execute.outcome == 'failure'))
+        && inputs.shards <= 1
+      name: Summarise
+      run: |
+        .github/workflows/summarise/playwright.sh
+
+  fini:
+    if: >
+      !cancelled()
+      && inputs.shards > 1
+      && needs.acceptance.result != 'skipped'
+
+    name: Acceptance Results
+    needs: [acceptance]
+
+    runs-on: ["${{fromJSON(inputs.machines)[0]}}", "${{inputs.runner}}"]
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{inputs.checkout || github.sha}}
+
+    - name: Collect Shard Results
+      uses: actions/download-artifact@v7
+      with:
+        pattern: playwright_results-*
+        path: ./shard-results
+        merge-multiple: false
+
+    - name: Merge and Summarise
+      shell: bash
+      env:
+        shards: ${{inputs.shards}}
+      run: |
+        mkdir -p tests/playwright
+        mapfile -t files < <(find ./shard-results -name results.json | sort)
+        echo "Merging ${#files[@]} shard result files (expected ${shards})."
+        if test "${#files[@]}" -ne "${shards}"; then
+          echo "expected ${shards} shard results, found ${#files[@]}" >&2
+          exit 1
+        fi
+        jq -s '.' "${files[@]}" > tests/playwright/results.json
+        .github/workflows/summarise/playwright.sh

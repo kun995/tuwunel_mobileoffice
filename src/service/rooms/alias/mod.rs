@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod tests;
+
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
@@ -43,68 +46,90 @@ impl crate::Service for Service {
 }
 
 impl Service {
-	#[tracing::instrument(skip(self))]
-	pub fn set_alias(&self, alias: &RoomAliasId, room_id: &RoomId, user_id: &UserId) -> Result {
+	pub fn set_alias(&self, alias: &RoomAliasId, room_id: &RoomId) -> Result {
 		self.check_alias_local(alias)?;
 
-		if alias == self.services.admin.admin_alias
-			&& user_id != self.services.globals.server_user
+		self.set_alias_by(alias, room_id, &self.services.globals.server_user)
+	}
+
+	#[tracing::instrument(skip(self))]
+	pub fn set_alias_by(&self, alias: &RoomAliasId, room_id: &RoomId, user_id: &UserId) -> Result {
+		self.check_alias_local(alias)?;
+
+		if alias == self.services.admin.admin_alias && user_id != self.services.globals.server_user
 		{
-			return Err!(Request(Forbidden("Only the server user can set this alias")));
+			return Err!(Request(Forbidden(
+				"Only the server user can set this alias"
+			)));
 		}
 
 		let count = self.services.globals.next_count();
 
+		let localpart = alias.alias();
+
 		// Comes first as we don't want a stuck alias
-		self.db
-			.alias_userid
-			.insert(alias.alias().as_bytes(), user_id.as_bytes());
+		self.db.alias_userid.insert(localpart, user_id);
 
-		self.db
-			.alias_roomid
-			.insert(alias.alias().as_bytes(), room_id.as_bytes());
+		self.db.alias_roomid.insert(localpart, room_id);
 
-		let mut aliasid = room_id.as_bytes().to_vec();
-		aliasid.push(0xFF);
-		aliasid.extend_from_slice(&count.to_be_bytes());
-
-		self.db
-			.aliasid_alias
-			.insert(&aliasid, alias.as_bytes());
+		self.db.aliasid_alias.put_raw((room_id, *count), alias);
 
 		Ok(())
 	}
 
-	#[tracing::instrument(skip(self))]
-	pub async fn remove_alias(&self, alias: &RoomAliasId, user_id: &UserId) -> Result {
+	/// Removes a local alias on a user's behalf and returns its room.
+	///
+	/// The user must be the alias creator, a server admin, or otherwise
+	/// permitted to change the room's canonical alias.
+	pub async fn remove_alias_by(
+		&self,
+		alias: &RoomAliasId,
+		user_id: &UserId,
+	) -> Result<OwnedRoomId> {
 		if !self.user_can_remove_alias(alias, user_id).await? {
-			return Err!(Request(Forbidden("User is not permitted to remove this alias.")));
+			return Err!(Request(Forbidden(
+				"User is not permitted to remove this alias."
+			)));
 		}
 
-		let alias = alias.alias();
-		let Ok(room_id) = self.db.alias_roomid.get(&alias).await else {
+		self.remove_alias(alias).await
+	}
+
+	/// Removes a local alias from the directory and returns its room.
+	///
+	/// The returned id names the room the removed mapping pointed at, which a
+	/// caller cannot recover afterwards because the alias no longer resolves.
+	/// It comes back whether or not the alias was that room's canonical one.
+	#[tracing::instrument(skip(self))]
+	pub async fn remove_alias(&self, alias: &RoomAliasId) -> Result<OwnedRoomId> {
+		let localpart = alias.alias();
+		let Ok(room_id) = self.db.alias_roomid.get(&localpart).await.deserialized() else {
 			return Err!(Request(NotFound("Alias does not exist or is invalid.")));
 		};
 
 		let prefix = (&room_id, Interfix);
+
+		// The row key carries the counter it was written under, so the row to drop is
+		// found by its value; deleting the prefix would take the room's other aliases.
 		self.db
 			.aliasid_alias
-			.keys_prefix_raw(&prefix)
+			.stream_prefix_raw(&prefix)
 			.ignore_err()
+			.ready_filter_map(|(key, stored)| stored.eq(alias.as_bytes()).then_some(key))
 			.ready_for_each(|key| self.db.aliasid_alias.remove(key))
 			.await;
 
-		self.db.alias_roomid.remove(alias.as_bytes());
-		self.db.alias_userid.remove(alias.as_bytes());
+		self.db.alias_roomid.remove(localpart.as_bytes());
+		self.db.alias_userid.remove(localpart.as_bytes());
 
-		Ok(())
+		Ok(room_id)
 	}
 
 	#[inline]
 	pub async fn maybe_resolve(&self, room: &RoomOrAliasId) -> Result<OwnedRoomId> {
 		match <&RoomId>::try_from(room) {
-			| Ok(room_id) => Ok(room_id.to_owned()),
-			| Err(alias) => Ok(self.resolve_alias(alias).await?.0),
+			Ok(room_id) => Ok(room_id.to_owned()),
+			Err(alias) => Ok(self.resolve_alias(alias).await?.0),
 		}
 	}
 
@@ -114,8 +139,8 @@ impl Service {
 		servers: Option<&[OwnedServerName]>,
 	) -> Result<(OwnedRoomId, Vec<OwnedServerName>)> {
 		match <&RoomId>::try_from(room) {
-			| Ok(room_id) => Ok((room_id.to_owned(), Vec::from(servers.unwrap_or_default()))),
-			| Err(alias) => self.resolve_alias(alias).await,
+			Ok(room_id) => Ok((room_id.to_owned(), Vec::from(servers.unwrap_or_default()))),
+			Err(alias) => self.resolve_alias(alias).await,
 		}
 	}
 
@@ -124,11 +149,7 @@ impl Service {
 		&self,
 		room_alias: &RoomAliasId,
 	) -> Result<(OwnedRoomId, Vec<OwnedServerName>)> {
-		if self
-			.services
-			.globals
-			.server_is_ours(room_alias.server_name())
-		{
+		if self.services.globals.alias_is_local(room_alias) {
 			if let Ok(room_id) = self.resolve_local_alias(room_alias).await {
 				return Ok((room_id, Vec::new()));
 			}
@@ -149,13 +170,11 @@ impl Service {
 	) -> Result<(OwnedRoomId, Vec<OwnedServerName>)> {
 		let server = room_alias.server_name();
 
-		let request = Request { room_alias: room_alias.to_owned() };
+		let request = Request {
+			room_alias: room_alias.to_owned(),
+		};
 
-		let response = self
-			.services
-			.federation
-			.execute(server, request)
-			.await?;
+		let response = self.services.federation.execute(server, request).await?;
 
 		Ok((response.room_id, response.servers))
 	}
@@ -163,11 +182,7 @@ impl Service {
 	#[tracing::instrument(skip(self), level = "trace")]
 	pub async fn resolve_local_alias(&self, alias: &RoomAliasId) -> Result<OwnedRoomId> {
 		self.check_alias_local(alias)?;
-		self.db
-			.alias_roomid
-			.get(alias.alias())
-			.await
-			.deserialized()
+		self.db.alias_roomid.get(alias.alias()).await.deserialized()
 	}
 
 	#[tracing::instrument(skip(self), level = "debug")]
@@ -200,16 +215,12 @@ impl Service {
 			.await
 			.map_err(|_| err!(Request(NotFound("Alias not found."))))?;
 
-		let server_user = &self.services.globals.server_user;
-
 		// The creator of an alias can remove it
 		if self
             .who_created_alias(alias).await
             .is_ok_and(|user| user == user_id)
             // Server admins can remove any local alias
             || self.services.admin.user_is_admin(user_id).await
-            // Always allow the server service account to remove the alias, since there may not be an admin room
-            || server_user == user_id
 		{
 			return Ok(true);
 		}
@@ -243,11 +254,7 @@ impl Service {
 	async fn who_created_alias(&self, alias: &RoomAliasId) -> Result<OwnedUserId> {
 		self.check_alias_local(alias)?;
 
-		self.db
-			.alias_userid
-			.get(alias.alias())
-			.await
-			.deserialized()
+		self.db.alias_userid.get(alias.alias()).await.deserialized()
 	}
 
 	async fn resolve_appservice_alias(&self, room_alias: &RoomAliasId) -> Result<OwnedRoomId> {
@@ -262,7 +269,9 @@ impl Service {
 						.appservice
 						.send_request(
 							appservice.registration.clone(),
-							query_room_alias::v1::Request { room_alias: room_alias.to_owned() },
+							query_room_alias::v1::Request {
+								room_alias: room_alias.to_owned()
+							},
 						)
 						.await,
 					Ok(Some(_opt_result))

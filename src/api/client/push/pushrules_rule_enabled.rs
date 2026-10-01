@@ -1,0 +1,60 @@
+use axum::extract::State;
+use ruma::api::client::push::{get_pushrule_enabled, set_pushrule_enabled};
+use tuwunel_core::{Err, Result, err};
+
+use crate::Ruma;
+
+/// # `GET /_matrix/client/r0/pushrules/global/{kind}/{ruleId}/enabled`
+///
+/// Gets the enabled status of a single specified push rule for this user.
+pub(crate) async fn get_pushrule_enabled_route(
+	State(services): State<crate::State>,
+	body: Ruma<get_pushrule_enabled::v3::Request>,
+) -> Result<get_pushrule_enabled::v3::Response> {
+	let sender_user = body.sender_user();
+
+	if super::is_deprecated_mention_rule(body.rule_id.as_str()) {
+		return Ok(get_pushrule_enabled::v3::Response { enabled: false });
+	}
+
+	let event = super::load_push_rules(&services, sender_user).await?;
+
+	let enabled = event
+		.content
+		.global
+		.get(body.kind.clone(), &body.rule_id)
+		.map(ruma::push::AnyPushRuleRef::enabled)
+		.ok_or_else(|| err!(Request(NotFound("Push rule not found."))))?;
+
+	Ok(get_pushrule_enabled::v3::Response { enabled })
+}
+
+/// # `PUT /_matrix/client/r0/pushrules/global/{kind}/{ruleId}/enabled`
+///
+/// Sets the enabled status of a single specified push rule for this user.
+pub(crate) async fn set_pushrule_enabled_route(
+	State(services): State<crate::State>,
+	body: Ruma<set_pushrule_enabled::v3::Request>,
+) -> Result<set_pushrule_enabled::v3::Response> {
+	let sender_user = body.sender_user();
+	let mut account_data = super::load_push_rules(&services, sender_user)
+		.await
+		.unwrap_or_else(|_| ruma::events::push_rules::PushRulesEvent {
+			content: ruma::events::push_rules::PushRulesEventContent {
+				global: ruma::push::Ruleset::server_default(sender_user),
+			},
+		});
+
+	if account_data
+		.content
+		.global
+		.set_enabled(body.kind.clone(), &body.rule_id, body.enabled)
+		.is_err()
+	{
+		return Err!(Request(NotFound("Push rule not found.")));
+	}
+
+	super::save_push_rules(&services, sender_user, &account_data).await?;
+
+	Ok(set_pushrule_enabled::v3::Response {})
+}

@@ -1,25 +1,29 @@
 mod append;
 mod namespace_regex;
+mod ping;
 mod registration_info;
 pub(crate) mod request;
+mod thirdparty;
 
 use std::{
-	collections::{BTreeMap, HashSet},
-	iter::IntoIterator,
+	collections::BTreeMap,
+	ffi::OsStr,
+	fs::{self, read_dir},
 	sync::Arc,
 };
 
 use async_trait::async_trait;
-use futures::{Future, FutureExt, Stream, StreamExt, TryStreamExt};
+use futures::{FutureExt, Stream, TryStreamExt};
 use ruma::{RoomAliasId, RoomId, UserId, api::appservice::Registration};
-use tokio::sync::{RwLock, RwLockReadGuard};
-use tuwunel_core::{Err, Result, debug, err, utils::stream::IterStream};
+use tokio::sync::{RwLock, RwLockReadGuard, SetOnce};
+use tuwunel_core::{Err, Result, defer, err, utils::stream::IterStream};
 use tuwunel_database::Map;
 
 pub use self::{namespace_regex::NamespaceRegex, registration_info::RegistrationInfo};
 
 pub struct Service {
 	registration_info: RwLock<Registrations>,
+	loaded: SetOnce<()>,
 	services: Arc<crate::services::OnceServices>,
 	db: Data,
 }
@@ -35,6 +39,7 @@ impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			registration_info: RwLock::new(BTreeMap::new()),
+			loaded: SetOnce::new(),
 			services: args.services.clone(),
 			db: Data {
 				id_appserviceregistrations: args.db["id_appserviceregistrations"].clone(),
@@ -43,109 +48,144 @@ impl crate::Service for Service {
 	}
 
 	async fn worker(self: Arc<Self>) -> Result {
-		self.init_registrations().await?;
-		self.check_registrations().await?;
+		defer! {{
+			self.loaded.set(()).ok();
+		}}
 
-		Ok(())
+		self.load().await
 	}
 
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
 }
 
 impl Service {
-	#[tracing::instrument(name = "init", skip(self))]
-	async fn init_registrations(&self) -> Result {
-		// Registrations from configuration file
-		let confs = self
-			.services
-			.server
-			.config
-			.appservice
-			.clone()
-			.into_iter()
-			.stream()
-			.map(|(id, mut reg)| {
-				reg.id.clone_from(&id);
-				reg.sender_localpart
-					.get_or_insert_with(|| id.clone());
+	/// Loads every registration source into the runtime registry.
+	///
+	/// The configured `appservice` table is read first, then any YAML under
+	/// `appservice_dir`, then the registrations persisted by the admin command.
+	async fn load(&self) -> Result {
+		for (id, mut appservice) in self.services.config.appservice.clone() {
+			if appservice.id.is_empty() {
+				appservice.id = id.clone();
+			}
 
-				Ok((id, reg))
-			});
+			if *id != appservice.id {
+				return Err!(Config(
+					"id",
+					"Registration ID {:?} does not match the configured {id:?}",
+					appservice.id
+				));
+			}
 
-		// Registrations from database
-		self.iter_db_ids()
-			.chain(confs.map_ok(|(id, reg)| (id, reg.into())))
-			.try_for_each(async |(id, reg): (_, Registration)| {
-				debug!(?id, ?reg, "appservice registration");
-				self.registration_info
-					.write()
-					.await
-					.insert(id.clone(), reg.try_into()?)
-					.map_or(Ok(()), |_| Err!("Conflicting Appservice ID: {id:?}"))
-			})
-			.await
-	}
-
-	#[tracing::instrument(name = "check", skip(self))]
-	async fn check_registrations(&self) -> Result {
-		let regs = self.registration_info.read().await;
-
-		let num_as_tokens = regs
-			.values()
-			.map(|info| &info.registration.as_token)
-			.collect::<HashSet<_>>()
-			.len();
-
-		if num_as_tokens < regs.len() {
-			return Err!(
-				"Conflicting Appservice registrations: each must have a unique as_token."
-			);
+			self.load_appservice(appservice.into()).await?;
 		}
+
+		if let Some(appservice_dir) = &self.services.config.appservice_dir {
+			let entries = read_dir(appservice_dir).map_err(|e| {
+				err!(Config("appservice_dir", "Failed to read {appservice_dir:?}: {e}"))
+			})?;
+
+			for dir_entry in entries {
+				let path = dir_entry?.path();
+
+				if !path.is_file()
+					|| !path
+						.extension()
+						.and_then(OsStr::to_str)
+						.is_some_and(|ext| matches!(ext, "yaml" | "yml"))
+				{
+					continue;
+				}
+
+				let bytes = fs::read(path)?;
+				let registration: Registration = serde_yaml::from_slice(&bytes)?;
+
+				self.load_appservice(registration).await?;
+			}
+		}
+
+		self.iter_db_ids()
+			.try_for_each(|registration| self.load_appservice(registration))
+			.await?;
 
 		Ok(())
 	}
 
-	/// Registers an appservice and returns the ID to the caller
-	pub async fn register_appservice(
-		&self,
-		registration: &Registration,
-		appservice_config_body: &str,
-	) -> Result {
-		let appservice_user = UserId::parse_with_server_name(
-			&registration.sender_localpart,
-			&self.services.config.server_name,
-		)?;
+	pub async fn load_appservice(&self, registration: Registration) -> Result {
+		//TODO: Check for collisions between exclusive appservice namespaces
 
-		if !self.services.users.exists(&appservice_user).await {
+		let registration_info =
+			RegistrationInfo::new(registration, self.services.globals.server_name())?;
+
+		let id = &registration_info.registration.id;
+
+		let mut registrations = self.registration_info.write().await;
+
+		for loaded_registration_info in registrations.values() {
+			let loaded_id = &loaded_registration_info.registration.id;
+
+			if loaded_id == id {
+				return Err!("Duplicate id: {id}");
+			}
+
+			if loaded_registration_info.registration.as_token
+				== registration_info.registration.as_token
+			{
+				return Err!("Duplicate as_token: {loaded_id} {id}");
+			}
+		}
+
+		let appservice_user = &registration_info.sender;
+
+		if !self.services.users.exists(appservice_user).await {
 			self.services
 				.users
-				.create(&appservice_user, None, None)
+				.create(appservice_user, None, None)
 				.await?;
 		}
 
-		//TODO: Check for collisions between exclusive appservice namespaces
-		self.registration_info
-			.write()
-			.await
-			.insert(registration.id.clone(), registration.clone().try_into()?);
-
-		self.db
-			.id_appserviceregistrations
-			.insert(&registration.id, appservice_config_body);
+		registrations.insert(id.clone(), registration_info);
 
 		Ok(())
 	}
 
-	/// Remove an appservice registration
-	///
-	/// # Arguments
-	///
-	/// * `service_name` - the registration ID of the appservice
+	pub async fn register_appservice(&self, registration: Registration) -> Result {
+		self.loaded().await;
+
+		let id = registration.id.clone();
+
+		let appservice_yaml = serde_yaml::to_string(&registration)?;
+
+		self.load_appservice(registration).await?;
+
+		self.db
+			.id_appserviceregistrations
+			.insert(&id, appservice_yaml);
+
+		Ok(())
+	}
+
 	pub async fn unregister_appservice(&self, appservice_id: &str) -> Result {
-		// removes the appservice registration info
-		self.registration_info
-			.write()
+		self.loaded().await;
+
+		let mut registrations = self.registration_info.write().await;
+
+		if !registrations.contains_key(appservice_id) {
+			return Err!("Appservice not found");
+		}
+
+		if self
+			.db
+			.id_appserviceregistrations
+			.exists(appservice_id)
 			.await
+			.is_err()
+		{
+			return Err!("Cannot unregister config appservice");
+		}
+
+		// removes the appservice registration info
+		registrations
 			.remove(appservice_id)
 			.ok_or_else(|| err!("Appservice not found"))?;
 
@@ -171,6 +211,16 @@ impl Service {
 			.map(|info| info.registration)
 	}
 
+	/// Retrieve a registration with its compiled namespaces (`sender`,
+	/// `is_user_match`), which a bare `Registration` lacks.
+	pub async fn get_registration_info(&self, id: &str) -> Option<RegistrationInfo> {
+		self.registration_info
+			.read()
+			.await
+			.get(id)
+			.cloned()
+	}
+
 	pub async fn find_from_access_token(&self, token: &str) -> Result<RegistrationInfo> {
 		self.read()
 			.await
@@ -186,6 +236,14 @@ impl Service {
 			.await
 			.values()
 			.any(|info| info.is_exclusive_user_match(user_id))
+	}
+
+	/// Checks if a given user id matches any appservice's user namespace.
+	pub async fn is_interested_in_user(&self, user_id: &UserId) -> bool {
+		self.read()
+			.await
+			.values()
+			.any(|info| info.is_user_match(user_id))
 	}
 
 	/// Checks if a given room alias matches any exclusive appservice regex
@@ -214,13 +272,11 @@ impl Service {
 			.flatten_stream()
 	}
 
-	pub fn iter_db_ids(&self) -> impl Stream<Item = Result<(String, Registration)>> + Send {
+	pub fn iter_db_ids(&self) -> impl Stream<Item = Result<Registration>> + Send {
 		self.db
 			.id_appserviceregistrations
 			.keys()
-			.and_then(async move |id: &str| {
-				Ok((id.to_owned(), self.get_db_registration(id).await?))
-			})
+			.and_then(async move |id: &str| Ok(self.get_db_registration(id).await?))
 	}
 
 	pub async fn get_db_registration(&self, id: &str) -> Result<Registration> {
@@ -235,4 +291,12 @@ impl Service {
 	pub fn read(&self) -> impl Future<Output = RwLockReadGuard<'_, Registrations>> + Send {
 		self.registration_info.read()
 	}
+
+	/// Waits for the boot-time registration load to finish.
+	///
+	/// The latch is released on every exit from the worker, a failed or
+	/// panicking load included, so a waiter is never stranded on a load that
+	/// will not complete.
+	#[inline]
+	pub async fn loaded(&self) { self.loaded.wait().await; }
 }

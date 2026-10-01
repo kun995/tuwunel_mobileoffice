@@ -1,18 +1,16 @@
 #![cfg(feature = "sentry_telemetry")]
 
-use std::{
-	str::FromStr,
-	sync::{Arc, OnceLock},
-};
+use std::sync::{Arc, OnceLock};
 
+use reqwest::{Client, ClientBuilder, Proxy};
 use sentry::{
-	Breadcrumb, ClientOptions, Level,
-	types::{
-		Dsn,
-		protocol::v7::{Context, Event},
-	},
+	Breadcrumb, ClientOptions, Level, Transport, TransportOptions, release_name,
+	transports::ReqwestHttpTransportOptions,
+	types::protocol::v7::{Context, Event},
 };
-use tuwunel_core::{config::Config, debug, trace};
+use tuwunel_core::{
+	config::Config, debug, error, error::error_chain, trace, version::user_agent,
+};
 
 static SEND_PANIC: OnceLock<bool> = OnceLock::new();
 static SEND_ERROR: OnceLock<bool> = OnceLock::new();
@@ -37,22 +35,59 @@ fn options(config: &Config) -> ClientOptions {
 		.expect("init_sentry should only be called if sentry is enabled and this is not None")
 		.as_str();
 
-	let server_name = config
-		.sentry_send_server_name
-		.then(|| config.server_name.to_string().into());
+	let options = ClientOptions::new()
+		.dsn(dsn)
+		.traces_sample_rate(config.sentry_traces_sample_rate)
+		.debug(cfg!(debug_assertions))
+		.maybe_release(release_name!())
+		.user_agent(user_agent())
+		.attach_stacktrace(config.sentry_attach_stacktrace)
+		.before_send(before_send)
+		.before_breadcrumb(before_breadcrumb)
+		.transport(build_transport);
 
-	ClientOptions {
-		dsn: Some(Dsn::from_str(dsn).expect("sentry_endpoint must be a valid URL")),
-		server_name,
-		traces_sample_rate: config.sentry_traces_sample_rate,
-		debug: cfg!(debug_assertions),
-		release: sentry::release_name!(),
-		user_agent: tuwunel_core::version::user_agent().into(),
-		attach_stacktrace: config.sentry_attach_stacktrace,
-		before_send: Some(Arc::new(before_send)),
-		before_breadcrumb: Some(Arc::new(before_breadcrumb)),
-		..Default::default()
-	}
+	config
+		.sentry_send_server_name
+		.then(|| config.server_name.to_string())
+		.into_iter()
+		.fold(options, ClientOptions::server_name)
+}
+
+fn build_transport(options: &ClientOptions) -> Arc<dyn Transport> {
+	let proxies = [
+		options
+			.http_proxy
+			.as_ref()
+			.and_then(|url| Proxy::http(url.as_ref()).ok()),
+		options
+			.https_proxy
+			.as_ref()
+			.and_then(|url| Proxy::https(url.as_ref()).ok()),
+	];
+
+	let builder = Client::builder().danger_accept_invalid_certs(options.accept_invalid_certs);
+
+	let client = proxies
+		.into_iter()
+		.flatten()
+		.fold(builder, ClientBuilder::proxy)
+		.build()
+		.inspect_err(|e| {
+			error!(
+				chain = %error_chain(e),
+				"Failed to build the sentry transport client",
+			);
+		})
+		.expect("reqwest client must build for sentry transport");
+
+	let transport_options = TransportOptions::try_from_client_options(options)
+		.expect("sentry client options must have a DSN");
+
+	let transport = ReqwestHttpTransportOptions::from(transport_options)
+		.with_client(client)
+		.build();
+
+	Arc::new(transport)
 }
 
 fn before_send(event: Event<'static>) -> Option<Event<'static>> {

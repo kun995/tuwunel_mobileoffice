@@ -1,25 +1,40 @@
+//! Resolves and caches transitive authorization-event ancestry.
+//!
+//! Traversals operate on short event IDs, enforce room membership on cache
+//! misses, and store complete chains for repeated starting sets. Public stream
+//! adapters translate the results back to event IDs with tolerant or explicit
+//! completeness reporting.
+
 use std::{
 	collections::{BTreeSet, HashSet},
-	fmt::Debug,
 	iter::once,
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 	time::Instant,
 };
 
 use async_trait::async_trait;
 use futures::{
-	FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, pin_mut,
+	FutureExt, Stream, StreamExt, TryFutureExt, pin_mut,
 	stream::{FuturesUnordered, unfold},
 };
-use ruma::{EventId, OwnedEventId, RoomId, RoomVersionId, room_version_rules::RoomVersionRules};
+use ruma::{
+	EventId, OwnedEventId, OwnedRoomId, RoomId, RoomVersionId,
+	room_version_rules::RoomVersionRules,
+};
+use serde::Deserialize;
 use tuwunel_core::{
 	Err, Result, at, debug, debug_error, err, implement,
-	matrix::{Event, PduEvent, room_version},
+	itertools::Itertools,
+	matrix::room_version,
 	pdu::AuthEvents,
-	trace, utils,
+	smallvec::SmallVec,
+	trace,
 	utils::{
-		IterStream,
-		stream::{BroadbandExt, ReadyExt, TryBroadbandExt},
+		BoolExt, IterStream,
+		stream::{BroadbandExt, ReadyExt, TryExpect, automatic_width},
 	},
 	validated, warn,
 };
@@ -27,6 +42,14 @@ use tuwunel_database::Map;
 
 use crate::rooms::short::ShortEventId;
 
+/// Computes transitive authorization chains and maintains their persistent cache.
+///
+/// Starting events are distributed across a fixed number of buckets before
+/// traversal. Only complete cache-miss walks are written. Existing cache hits
+/// are trusted without rechecking completeness, so historical or
+/// downgrade-written rows can still supply partial chains until they expire or
+/// are cleared. Combined bucket results are sorted and deduplicated by short
+/// event ID rather than graph order.
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
 	db: Data,
@@ -34,10 +57,10 @@ pub struct Service {
 
 struct Data {
 	authchainkey_authchain: Arc<Map>,
-	shorteventid_authchain: Arc<Map>,
 }
 
-type Bucket<'a> = BTreeSet<(u64, &'a EventId)>;
+type Bucket<'a> = BTreeSet<(ShortEventId, &'a EventId)>;
+type CacheKey = SmallVec<[ShortEventId; 1]>;
 
 #[async_trait]
 impl crate::Service for Service {
@@ -46,20 +69,20 @@ impl crate::Service for Service {
 			services: args.services.clone(),
 			db: Data {
 				authchainkey_authchain: args.db["authchainkey_authchain"].clone(),
-				shorteventid_authchain: args.db["shorteventid_authchain"].clone(),
 			},
 		}))
 	}
 
-	async fn clear_cache(&self) {
-		self.db.authchainkey_authchain.clear().await;
-	}
+	async fn clear_cache(&self) { self.db.authchainkey_authchain.clear().await; }
 
-	fn name(&self) -> &str {
-		crate::service::make_name(std::module_path!())
-	}
+	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
 }
 
+/// Streams the transitive auth ancestors of a set of starting events.
+///
+/// The starting events themselves are not included unless encountered as
+/// ancestors. Traversal and reverse-mapping failures are filtered from this
+/// tolerant interface, so the stream can yield a partial chain without error.
 #[implement(Service)]
 pub fn event_ids_iter<'a, I>(
 	&'a self,
@@ -68,7 +91,7 @@ pub fn event_ids_iter<'a, I>(
 	starting_events: I,
 ) -> impl Stream<Item = Result<OwnedEventId>> + Send + 'a
 where
-	I: Iterator<Item = &'a EventId> + Clone + Debug + ExactSizeIterator + Send + 'a,
+	I: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send + 'a,
 {
 	self.get_auth_chain(room_id, room_version, starting_events)
 		.map_ok(|chain| {
@@ -80,13 +103,55 @@ where
 		.try_flatten_stream()
 }
 
+/// Streams an auth chain and reports whether its observed inputs were complete.
+///
+/// The caller initializes `complete` to `true` and checks it after consuming
+/// the stream. Cached chains leave it unchanged. Any polled reverse-mapping or
+/// ancestor-walk failure sets it to `false`, so the stream must be fully
+/// consumed before the flag is inspected.
+#[implement(Service)]
+pub fn event_ids_iter_strict<'a, I>(
+	&'a self,
+	room_id: &'a RoomId,
+	room_version: &'a RoomVersionId,
+	starting_events: I,
+	complete: &'a AtomicBool,
+) -> impl Stream<Item = Result<OwnedEventId>> + Send + 'a
+where
+	I: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send + 'a,
+{
+	self.get_auth_chain_strict(room_id, room_version, starting_events, complete)
+		.map_ok(move |chain| {
+			self.services
+				.short
+				.multi_get_eventid_from_short(chain.into_iter().stream())
+				.inspect(move |result| {
+					if result.is_err() {
+						complete.store(false, Ordering::Relaxed);
+					}
+				})
+				.ready_filter(Result::is_ok)
+		})
+		.try_flatten_stream()
+}
+
 #[implement(Service)]
 #[tracing::instrument(
 	name = "auth_chain",
 	level = "debug",
 	skip_all,
-	fields(%room_id),
+	fields(
+		%room_id,
+		starting_events = %starting_events.clone().count(),
+	)
 )]
+/// Returns sorted short IDs for the transitive auth ancestors of starting events.
+///
+/// Starting events are excluded unless reached again as ancestors, and missing
+/// ancestry can produce a partial successful result. Complete per-bucket
+/// results are cached under roomless keys derived from each bucket's exact set
+/// of starting short IDs; uncached traversal still rejects events from another
+/// room.
 pub async fn get_auth_chain<'a, I>(
 	&'a self,
 	room_id: &RoomId,
@@ -94,18 +159,61 @@ pub async fn get_auth_chain<'a, I>(
 	starting_events: I,
 ) -> Result<Vec<ShortEventId>>
 where
-	I: Iterator<Item = &'a EventId> + Clone + Debug + ExactSizeIterator + Send + 'a,
+	I: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send + 'a,
+{
+	let complete = AtomicBool::new(true);
+
+	self.get_auth_chain_inner(room_id, room_version, starting_events, &complete)
+		.await
+}
+
+#[implement(Service)]
+#[tracing::instrument(
+	name = "auth_chain",
+	level = "debug",
+	skip_all,
+	fields(
+		%room_id,
+		starting_events = %starting_events.clone().count(),
+	)
+)]
+async fn get_auth_chain_strict<'a, I>(
+	&'a self,
+	room_id: &RoomId,
+	room_version: &RoomVersionId,
+	starting_events: I,
+	complete: &AtomicBool,
+) -> Result<Vec<ShortEventId>>
+where
+	I: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send + 'a,
+{
+	self.get_auth_chain_inner(room_id, room_version, starting_events, complete)
+		.inspect_err(|_| complete.store(false, Ordering::Relaxed))
+		.await
+}
+
+#[implement(Service)]
+async fn get_auth_chain_inner<'a, I>(
+	&'a self,
+	room_id: &RoomId,
+	room_version: &RoomVersionId,
+	starting_events: I,
+	complete: &AtomicBool,
+) -> Result<Vec<ShortEventId>>
+where
+	I: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send + 'a,
 {
 	const NUM_BUCKETS: usize = 50; //TODO: change possible w/o disrupting db?
 	const BUCKET: Bucket<'_> = BTreeSet::new();
 
 	let started = Instant::now();
 	let room_rules = room_version::rules(room_version)?;
+	let starting_events_count = starting_events.clone().count();
 	let starting_ids = self
 		.services
 		.short
 		.multi_get_or_create_shorteventid(starting_events.clone())
-		.zip(starting_events.clone().stream());
+		.zip(starting_events.stream());
 
 	pin_mut!(starting_ids);
 	let mut buckets = [BUCKET; NUM_BUCKETS];
@@ -116,24 +224,31 @@ where
 	}
 
 	debug!(
-		starting_events = ?starting_events.count(),
+		starting_events = starting_events_count,
 		elapsed = ?started.elapsed(),
 		"start",
 	);
 
 	let full_auth_chain: Vec<ShortEventId> = buckets
-		.into_iter()
-		.try_stream()
-		.broad_and_then(|chunk| self.get_auth_chain_outer(room_id, started, chunk, &room_rules))
-		.try_collect()
-		.map_ok(|auth_chain: Vec<_>| auth_chain.into_iter().flatten().collect())
-		.map_ok(|mut full_auth_chain: Vec<_>| {
-			full_auth_chain.sort_unstable();
-			full_auth_chain.dedup();
-			full_auth_chain
+		.iter()
+		.stream()
+		.flat_map_unordered(automatic_width(), |starting_events| {
+			self.get_chunk_auth_chain(
+				room_id,
+				&started,
+				starting_events.iter().copied(),
+				&room_rules,
+				complete,
+			)
+			.boxed() // Unpin for flat_map_unordered
 		})
-		.boxed()
-		.await?;
+		.collect::<Vec<_>>()
+		.map(IntoIterator::into_iter)
+		.map(Itertools::sorted_unstable)
+		.map(Itertools::dedup)
+		.map(Iterator::collect)
+		.boxed() // erase region
+		.await;
 
 	debug!(
 		chain_length = ?full_auth_chain.len(),
@@ -145,199 +260,318 @@ where
 }
 
 #[implement(Service)]
-async fn get_auth_chain_outer<'a>(
+#[tracing::instrument(
+	name = "outer",
+	level = "trace",
+	skip_all,
+	fields(
+		starting_events = %starting_events.clone().count(),
+	)
+)]
+fn get_chunk_auth_chain<'a, I>(
 	&'a self,
 	room_id: &'a RoomId,
-	started: Instant,
-	chunk: Bucket<'_>,
-	room_rules: &RoomVersionRules,
-) -> Result<Vec<ShortEventId>> {
-	let chunk_key: Vec<ShortEventId> = chunk.iter().map(at!(0)).collect();
-
-	if let Ok(cached) = self.get_cached_auth_chain(&chunk_key).await {
-		return Ok(cached);
-	}
-
-	let chunk_cache = chunk
-		.into_iter()
-		.stream()
-		.broad_then(async |(shortid, event_id)| {
-			if let Ok(cached) = self.get_cached_auth_chain(&[shortid]).await {
-				return cached;
-			}
-
-			let auth_chain: Vec<_> = self
-				.get_auth_chain_inner(room_id, event_id, room_rules)
-				.collect()
+	started: &'a Instant,
+	starting_events: I,
+	room_rules: &'a RoomVersionRules,
+	complete: &'a AtomicBool,
+) -> impl Stream<Item = ShortEventId> + Send + 'a
+where
+	I: Iterator<Item = (ShortEventId, &'a EventId)> + Clone + Send + Sync + 'a,
+{
+	self.get_cached_auth_chain(starting_events.clone().map(at!(0)))
+		.map_ok(IntoIterator::into_iter)
+		.map_ok(IterStream::try_stream)
+		.or_else(async move |_| {
+			let chain = self
+				.build_chunk_auth_chain(room_id, started, starting_events, room_rules, complete)
 				.await;
 
-			self.put_cached_auth_chain(&[shortid], auth_chain.as_slice());
-			debug!(
-				?event_id,
-				elapsed = ?started.elapsed(),
-				"Cache missed event"
-			);
-
-			auth_chain
+			Ok(chain.into_iter().try_stream())
 		})
-		.collect()
-		.map(|chunk_cache: Vec<_>| chunk_cache.into_iter().flatten().collect())
-		.map(|mut chunk_cache: Vec<_>| {
-			chunk_cache.sort_unstable();
-			chunk_cache.dedup();
-			chunk_cache
-		})
-		.await;
-
-	self.put_cached_auth_chain(&chunk_key, chunk_cache.as_slice());
-	debug!(
-		chunk_cache_length = ?chunk_cache.len(),
-		elapsed = ?started.elapsed(),
-		"Cache missed chunk",
-	);
-
-	Ok(chunk_cache)
+		.try_flatten_stream()
+		.map_expect("either cache hit or cache miss yields a chain")
 }
 
 #[implement(Service)]
-#[tracing::instrument(
-	name = "inner",
-	level = "trace",
-	skip_all,
-	fields(%event_id),
-)]
-fn get_auth_chain_inner<'a>(
+async fn build_chunk_auth_chain<'a, I>(
+	&'a self,
+	room_id: &'a RoomId,
+	started: &'a Instant,
+	starting_events: I,
+	room_rules: &'a RoomVersionRules,
+	complete: &'a AtomicBool,
+) -> Vec<ShortEventId>
+where
+	I: Iterator<Item = (ShortEventId, &'a EventId)> + Clone + Send + Sync + 'a,
+{
+	let chunk_complete = AtomicBool::new(true);
+
+	let build_chain = async |(shortid, event_id): (ShortEventId, &'a EventId)| {
+		if let Ok(cached) = self.get_cached_auth_chain(once(shortid)).await {
+			return cached;
+		}
+
+		let event_complete = AtomicBool::new(true);
+		let auth_chain: Vec<_> = self
+			.get_event_auth_chain(room_id, event_id, room_rules, &event_complete)
+			.collect()
+			.await;
+
+		match event_complete.load(Ordering::Relaxed) {
+			| true => self.put_cached_auth_chain(once(shortid), auth_chain.as_slice()),
+			| false => {
+				chunk_complete.store(false, Ordering::Relaxed);
+				complete.store(false, Ordering::Relaxed);
+			},
+		}
+
+		debug!(
+			?event_id,
+			elapsed = ?started.elapsed(),
+			"Cache missed event"
+		);
+
+		auth_chain
+	};
+
+	let chunk_chain: Vec<_> = starting_events
+		.clone()
+		.stream()
+		.broad_then(build_chain)
+		.collect::<Vec<_>>()
+		.map(IntoIterator::into_iter)
+		.map(Iterator::flatten)
+		.map(Itertools::sorted_unstable)
+		.map(Itertools::dedup)
+		.map(Iterator::collect)
+		.await;
+
+	match chunk_complete.load(Ordering::Relaxed) {
+		| false => debug!(
+			elapsed = ?started.elapsed(),
+			"Incomplete chunk not cached",
+		),
+		| true => {
+			self.put_cached_auth_chain(starting_events.map(at!(0)), chunk_chain.as_slice());
+
+			debug!(
+				chunk_chain_length = ?chunk_chain.len(),
+				elapsed = ?started.elapsed(),
+				"Cache missed chunk",
+			);
+		},
+	}
+
+	chunk_chain
+}
+
+#[implement(Service)]
+#[tracing::instrument(name = "inner", level = "trace", skip_all)]
+fn get_event_auth_chain<'a>(
 	&'a self,
 	room_id: &'a RoomId,
 	event_id: &'a EventId,
 	room_rules: &'a RoomVersionRules,
+	complete: &'a AtomicBool,
 ) -> impl Stream<Item = ShortEventId> + Send + 'a {
+	self.get_event_auth_chain_ids(room_id, event_id, room_rules, complete)
+		.broad_then(async move |auth_event| {
+			self.services
+				.short
+				.get_or_create_shorteventid(&auth_event)
+				.await
+		})
+}
+
+#[implement(Service)]
+#[tracing::instrument(
+	name = "inner_ids",
+	level = "trace",
+	skip_all,
+	fields(%event_id)
+)]
+fn get_event_auth_chain_ids<'a>(
+	&'a self,
+	room_id: &'a RoomId,
+	event_id: &'a EventId,
+	room_rules: &'a RoomVersionRules,
+	complete: &'a AtomicBool,
+) -> impl Stream<Item = OwnedEventId> + Send + 'a {
 	struct State<Fut> {
 		todo: FuturesUnordered<Fut>,
 		seen: HashSet<OwnedEventId>,
+		implied: Option<OwnedEventId>,
 	}
 
+	// MSC4291 rooms imply the create event rather than naming it in auth_events.
+	let create_event_id = room_rules
+		.authorization
+		.room_create_event_id_as_room_id
+		.and_then(|| room_id.as_event_id().ok())
+		.filter(|create_event_id| create_event_id.ne(&event_id));
+
+	let starting_events = self.get_event_auth_event_ids(room_id, event_id.to_owned());
+
 	let state = State {
-		todo: once(self.get_pdu(room_id, event_id.to_owned())).collect(),
-		seen: room_rules
-			.authorization
-			.room_create_event_id_as_room_id
-			.then_some(room_id.as_event_id().ok())
-			.into_iter()
-			.flatten()
-			.collect(),
+		todo: once(starting_events).collect(),
+		seen: create_event_id.iter().cloned().collect(),
+		implied: create_event_id,
 	};
 
+	let eval = |auth_events: AuthEvents, mut state: State<_>| {
+		let implied = state.implied.take();
+		let push = |auth_event: &OwnedEventId| {
+			trace!(todo = state.todo.len(), ?auth_event, "push");
+			state
+				.todo
+				.push(self.get_event_auth_event_ids(room_id, auth_event.clone()));
+		};
+
+		let seen = |auth_event: OwnedEventId| {
+			state
+				.seen
+				.insert(auth_event.clone())
+				.then_some(auth_event)
+		};
+
+		let unseen = auth_events
+			.into_iter()
+			.filter_map(seen)
+			.inspect(push);
+
+		let out = implied
+			.into_iter()
+			.chain(unseen)
+			.collect::<AuthEvents>()
+			.into_iter()
+			.stream();
+
+		(out, state)
+	};
+
+	// unfold requires FnMut returning a nameable future; an async closure
+	// capturing eval does not satisfy it.
+	#[expect(closure_returning_async_block)]
 	unfold(state, move |mut state| async move {
 		match state.todo.next().await {
 			| None => None,
-			| Some(Err(_)) => Some((AuthEvents::new().into_iter().stream(), state)),
-			| Some(Ok(pdu)) => {
-				let push = |auth_event: &OwnedEventId| {
-					trace!(?event_id, ?auth_event, "push");
-					state
-						.todo
-						.push(self.get_pdu(room_id, auth_event.clone()));
-				};
+			| Some(Ok(auth_events)) => Some(eval(auth_events, state)),
+			| Some(Err(e)) => {
+				complete.store(false, Ordering::Relaxed);
 
-				let seen = |auth_event: OwnedEventId| {
-					state
-						.seen
-						.insert(auth_event.clone())
-						.then_some(auth_event)
-				};
-
-				let out = pdu
-					.auth_events()
-					.map(ToOwned::to_owned)
-					.filter_map(seen)
-					.inspect(push)
-					.collect::<AuthEvents>()
-					.into_iter()
-					.stream();
-
-				Some((out, state))
+				// A missing ancestor is a normal backfill gap and is skipped;
+				// any other error is corrupt data and ends the walk.
+				e.is_not_found()
+					.then(move || (AuthEvents::new().into_iter().stream(), state))
 			},
 		}
 	})
 	.flatten()
-	.broad_then(async move |auth_event| {
-		self.services
-			.short
-			.get_or_create_shorteventid(&auth_event)
-			.await
-	})
 }
 
 #[implement(Service)]
-async fn get_pdu<'a>(&'a self, room_id: &'a RoomId, event_id: OwnedEventId) -> Result<PduEvent> {
-	let pdu = self
-		.services
-		.timeline
-		.get_pdu(&event_id)
-		.await
-		.inspect_err(|e| {
-			debug_error!(?event_id, ?room_id, "auth chain event: {e}");
-		})?;
+#[tracing::instrument(
+	name = "cache_put",
+	level = "debug",
+	skip_all,
+	fields(
+		key_len = key.clone().count(),
+		chain_len = auth_chain.len(),
+	)
+)]
+fn put_cached_auth_chain<I>(&self, key: I, auth_chain: &[ShortEventId])
+where
+	I: Iterator<Item = ShortEventId> + Clone + Send,
+{
+	let key = key.collect::<CacheKey>();
 
-	if pdu.room_id() != room_id {
-		return Err!(Request(Forbidden(error!(
-			?event_id,
-			?room_id,
-			wrong_room_id = ?pdu.room_id(),
-			"auth event for incorrect room",
-		))));
-	}
-
-	Ok(pdu)
-}
-
-#[implement(Service)]
-#[tracing::instrument(skip_all, level = "debug")]
-fn put_cached_auth_chain(&self, key: &[ShortEventId], auth_chain: &[ShortEventId]) {
 	debug_assert!(!key.is_empty(), "auth_chain key must not be empty");
 
 	self.db
 		.authchainkey_authchain
-		.put(key, auth_chain);
-
-	if key.len() == 1 {
-		self.db
-			.shorteventid_authchain
-			.put(key, auth_chain);
-	}
+		.put(key.as_slice(), auth_chain);
 }
 
 #[implement(Service)]
-#[tracing::instrument(skip_all, level = "trace")]
-async fn get_cached_auth_chain(&self, key: &[u64]) -> Result<Vec<ShortEventId>> {
+#[tracing::instrument(
+	name = "cache_get",
+	level = "trace",
+	err(level = "trace"),
+	skip_all,
+	fields(
+		key_len = %key.clone().count()
+	),
+)]
+async fn get_cached_auth_chain<I>(&self, key: I) -> Result<Vec<ShortEventId>>
+where
+	I: Iterator<Item = ShortEventId> + Clone + Send,
+{
+	let key = key.collect::<CacheKey>();
+
 	if key.is_empty() {
 		return Ok(Vec::new());
 	}
 
-	// Check cache. On miss, check first-order table for single-event keys.
 	let chain = self
 		.db
 		.authchainkey_authchain
-		.qry(key)
+		.qry(key.as_slice())
 		.map_err(|_| err!(Request(NotFound("auth_chain not cached"))))
-		.or_else(async |e| {
-			if key.len() > 1 {
-				return Err(e);
-			}
-
-			self.db
-				.shorteventid_authchain
-				.qry(&key[0])
-				.map_err(|_| err!(Request(NotFound("auth_chain not found"))))
-				.await
-		})
 		.await?;
 
+	if !chain.len().is_multiple_of(size_of::<u64>()) {
+		return Err!(Request(NotFound("malformed auth_chain cache")));
+	}
+
 	let chain = chain
-		.chunks_exact(size_of::<u64>())
-		.map(utils::u64_from_u8)
+		.as_chunks::<{ size_of::<u64>() }>()
+		.0
+		.iter()
+		.copied()
+		.map(u64::from_be_bytes)
 		.collect();
 
 	Ok(chain)
+}
+
+#[implement(Service)]
+#[tracing::instrument(
+	name = "auth_events",
+	level = "trace",
+	ret(level = "trace"),
+	err(level = "trace"),
+	skip_all,
+	fields(%event_id)
+)]
+async fn get_event_auth_event_ids<'a>(
+	&'a self,
+	room_id: &'a RoomId,
+	event_id: OwnedEventId,
+) -> Result<AuthEvents> {
+	#[derive(Deserialize)]
+	struct Pdu {
+		auth_events: AuthEvents,
+		room_id: OwnedRoomId,
+	}
+
+	let pdu: Pdu = self
+		.services
+		.timeline
+		.get(&event_id)
+		.inspect_err(|e| {
+			debug_error!(?event_id, ?room_id, "auth chain event: {e}");
+		})
+		.await?;
+
+	if pdu.room_id != room_id {
+		return Err!(Request(Forbidden(error!(
+			?event_id,
+			?room_id,
+			wrong_room_id = ?pdu.room_id,
+			"auth event for incorrect room",
+		))));
+	}
+
+	Ok(pdu.auth_events)
 }

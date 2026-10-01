@@ -25,8 +25,8 @@ io_uring = [
 	"rust-rocksdb/io-uring",
 ]
 jemalloc = [
-	"tuwunel-core/jemalloc",
 	"rust-rocksdb/jemalloc",
+	"tuwunel-core/jemalloc",
 ]
 jemalloc_conf = [
 	"tuwunel-core/jemalloc_conf",
@@ -41,21 +41,22 @@ lz4_compression = [
 	"rust-rocksdb/lz4",
 ]
 release_max_log_level = [
-	"tuwunel-core/release_max_log_level",
 	"log/max_level_trace",
 	"log/release_max_level_info",
 	"tracing/max_level_trace",
 	"tracing/release_max_level_info",
+	"tuwunel-core/release_max_log_level",
 ]
 zstd_compression = [
-	"tuwunel-core/zstd_compression",
 	"rust-rocksdb/zstd",
+	"tuwunel-core/zstd_compression",
 ]
 
 [dependencies]
 async-channel.workspace = true
 const-str.workspace = true
 ctor.workspace = true
+dtor.workspace = true
 futures.workspace = true
 log.workspace = true
 minicbor.workspace = true
@@ -68,6 +69,7 @@ tracing.workspace = true
 tuwunel-core.workspace = true
 
 [dev-dependencies]
+serde_bytes.workspace = true
 criterion.workspace = true
 
 [lints]

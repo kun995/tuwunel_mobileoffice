@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use jwt::{Algorithm, DecodingKey, Validation, decode};
+use jwt::{Algorithm, DecodingKey, Validation, dangerous::insecure_decode, decode};
 use ruma::{
 	OwnedUserId, UserId,
 	api::client::session::login::v3::{Request, Token},
@@ -27,7 +27,9 @@ pub(super) async fn handle_login(
 	if !services.users.exists(&user_id).await {
 		let config = &services.config.jwt;
 		if !config.register_user {
-			return Err!(Request(NotFound("User {user_id} is not registered on this server.")));
+			return Err!(Request(NotFound(
+				"User {user_id} is not registered on this server."
+			)));
 		}
 
 		services
@@ -46,7 +48,9 @@ pub(crate) async fn validate_user(services: &Services, token: &str) -> Result<Ow
 		return Ok(user_id);
 	}
 
-	Err!(Request(NotFound("JWT identity is not mapped to an existing Matrix account.")))
+	Err!(Request(NotFound(
+		"JWT identity is not mapped to an existing Matrix account."
+	)))
 }
 
 async fn resolve_login_user(services: &Services, token: &str) -> Result<OwnedUserId> {
@@ -63,16 +67,15 @@ async fn resolve_login_user(services: &Services, token: &str) -> Result<OwnedUse
 	}
 	.cloned()
 	.ok_or_else(|| {
-		err!(Request(InvalidUsername("JWT subject is empty after localpart normalization.")))
+		err!(Request(InvalidUsername(
+			"JWT subject is empty after localpart normalization."
+		)))
 	})?;
 
 	Ok(user_id)
 }
 
-fn validate_user_candidates(
-	services: &Services,
-	token: &str,
-) -> Result<(bool, Vec<OwnedUserId>)> {
+fn validate_user_candidates(services: &Services, token: &str) -> Result<(bool, Vec<OwnedUserId>)> {
 	let config = &services.config.jwt;
 	if !config.enable {
 		return Err!(Request(Unauthorized("JWT login is not enabled.")));
@@ -95,10 +98,7 @@ async fn find_existing_candidate(
 	None
 }
 
-fn jwt_user_id_candidates(
-	services: &Services,
-	claim: &Claim,
-) -> Result<(bool, Vec<OwnedUserId>)> {
+fn jwt_user_id_candidates(services: &Services, claim: &Claim) -> Result<(bool, Vec<OwnedUserId>)> {
 	let raw_local = claim
 		.preferred_username
 		.as_deref()
@@ -119,14 +119,16 @@ fn jwt_user_id_candidates(
 
 	for localpart in localparts {
 		match UserId::parse_with_server_name(localpart, server) {
-			| Ok(user_id) => user_ids.push(user_id),
-			| Err(e) => last_error = Some(e),
+			Ok(user_id) => user_ids.push(user_id),
+			Err(e) => last_error = Some(e),
 		}
 	}
 
 	if user_ids.is_empty() {
 		if let Some(e) = last_error {
-			return Err!(Request(InvalidUsername("JWT subject is not a valid user MXID: {e}")));
+			return Err!(Request(InvalidUsername(
+				"JWT subject is not a valid user MXID: {e}"
+			)));
 		}
 	}
 
@@ -134,11 +136,7 @@ fn jwt_user_id_candidates(
 }
 
 fn push_candidate_localpart(localparts: &mut Vec<String>, localpart: String) {
-	if !localpart.is_empty()
-		&& !localparts
-			.iter()
-			.any(|candidate| candidate == &localpart)
-	{
+	if !localpart.is_empty() && !localparts.iter().any(|candidate| candidate == &localpart) {
 		localparts.push(localpart);
 	}
 }
@@ -155,9 +153,16 @@ fn normalize_jwt_localpart(value: &str) -> Option<String> {
 }
 
 fn validate(config: &JwtConfig, token: &str) -> Result<Claim> {
-	let verifier = init_verifier(config)?;
-	let validator = init_validator(config)?;
-	decode::<Claim>(token, &verifier, &validator)
+	let token_data = if cfg!(debug_assertions) && !config.validate_signature {
+		warn!("JWT signature validation is disabled!");
+		insecure_decode::<Claim>(token)
+	} else {
+		let verifier = init_verifier(config)?;
+		let validator = init_validator(config)?;
+		decode::<Claim>(token, &verifier, &validator)
+	};
+
+	token_data
 		.map(|decoded| (decoded.header, decoded.claims))
 		.inspect(|(head, claim)| debug!(?head, ?claim, "JWT token decoded"))
 		.map_err(|e| err!(Request(Forbidden("Invalid JWT token: {e}"))))
@@ -169,27 +174,35 @@ fn init_verifier(config: &JwtConfig) -> Result<DecodingKey> {
 	let format = config.format.to_uppercase();
 
 	Ok(match format.as_str() {
-		| "HMAC" => DecodingKey::from_secret(key.as_bytes()),
+		"HMAC" => DecodingKey::from_secret(key.as_bytes()),
 
-		| "HMACB64" => DecodingKey::from_base64_secret(key.as_str())
+		"HMACB64" => DecodingKey::from_base64_secret(key.as_str())
 			.map_err(|e| err!(Config("jwt.key", "JWT key is not valid base64: {e}")))?,
 
-		| "ECDSA" => DecodingKey::from_ec_pem(key.as_bytes())
+		"ECDSA" => DecodingKey::from_ec_pem(key.as_bytes())
 			.map_err(|e| err!(Config("jwt.key", "JWT key is not valid ECDSA PEM: {e}")))?,
 
-		| "EDDSA" => DecodingKey::from_ed_pem(key.as_bytes())
+		"EDDSA" => DecodingKey::from_ed_pem(key.as_bytes())
 			.map_err(|e| err!(Config("jwt.key", "JWT key is not valid EDDSA PEM: {e}")))?,
-		| "RSA" => DecodingKey::from_rsa_pem(key.as_bytes())
+		"RSA" => DecodingKey::from_rsa_pem(key.as_bytes())
 			.map_err(|e| err!(Config("jwt.key", "JWT key is not valid RSA PEM: {e}")))?,
 
-		| _ => return Err!(Config("jwt.format", "Key format {format:?} is not supported.")),
+		_ => {
+			return Err!(Config(
+				"jwt.format",
+				"Key format {format:?} is not supported."
+			));
+		}
 	})
 }
 
 fn init_validator(config: &JwtConfig) -> Result<Validation> {
 	let alg = config.algorithm.as_str();
 	let alg = Algorithm::from_str(alg).map_err(|e| {
-		err!(Config("jwt.algorithm", "JWT algorithm is not recognized or configured {e}"))
+		err!(Config(
+			"jwt.algorithm",
+			"JWT algorithm is not recognized or configured {e}"
+		))
 	})?;
 
 	let mut validator = Validation::new(alg);
@@ -215,11 +228,6 @@ fn init_validator(config: &JwtConfig) -> Result<Validation> {
 		validator.set_issuer(&config.issuer);
 	}
 
-	if cfg!(debug_assertions) && !config.validate_signature {
-		warn!("JWT signature validation is disabled!");
-		validator.insecure_disable_signature_validation();
-	}
-
 	validator.set_required_spec_claims(&required_spec_claims);
 	debug!(?validator, "JWT configured");
 
@@ -240,7 +248,10 @@ mod tests {
 
 	#[test]
 	fn keeps_non_email_jwt_localpart() {
-		assert_eq!(normalize_jwt_localpart(" 0940035066 ").as_deref(), Some("0940035066"));
+		assert_eq!(
+			normalize_jwt_localpart(" 0940035066 ").as_deref(),
+			Some("0940035066")
+		);
 	}
 
 	#[test]

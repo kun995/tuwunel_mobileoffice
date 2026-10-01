@@ -11,10 +11,25 @@ use tuwunel_service::Services;
 #[derive(Debug, Deserialize)]
 pub(super) struct QueryParams {
 	pub(super) access_token: Option<String>,
+
 	pub(super) user_id: Option<UserId>,
+
+	pub(super) device_id: Option<DeviceId>,
+
+	#[serde(rename = "org.matrix.msc3202.device_id")]
+	pub(super) msc3202_device_id: Option<DeviceId>,
+}
+
+impl QueryParams {
+	pub(super) fn device_id(&self) -> Option<&str> {
+		self.device_id
+			.as_deref()
+			.or(self.msc3202_device_id.as_deref())
+	}
 }
 
 pub(super) type UserId = SmallString<[u8; 48]>;
+pub(super) type DeviceId = SmallString<[u8; 24]>;
 
 #[derive(Debug)]
 pub(super) struct Request {
@@ -28,21 +43,27 @@ pub(super) struct Request {
 pub(super) type PathParams = SmallVec<[PathParam; 8]>;
 pub(super) type PathParam = SmallString<[u8; 32]>;
 
+#[tracing::instrument(
+	name = "parse",
+	level = "trace",
+	skip_all,
+	err(level = "debug")
+)]
 pub(super) async fn from(
 	services: &Services,
-	request: hyper::Request<axum::body::Body>,
+	request: http::Request<axum::body::Body>,
 ) -> Result<Request> {
 	let limited = request.with_limited_body();
 	let (mut parts, body) = limited.into_parts();
 
 	let cookie: CookieJar = parts.extract().await?;
 	let path: Path<PathParams> = parts.extract().await?;
+
 	let query = parts.uri.query().unwrap_or_default();
 	let query = serde_html_form::from_str(query)
 		.map_err(|e| err!(Request(Unknown("Failed to read query parameters: {e}"))))?;
 
 	let max_body_size = services.server.config.max_request_size;
-
 	let body = axum::body::to_bytes(body, max_body_size)
 		.await
 		.map_err(|e| err!(Request(TooLarge("Request body too large: {e}"))))?;

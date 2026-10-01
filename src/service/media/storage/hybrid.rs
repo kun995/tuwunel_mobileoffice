@@ -3,7 +3,10 @@
 /// Combines two storage backends (primary and secondary) with configurable behavior.
 
 #[cfg(feature = "s3_storage")]
-use std::{sync::Arc, time::{Duration, SystemTime}};
+use std::{
+	sync::Arc,
+	time::{Duration, SystemTime},
+};
 
 #[cfg(feature = "s3_storage")]
 use async_trait::async_trait;
@@ -15,7 +18,7 @@ use tracing::{info, warn};
 #[cfg(feature = "s3_storage")]
 use super::{MediaStorage, StorageMetadata};
 #[cfg(feature = "s3_storage")]
-use tuwunel_core::{config::HybridStrategyConfig, err, Result};
+use tuwunel_core::{Result, config::HybridStrategyConfig, err};
 
 /// Hybrid storage combining two backends
 #[cfg(feature = "s3_storage")]
@@ -33,7 +36,11 @@ impl HybridStorage {
 	/// * `primary` - Primary storage backend (e.g., S3)
 	/// * `secondary` - Secondary storage backend (e.g., filesystem cache)
 	/// * `config` - Hybrid strategy configuration
-	pub fn new(primary: Arc<dyn MediaStorage>, secondary: Arc<dyn MediaStorage>, config: HybridStrategyConfig) -> Self {
+	pub fn new(
+		primary: Arc<dyn MediaStorage>,
+		secondary: Arc<dyn MediaStorage>,
+		config: HybridStrategyConfig,
+	) -> Self {
 		Self {
 			primary,
 			secondary,
@@ -106,10 +113,10 @@ impl MediaStorage for HybridStorage {
 					info!("Cache hit for media key");
 					return Ok(Some(data));
 				}
-			},
+			}
 			None => {
 				info!("Cache miss for media key");
-			},
+			}
 		}
 
 		// Cache miss - read from primary if fallback is enabled
@@ -149,15 +156,14 @@ impl MediaStorage for HybridStorage {
 				// Both failed - this is an error
 				Err(err!(Database(error!(
 					"Failed to delete from both storages: primary={}, secondary={}",
-					e1,
-					e2
+					e1, e2
 				))))
-			},
+			}
 			(Err(e), _) | (_, Err(e)) => {
 				// One failed - log warning but don't fail
 				warn!("Failed to delete from one storage: {}", e);
 				Ok(())
-			},
+			}
 			_ => Ok(()),
 		}
 	}

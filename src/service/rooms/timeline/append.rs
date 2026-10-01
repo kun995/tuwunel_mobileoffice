@@ -1,13 +1,20 @@
+//! Appends authenticated events to room timelines and applies their side effects.
+//!
+//! Incoming events first receive a state snapshot, while accepted events are
+//! assigned a normal stream count and committed to the timeline. Subsequent
+//! cache, indexing, notification, and membership effects are coordinated here.
+
 use std::{collections::BTreeMap, sync::Arc};
 
 use ruma::{
-	CanonicalJsonObject, CanonicalJsonValue, EventId, RoomVersionId, UserId,
+	CanonicalJsonObject, CanonicalJsonValue, EventId, UserId,
 	events::{
 		TimelineEventType,
+		receipt::ReceiptThread,
+		relation::RelationType,
 		room::{
 			encrypted::Relation,
 			member::{MembershipState, RoomMemberEventContent},
-			redaction::RoomRedactionEventContent,
 		},
 	},
 };
@@ -16,26 +23,34 @@ use tuwunel_core::{
 	matrix::{
 		event::Event,
 		pdu::{PduCount, PduEvent, PduId, RawPduId},
+		room_version,
 	},
+	smallvec::SmallVec,
 	utils::{self, result::LogErr},
 };
 use tuwunel_database::Json;
 
-use super::{ExtractBody, ExtractRelatesTo, ExtractRelatesToEventId, RoomMutexGuard};
-use crate::rooms::{short::ShortRoomId, state_compressor::CompressedState};
+use super::{ExtractBody, ExtractRelatesTo, ExtractRelatesToEventId, RoomMutexGuard, bias_count};
+use crate::rooms::{
+	read_receipt::PrivateRead, short::ShortRoomId, state_accessor::plain_text_topic,
+	state_cache::MembershipUpdate, state_compressor::CompressedState,
+};
 
 static LINK_REGEX: std::sync::LazyLock<regex::Regex> =
 	std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)((https?:\/\/|www\.)\S+)").unwrap());
 
 /// Append the incoming event setting the state snapshot to the state from
 /// the server that sent the event.
+type Band<'a> = SmallVec<[&'a EventId; 1]>;
+
+/// Appends an incoming event with its locally resolved state snapshot.
+///
+/// The snapshot is recorded even when the event is soft-failed. A soft-failed
+/// event is not inserted into the accepted timeline, but its predecessors are
+/// marked referenced. Only a nonempty replacement extremity band is stored; an
+/// empty calculation preserves the prior band.
 #[implement(super::Service)]
-#[tracing::instrument(
-	name = "append_incoming",
-	level = "debug",
-	skip_all,
-	ret(Debug)
-)]
+#[tracing::instrument(name = "append_incoming", level = "debug", skip_all, ret(Debug))]
 pub(crate) async fn append_incoming_pdu<'a, Leafs>(
 	&'a self,
 	pdu: &'a PduEvent,
@@ -61,10 +76,14 @@ where
 			.pdu_metadata
 			.mark_as_referenced(&pdu.room_id, pdu.prev_events.iter().map(AsRef::as_ref));
 
-		self.services
-			.state
-			.set_forward_extremities(&pdu.room_id, new_room_leafs, state_lock)
-			.await;
+		// Keep the previous band rather than let a soft-failed event empty it; a
+		// later accepted event self-chains and heals it.
+		if let Some(new_room_leafs) = nonempty_band(new_room_leafs) {
+			self.services
+				.state
+				.set_forward_extremities(&pdu.room_id, new_room_leafs.into_iter(), state_lock)
+				.await;
+		}
 
 		return Ok(None);
 	}
@@ -76,12 +95,21 @@ where
 	Ok(Some(pdu_id))
 }
 
-/// Creates a new persisted data unit and adds it to a room.
+fn nonempty_band<'a, Leafs>(leafs: Leafs) -> Option<Band<'a>>
+where
+	Leafs: Iterator<Item = &'a EventId>,
+{
+	let leafs: Band<'_> = leafs.collect();
+
+	(!leafs.is_empty()).then_some(leafs)
+}
+
+/// Persists an authenticated event and applies its timeline side effects.
 ///
-/// By this point the incoming event should be fully authenticated, no auth
-/// happens in `append_pdu`.
-///
-/// Returns pdu id
+/// This method performs no authentication. The accepted row, event mapping,
+/// outlier removal, and timestamp index are committed together, but later
+/// cache, indexing, notification, and membership work is not part of that
+/// transaction, so an error can be returned after the event is stored.
 #[implement(super::Service)]
 #[tracing::instrument(name = "append", level = "debug", skip_all, ret(Debug))]
 pub async fn append_pdu<'a, Leafs>(
@@ -112,15 +140,12 @@ where
 			.entry("unsigned".into())
 			.or_insert_with(|| CanonicalJsonValue::Object(BTreeMap::default()))
 		{
-			if let Ok(shortstatehash) = self
-				.services
-				.state
-				.pdu_shortstatehash(pdu.event_id())
-				.await && let Ok(prev_state) = self
-				.services
-				.state_accessor
-				.state_get(shortstatehash, &pdu.kind().to_string().into(), state_key)
-				.await
+			if let Ok(shortstatehash) = self.services.state.pdu_shortstatehash(pdu.event_id()).await
+				&& let Ok(prev_state) = self
+					.services
+					.state_accessor
+					.state_get(shortstatehash, &pdu.kind().to_string().into(), state_key)
+					.await
 			{
 				unsigned.insert(
 					"prev_content".into(),
@@ -159,29 +184,53 @@ where
 		.await;
 
 	let insert_lock = self.mutex_insert.lock(pdu.room_id()).await;
-	let next_count1 = self.services.globals.next_count();
-	let next_count2 = self.services.globals.next_count();
+	let next_count = self.services.globals.next_count();
 
 	// Mark as read first so the sending client doesn't get a notification even if
-	// appending fails
+	// appending fails. Route through the dispatcher so per-thread counts are
+	// also cleared; the sender's own send subsumes any thread receipt.
 	self.services
 		.read_receipt
-		.private_read_set(pdu.room_id(), pdu.sender(), *next_count2);
+		.private_read_set(PrivateRead {
+			room_id: pdu.room_id(),
+			user_id: pdu.sender(),
+			count: *next_count,
+			ts: pdu.origin_server_ts(),
+			thread: &ReceiptThread::Unthreaded,
+			announce: false,
+		})
+		.await;
 
 	self.services
 		.pusher
-		.reset_notification_counts(pdu.sender(), pdu.room_id());
+		.reset_notification_counts_for_thread(
+			pdu.sender(),
+			pdu.room_id(),
+			None,
+			&ReceiptThread::Unthreaded,
+		)
+		.await;
 
-	let count = PduCount::Normal(*next_count1);
+	let count = PduCount::Normal(*next_count);
 	let pdu_id: RawPduId = PduId { shortroomid, count }.into();
 
 	// Insert pdu
-	self.append_pdu_json(&pdu_id, pdu, &pdu_json, count);
+	self.append_pdu_json(&pdu_id, pdu, &pdu_json);
 	if *pdu.kind() == TimelineEventType::RoomMessage {
 		self.mark_has_user_message(pdu.room_id());
 	}
 
 	drop(insert_lock);
+
+	// Only local senders can own pushers.
+	if self.services.globals.user_is_local(pdu.sender()) {
+		self.services
+			.sending
+			.refresh_push_badge(pdu.sender())
+			.await
+			.log_err()
+			.ok();
+	}
 
 	self.services
 		.pusher
@@ -193,8 +242,7 @@ where
 	self.append_pdu_effects(pdu_id, pdu, shortroomid, count, state_lock)
 		.await?;
 
-	drop(next_count1);
-	drop(next_count2);
+	drop(next_count);
 
 	self.services
 		.appservice
@@ -216,84 +264,30 @@ async fn append_pdu_effects(
 	state_lock: &RoomMutexGuard,
 ) -> Result {
 	match *pdu.kind() {
-		| TimelineEventType::RoomRedaction => {
-			use RoomVersionId::*;
+		TimelineEventType::RoomRedaction => {
+			let room_version = self.services.state.get_room_version(pdu.room_id()).await?;
 
-			let room_version_id = self
-				.services
-				.state
-				.get_room_version(pdu.room_id())
-				.await?;
+			let room_rules = room_version::rules(&room_version)?;
 
-			let content: RoomRedactionEventContent;
-			let event_id = match room_version_id {
-				| V1 | V2 | V3 | V4 | V5 | V6 | V7 | V8 | V9 | V10 => pdu.redacts(),
-				| _ => {
-					content = pdu.get_content()?;
-					content.redacts.as_deref()
-				},
-			};
-			if let Some(redact_id) = event_id
+			let redacts_id = pdu.redacts_id(&room_rules);
+
+			if let Some(redacts_id) = &redacts_id
 				&& self
 					.services
 					.state_accessor
-					.user_can_redact(redact_id, pdu.sender(), pdu.room_id(), false)
+					.user_can_redact(redacts_id, pdu.sender(), pdu.room_id(), false)
 					.await?
 			{
-				self.redact_pdu(redact_id, pdu, shortroomid, state_lock)
+				self.redact_pdu(redacts_id, pdu, shortroomid, state_lock)
 					.await?;
 				self.services
 					.pusher
-					.remove_redacted_event_notifications(pdu.room_id(), redact_id)
+					.remove_redacted_event_notifications(pdu.room_id(), redacts_id)
 					.await;
 			}
-		},
-		| TimelineEventType::SpaceChild => {
-			if let Some(_state_key) = pdu.state_key() {
-				self.services
-					.spaces
-					.roomid_spacehierarchy_cache
-					.lock()
-					.await
-					.remove(pdu.room_id());
-			}
-		},
-		| TimelineEventType::RoomMember => {
-			if let Some(state_key) = pdu.state_key() {
-				// if the state_key fails
-				let target_user_id =
-					UserId::parse(state_key).expect("This state_key was previously validated");
-
-				let content: RoomMemberEventContent = pdu.get_content()?;
-				let stripped_state = match content.membership {
-					| MembershipState::Invite | MembershipState::Knock => self
-						.services
-						.state
-						.summary_stripped(pdu)
-						.await
-						.into(),
-					| _ => None,
-				};
-
-				// Update our membership info, we do this here incase a user is invited or
-				// knocked and immediately leaves we need the DB to record the invite or
-				// knock event for auth
-				self.services
-					.state_cache
-					.update_membership(
-						pdu.room_id(),
-						target_user_id,
-						content,
-						pdu.sender(),
-						stripped_state,
-						None,
-						true,
-						count,
-					)
-					.await?;
-			}
-		},
-		| TimelineEventType::RoomMessage => {
+		}
+		TimelineEventType::RoomMember => self.append_member_effects(pdu, count).await?,
+		TimelineEventType::RoomMessage => {
 			let content: ExtractBody = pdu.get_content()?;
 			if let Some(filename) = content.filename.as_deref() {
 				self.services
@@ -302,39 +296,37 @@ async fn append_pdu_effects(
 			}
 
 			if let Some(body) = content.body {
-				self.services
-					.search
-					.index_pdu(shortroomid, &pdu_id, &body);
+				self.services.search.index_pdu(shortroomid, &pdu_id, &body);
 
-				if body.contains("http://") || body.contains("https://") || body.contains("www.")
-				{
+				if body.contains("http://") || body.contains("https://") || body.contains("www.") {
 					if LINK_REGEX.is_match(&body) {
-						self.db
-							.roomid_haslink_pduid
-							.raw_put(pdu_id.as_bytes(), b"");
+						self.db.roomid_haslink_pduid.raw_put(pdu_id.as_bytes(), b"");
 					}
 				}
 
-				if self
-					.services
-					.admin
-					.is_admin_command(pdu, &body)
-					.await
-				{
+				if self.services.admin.is_admin_command(pdu, &body).await {
 					self.services
 						.admin
 						.command(body, Some((pdu.event_id()).into()))
 						.await?;
 				}
 			}
-		},
-		| _ => {},
+		}
+		TimelineEventType::RoomTopic => {
+			if let Some(topic) = pdu.get_content().ok().and_then(plain_text_topic) {
+				self.services.search.index_pdu(shortroomid, &pdu_id, &topic);
+			}
+		}
+		_ => {}
+	}
+
+	// The cached hierarchy summary projects room state; evict on any state change.
+	if pdu.state_key().is_some() {
+		self.services.spaces.cache_evict(pdu.room_id());
 	}
 
 	if let Ok(content) = pdu.get_content::<ExtractRelatesToEventId>()
-		&& let Ok(related_pducount) = self
-			.get_pdu_count(&content.relates_to.event_id)
-			.await
+		&& let Ok(related_pducount) = self.get_pdu_count(&content.relates_to.event_id).await
 	{
 		self.services
 			.pdu_metadata
@@ -343,7 +335,7 @@ async fn append_pdu_effects(
 
 	if let Ok(content) = pdu.get_content::<ExtractRelatesTo>() {
 		match content.relates_to {
-			| Relation::Reply { in_reply_to } => {
+			Relation::Reply(ruma::events::relation::Reply { in_reply_to }) => {
 				// We need to do it again here, because replies don't have
 				// event_id as a top level field
 				if let Ok(related_pducount) = self.get_pdu_count(&in_reply_to.event_id).await {
@@ -351,37 +343,133 @@ async fn append_pdu_effects(
 						.pdu_metadata
 						.add_relation(count, related_pducount);
 				}
-			},
-			| Relation::Thread(thread) => {
+			}
+			Relation::Thread(thread) => {
 				self.services
 					.threads
-					.add_to_thread(&thread.event_id, pdu)
+					.add_to_thread(&thread.event_id, pdu_id, pdu)
 					.await?;
-			},
-			| _ => {}, // TODO: Aggregate other types
+			}
+			Relation::Replacement(replacement) => {
+				self.services
+					.pdu_metadata
+					.add_typed_relation(
+						shortroomid,
+						count,
+						&replacement.event_id,
+						pdu,
+						RelationType::Replacement,
+					)
+					.await;
+			}
+			Relation::Reference(reference) => {
+				self.services
+					.pdu_metadata
+					.add_typed_relation(
+						shortroomid,
+						count,
+						&reference.event_id,
+						pdu,
+						RelationType::Reference,
+					)
+					.await;
+			}
+			_ => {} // TODO: Aggregate other types
 		}
 	}
 
 	Ok(())
 }
 
+/// Record the membership transition an `m.room.member` event carries.
+///
+/// The cache is written here rather than off the resolved state so that a
+/// user who is invited or knocked and leaves immediately still leaves the
+/// earlier event on record for auth.
 #[implement(super::Service)]
-fn append_pdu_json(
-	&self,
-	pdu_id: &RawPduId,
-	pdu: &PduEvent,
-	json: &CanonicalJsonObject,
-	count: PduCount,
-) {
-	debug_assert!(matches!(count, PduCount::Normal(_)), "PduCount not Normal");
+async fn append_member_effects(&self, pdu: &PduEvent, count: PduCount) -> Result {
+	let Some(state_key) = pdu.state_key() else {
+		return Ok(());
+	};
 
-	self.db.pduid_pdu.raw_put(pdu_id, Json(json));
+	let user_id = UserId::parse(state_key).expect("This state_key was previously validated");
+	let content: RoomMemberEventContent = pdu.get_content()?;
+	let is_invite = content.membership == MembershipState::Invite;
+	let is_direct = content.is_direct;
 
-	self.db
-		.eventid_pduid
-		.insert(pdu.event_id.as_bytes(), pdu_id);
+	let stripped_state = match content.membership {
+		MembershipState::Invite | MembershipState::Knock => {
+			self.services.state.summary_stripped(pdu).await.into()
+		}
+		_ => None,
+	};
 
-	self.db
-		.eventid_outlierpdu
-		.remove(pdu.event_id.as_bytes());
+	self.services
+		.state_cache
+		.update_membership(MembershipUpdate {
+			room_id: pdu.room_id(),
+			user_id: &user_id,
+			membership_event: content,
+			sender: pdu.sender(),
+			last_state: stripped_state,
+			invite_via: None,
+			update_joined_count: true,
+			count,
+		})
+		.await?;
+
+	if is_invite {
+		self.services
+			.membership
+			.auto_accept(pdu.room_id(), &user_id, pdu.sender(), is_direct);
+	}
+
+	Ok(())
+}
+
+#[implement(super::Service)]
+fn append_pdu_json(&self, pdu_id: &RawPduId, pdu: &PduEvent, json: &CanonicalJsonObject) {
+	debug_assert!(
+		matches!(pdu_id.pdu_count(), PduCount::Normal(_)),
+		"PduCount not Normal"
+	);
+
+	let mut txn = self.db.db.txn();
+
+	txn.raw_put(&self.db.pduid_pdu, pdu_id, Json(json));
+	txn.insert_raw(&self.db.eventid_pduid, pdu.event_id.as_bytes(), pdu_id);
+	txn.del_raw(&self.db.eventid_outlierpdu, pdu.event_id.as_bytes());
+
+	let count_key = bias_count(pdu_id.count());
+	let ts = u64::from(pdu.origin_server_ts);
+	let key = (pdu.room_id(), ts, count_key);
+	txn.put_raw(&self.db.roomid_tscount_pducount, key, pdu_id.count());
+
+	txn.execute();
+}
+
+#[cfg(test)]
+mod tests {
+	use std::iter::empty;
+
+	use ruma::event_id;
+
+	use super::*;
+
+	#[test]
+	fn empty_band_is_skipped() {
+		assert!(nonempty_band(empty::<&EventId>()).is_none());
+	}
+
+	#[test]
+	fn nonempty_band_preserves_all_leaves() {
+		let leaves = [event_id!("$a:test.local"), event_id!("$b:test.local")];
+
+		let kept: Vec<&EventId> = nonempty_band(leaves.iter().copied())
+			.expect("non-empty band retained")
+			.into_iter()
+			.collect();
+
+		assert_eq!(kept, leaves);
+	}
 }

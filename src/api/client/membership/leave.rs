@@ -1,34 +1,47 @@
 use axum::extract::State;
 use futures::{FutureExt, StreamExt};
 use rand::seq::SliceRandom;
+use ruma::api::client::membership::leave_room::v3::{Request, Response};
 use ruma::{
 	Int, RoomId, UserId,
-	api::client::membership::leave_room,
 	events::{StateEventType, room::power_levels::RoomPowerLevelsEventContent},
 };
-use tuwunel_core::{Result, matrix::pdu::PduBuilder};
+use tuwunel_core::matrix::pdu::PduBuilder;
+use tuwunel_core::{Err, Result};
 use tuwunel_service::{Services, rooms::timeline::RoomMutexGuard};
 
-use crate::Ruma;
+use crate::{Ruma, client::admin::misc::is_notice_room};
 
-/// # `POST /_matrix/client/v3/rooms/{roomId}/leave`
+/// Leaves a room through `POST /_matrix/client/v3/rooms/{roomId}/leave`.
 ///
-/// Tries to leave the sender user from a room.
-///
-/// - This should always work if the user is currently joined.
+/// Server-notice invitations cannot be rejected, but joined recipients can leave.
+#[tracing::instrument(level = "debug", skip_all)]
 pub(crate) async fn leave_room_route(
 	State(services): State<crate::State>,
-	body: Ruma<leave_room::v3::Request>,
-) -> Result<leave_room::v3::Response> {
+	Ruma {
+		body, sender_user, ..
+	}: Ruma<Request>,
+) -> Result<Response> {
 	let state_lock = services.state.mutex.lock(&body.room_id).await;
-	auto_assign_admin_before_leave(&services, body.sender_user(), &body.room_id, &state_lock)
+	let sender = sender_user
+		.as_deref()
+		.expect("user must be authenticated for this handler");
+
+	if services.state_cache.is_invited(sender, &body.room_id).await
+		&& is_notice_room(&services, sender, &body.room_id).await?
+	{
+		return Err!(Request(CannotLeaveServerNoticeRoom(
+			"You cannot reject this invite"
+		)));
+	}
+
+	// Reuse the room guard: taking this mutex again would deadlock the leave request.
+	auto_assign_admin_before_leave(&services, sender, &body.room_id, &state_lock)
 		.boxed()
 		.await?;
-
 	services
 		.membership
-		.leave(body.sender_user(), &body.room_id, body.reason.clone(), false, &state_lock)
-		.boxed()
+		.leave(sender, &body.room_id, body.reason, false, &state_lock)
 		.await?;
 
 	if services.config.delete_rooms_after_leave {
@@ -39,7 +52,7 @@ pub(crate) async fn leave_room_route(
 			.await;
 	}
 
-	Ok(leave_room::v3::Response {})
+	Ok(Response {})
 }
 
 async fn auto_assign_admin_before_leave(
@@ -52,11 +65,7 @@ async fn auto_assign_admin_before_leave(
 		return Ok(());
 	}
 
-	let Ok(power_levels) = services
-		.state_accessor
-		.get_power_levels(room_id)
-		.await
-	else {
+	let Ok(power_levels) = services.state_accessor.get_power_levels(room_id).await else {
 		return Ok(());
 	};
 
@@ -85,7 +94,7 @@ async fn auto_assign_admin_before_leave(
 		return Ok(());
 	}
 
-	candidates.shuffle(&mut rand::thread_rng());
+	candidates.shuffle(&mut rand::rng());
 	let Some(next_admin) = candidates.into_iter().next() else {
 		return Ok(());
 	};
@@ -101,9 +110,7 @@ async fn auto_assign_admin_before_leave(
 		.unwrap_or_default();
 
 	power_levels_content.users.remove(sender_user);
-	power_levels_content
-		.users
-		.insert(next_admin, admin_power);
+	power_levels_content.users.insert(next_admin, admin_power);
 
 	services
 		.timeline

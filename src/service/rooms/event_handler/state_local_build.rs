@@ -1,0 +1,1113 @@
+use std::{
+	borrow::Borrow,
+	collections::HashMap,
+	mem::take,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, AtomicU64, Ordering},
+	},
+};
+
+use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, future::join};
+use ruma::{
+	EventId, OwnedEventId, OwnedRoomId, RoomId, RoomVersionId,
+	events::{StateEventType, TimelineEventType},
+	room_version_rules::RoomVersionRules,
+};
+use tracing::{Instrument, Span};
+use tuwunel_core::{
+	Result, debug, debug_warn, defer, err, implement,
+	matrix::{
+		Event, PduEvent,
+		pdu::PrevEvents,
+		room_version::{self, from_create_event},
+	},
+	trace,
+	utils::stream::{BroadbandExt, IterStream, ReadyExt, WidebandExt},
+};
+
+use crate::rooms::{
+	short::{ShortStateHash, ShortStateKey},
+	state::IdMapState,
+	state_compressor::CompressedState,
+	state_res::{AuthCheckOutcome, auth_check},
+};
+
+#[cfg(test)]
+mod tests;
+
+/// State before or after one event, in the shape the sibling builders return.
+type StateIds = HashMap<ShortStateKey, OwnedEventId>;
+
+/// Summary of one local build attempt, for the admin debug command.
+#[derive(Debug)]
+pub struct LocalBuildReport {
+	pub state_len: Option<usize>,
+	pub visited: usize,
+	pub forks: usize,
+	pub gate_drops: usize,
+	pub memo_hits: usize,
+	pub fallback: Option<String>,
+}
+
+/// Immutable process-lifetime totals for production local state builds.
+///
+/// Relaxed loads make each snapshot observational rather than a
+/// synchronization primitive.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StateLocalMetrics {
+	/// Production local walks started.
+	pub walk_attempts: u64,
+	/// Local walks that produced complete state.
+	pub walk_resolved: u64,
+	/// Walks that fell back because an ancestor was absent.
+	pub fallback_absent: u64,
+	/// Walks that reached the configured node ceiling.
+	pub fallback_ceiling: u64,
+	/// Walks with an absent auth dependency.
+	pub fallback_auth_missing: u64,
+	/// Walks whose ancestors were all committed.
+	pub fallback_all_committed: u64,
+	/// Walks that reached the live-entry ceiling.
+	pub fallback_entries: u64,
+	/// Walks whose memo canary was absent.
+	pub fallback_canary: u64,
+	/// Walks whose create event did not match.
+	pub fallback_create_mismatch: u64,
+	/// Walks whose complete inputs could not be evaluated.
+	pub fallback_unevaluable: u64,
+	/// Walks that fell back after a recoverable lookup or state-build error.
+	pub fallback_error: u64,
+	/// Walks whose inner result errored or whose task did not complete.
+	pub walk_failures: u64,
+	/// State-event folds denied by the positional auth gate.
+	pub gate_denials: u64,
+}
+
+#[derive(Default)]
+pub(super) struct StateLocalCounters {
+	walk_attempts: AtomicU64,
+	walk_resolved: AtomicU64,
+	fallback_absent: AtomicU64,
+	fallback_ceiling: AtomicU64,
+	fallback_auth_missing: AtomicU64,
+	fallback_all_committed: AtomicU64,
+	fallback_entries: AtomicU64,
+	fallback_canary: AtomicU64,
+	fallback_create_mismatch: AtomicU64,
+	fallback_unevaluable: AtomicU64,
+	fallback_error: AtomicU64,
+	walk_failures: AtomicU64,
+	gate_denials: AtomicU64,
+}
+
+struct WalkAttempt {
+	counters: Arc<StateLocalCounters>,
+	settled: bool,
+}
+
+#[implement(StateLocalCounters)]
+fn start_walk(&self) { self.walk_attempts.fetch_add(1, Ordering::Relaxed); }
+
+#[implement(StateLocalCounters)]
+fn settle_walk(&self, outcome: WalkOutcome) {
+	match outcome {
+		| WalkOutcome::Resolved => {
+			self.walk_resolved.fetch_add(1, Ordering::Relaxed);
+		},
+		| WalkOutcome::Fallback(fallback) => self.record_fallback(fallback),
+		| WalkOutcome::Failure => {
+			self.walk_failures.fetch_add(1, Ordering::Relaxed);
+		},
+	}
+}
+
+#[implement(StateLocalCounters)]
+fn record_fallback(&self, fallback: Fallback) {
+	let counter = match fallback {
+		| Fallback::Absent => &self.fallback_absent,
+		| Fallback::Ceiling => &self.fallback_ceiling,
+		| Fallback::AuthMissing => &self.fallback_auth_missing,
+		| Fallback::AllCommitted => &self.fallback_all_committed,
+		| Fallback::Entries => &self.fallback_entries,
+		| Fallback::Canary => &self.fallback_canary,
+		| Fallback::CreateMismatch => &self.fallback_create_mismatch,
+		| Fallback::Unevaluable => &self.fallback_unevaluable,
+		| Fallback::Error => &self.fallback_error,
+	};
+
+	counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[implement(StateLocalCounters)]
+fn add_gate_denials(&self, gate_denials: usize) {
+	if gate_denials == 0 {
+		return;
+	}
+
+	let gate_denials = gate_denials.try_into().unwrap_or(u64::MAX);
+
+	self.gate_denials
+		.fetch_add(gate_denials, Ordering::Relaxed);
+}
+
+#[implement(StateLocalCounters)]
+fn snapshot(&self) -> StateLocalMetrics {
+	StateLocalMetrics {
+		walk_attempts: self.walk_attempts.load(Ordering::Relaxed),
+		walk_resolved: self.walk_resolved.load(Ordering::Relaxed),
+		fallback_absent: self.fallback_absent.load(Ordering::Relaxed),
+		fallback_ceiling: self.fallback_ceiling.load(Ordering::Relaxed),
+		fallback_auth_missing: self.fallback_auth_missing.load(Ordering::Relaxed),
+		fallback_all_committed: self
+			.fallback_all_committed
+			.load(Ordering::Relaxed),
+		fallback_entries: self.fallback_entries.load(Ordering::Relaxed),
+		fallback_canary: self.fallback_canary.load(Ordering::Relaxed),
+		fallback_create_mismatch: self
+			.fallback_create_mismatch
+			.load(Ordering::Relaxed),
+		fallback_unevaluable: self.fallback_unevaluable.load(Ordering::Relaxed),
+		fallback_error: self.fallback_error.load(Ordering::Relaxed),
+		walk_failures: self.walk_failures.load(Ordering::Relaxed),
+		gate_denials: self.gate_denials.load(Ordering::Relaxed),
+	}
+}
+
+#[implement(WalkAttempt)]
+fn start(counters: Arc<StateLocalCounters>) -> Self {
+	counters.start_walk();
+
+	Self { counters, settled: false }
+}
+
+#[implement(WalkAttempt)]
+fn settle(mut self, outcome: WalkOutcome, gate_denials: usize) {
+	self.counters.add_gate_denials(gate_denials);
+	self.counters.settle_walk(outcome);
+	self.settled = true;
+}
+
+impl Drop for WalkAttempt {
+	fn drop(&mut self) {
+		if !self.settled {
+			self.counters.settle_walk(WalkOutcome::Failure);
+		}
+	}
+}
+
+/// Active writes fork-node memo rows; Shadow suppresses all persistent
+/// writes.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum WalkMode {
+	Active,
+	Shadow,
+}
+
+/// State threaded through one walk's discovery and build phases.
+struct Walk<'a> {
+	room_id: &'a RoomId,
+	room_version: &'a RoomVersionId,
+	room_rules: RoomVersionRules,
+	create_event_id: &'a EventId,
+	mode: WalkMode,
+	max_nodes: usize,
+	top_prevs: PrevEvents,
+	class: HashMap<OwnedEventId, Class>,
+	nodes: Vec<Node>,
+	order: Vec<usize>,
+	frontier: HashMap<OwnedEventId, usize>,
+	resolved: HashMap<OwnedEventId, Arc<StateIds>>,
+	live_entries: usize,
+	peak_entries: usize,
+	forks: usize,
+	gate_drops: usize,
+	memo_hits: usize,
+	fallback: Option<Fallback>,
+	attempt: Option<WalkAttempt>,
+}
+
+/// Held outlier in the walk sub-DAG.
+struct Node {
+	pdu: PduEvent,
+	consumers: usize,
+}
+
+/// Ancestry classification from the discovery phase.
+#[derive(Clone, Copy)]
+enum Class {
+	/// Committed to the timeline with resolved state at the event.
+	Committed(ShortStateHash),
+
+	/// Uncommitted, but an eventid_resolvedstate row exists.
+	Memoized,
+
+	/// Uncommitted outlier we hold; the index into Walk::nodes.
+	Held(usize),
+}
+
+/// Why a walk gave up; every reason falls back to the federation fetch.
+#[derive(Clone, Copy)]
+enum Fallback {
+	Absent,
+	Ceiling,
+	AuthMissing,
+	AllCommitted,
+	Entries,
+	Canary,
+	CreateMismatch,
+	Unevaluable,
+	Error,
+}
+
+#[derive(Clone, Copy)]
+enum WalkOutcome {
+	Resolved,
+	Fallback(Fallback),
+	Failure,
+}
+
+/// Ceiling on simultaneously live state-map entries across one walk: the sum
+/// of the lengths of materialized maps no consumer has released yet.
+/// Exceeding it falls back to the federation fetch. Deliberately a const, not
+/// config; revisit only if operation trips it.
+const MAX_LIVE_ENTRIES: usize = 1 << 19;
+
+/// Build the state before `incoming_pdu` from events we already hold, walking
+/// locally held uncommitted ancestry down to committed or memoized ancestors
+/// with an auth gate on every folded state event. Some(map) is a complete
+/// gated build in the shape the sibling builders return; None falls back to
+/// the federation state fetch, for any reason. Err propagates only server
+/// shutdown and room-version failures.
+#[implement(super::Service)]
+pub(super) async fn state_at_incoming_local<Pdu>(
+	&self,
+	room_id: &RoomId,
+	incoming_pdu: &Pdu,
+	room_version: &RoomVersionId,
+	create_event_id: &EventId,
+	mode: WalkMode,
+) -> Result<Option<StateIds>>
+where
+	Pdu: Event,
+{
+	let top_prevs = incoming_pdu
+		.prev_events()
+		.map(ToOwned::to_owned)
+		.collect();
+
+	let services = self.services.clone();
+	let room_id = room_id.to_owned();
+	let room_version = room_version.clone();
+	let create_event_id = create_event_id.to_owned();
+	let parent = Span::current();
+	let attempt = WalkAttempt::start(self.state_local.clone());
+
+	let task = self.services.server.runtime().spawn(
+		async move {
+			services
+				.event_handler
+				.walk_task(room_id, room_version, create_event_id, mode, top_prevs, attempt)
+				.await
+		}
+		.instrument(parent),
+	);
+
+	// Abort on caller cancellation; a dropped JoinHandle only detaches.
+	let abort = task.abort_handle();
+
+	defer! {{ abort.abort(); }};
+
+	task.await.unwrap_or_else(|error| {
+		debug_warn!(
+			%error,
+			"Local state build task failed; falling back to federation fetch.",
+		);
+
+		Ok(None)
+	})
+}
+
+/// Walk body on its own task: a poll descends every combinator layer from the
+/// task root, and under /send intake, already the server's deepest stack, the
+/// walk's auth-gate subtree overflows the worker stack in debug builds.
+#[implement(super::Service)]
+#[tracing::instrument(name = "local", level = "debug", skip_all)]
+async fn walk_task(
+	&self,
+	room_id: OwnedRoomId,
+	room_version: RoomVersionId,
+	create_event_id: OwnedEventId,
+	mode: WalkMode,
+	top_prevs: PrevEvents,
+	attempt: WalkAttempt,
+) -> Result<Option<StateIds>> {
+	let max_nodes = self
+		.services
+		.server
+		.config
+		.resolve_state_locally_max;
+
+	let mut walk = Walk::new(
+		&room_id,
+		&room_version,
+		&create_event_id,
+		mode,
+		max_nodes,
+		top_prevs,
+		Some(attempt),
+	)?;
+
+	let state = self.walk_state(&mut walk).await;
+	let state = state.inspect_err(|_| {
+		walk.settle(WalkOutcome::Failure);
+	})?;
+
+	debug!(
+		visited = walk.nodes.len(),
+		forks = walk.forks,
+		gate_drops = walk.gate_drops,
+		memo_hits = walk.memo_hits,
+		live_entries_peak = walk.peak_entries,
+		outcome = walk.fallback.map_or("resolved", Fallback::name),
+		"Local state build finished.",
+	);
+
+	if let Some(fallback) = walk.fallback {
+		debug_warn!(
+			reason = fallback.name(),
+			"Local state build falling back to federation fetch.",
+		);
+	}
+
+	let (state, outcome) = match (state, walk.fallback) {
+		| (Some(state), None) => (Some(state), WalkOutcome::Resolved),
+		| (None, Some(fallback)) => (None, WalkOutcome::Fallback(fallback)),
+		| _ => {
+			debug_assert!(false, "local walk state and fallback disagree");
+			(None, WalkOutcome::Failure)
+		},
+	};
+
+	walk.settle(outcome);
+
+	Ok(state)
+}
+
+/// Read an observational snapshot of production local-build totals.
+///
+/// The values cover this process lifetime and do not reset when read.
+#[implement(super::Service)]
+#[inline]
+#[must_use]
+pub fn state_local_metrics(&self) -> StateLocalMetrics { self.state_local.snapshot() }
+
+/// Run a diagnostic walk for one stored event and describe the outcome.
+///
+/// The walk does not write authoritative state, resolved-state memos, or
+/// production counters. It may allocate short IDs and warm auth-chain caches.
+#[implement(super::Service)]
+pub async fn local_state_report(&self, event_id: &EventId) -> Result<LocalBuildReport> {
+	let pdu = self.services.timeline.get_pdu(event_id).await?;
+
+	let create_event = self
+		.services
+		.state_accessor
+		.room_state_get(pdu.room_id(), &StateEventType::RoomCreate, "")
+		.await?;
+
+	let room_version = from_create_event(&create_event)?;
+	let max_nodes = self
+		.services
+		.server
+		.config
+		.resolve_state_locally_max;
+
+	let top_prevs = pdu.prev_events().map(ToOwned::to_owned).collect();
+
+	let mut walk = Walk::new(
+		pdu.room_id(),
+		&room_version,
+		create_event.event_id(),
+		WalkMode::Shadow,
+		max_nodes,
+		top_prevs,
+		None,
+	)?;
+
+	let state = self.walk_state(&mut walk).await?;
+
+	Ok(LocalBuildReport {
+		state_len: state.map(|state| state.len()),
+		visited: walk.nodes.len(),
+		forks: walk.forks,
+		gate_drops: walk.gate_drops,
+		memo_hits: walk.memo_hits,
+		fallback: walk
+			.fallback
+			.map(|fallback| fallback.name().to_owned()),
+	})
+}
+
+/// Drive discovery then the post-order build; any abnormality sets
+/// walk.fallback and yields None.
+#[implement(super::Service)]
+async fn walk_state(&self, walk: &mut Walk<'_>) -> Result<Option<StateIds>> {
+	self.walk_discover(walk).await?;
+
+	if walk.fallback.is_some() {
+		return Ok(None);
+	}
+
+	self.walk_build(walk)
+		.boxed() // size firewall
+		.await
+}
+
+/// Classify the uncommitted ancestry below the incoming event with point
+/// reads only, emitting held nodes in post-order; every condition the build
+/// cannot survive sets walk.fallback here, before any state materializes.
+#[implement(super::Service)]
+async fn walk_discover(&self, walk: &mut Walk<'_>) -> Result {
+	let mut stack: Vec<(OwnedEventId, bool)> = walk
+		.top_prevs
+		.iter()
+		.map(|prev| (prev.clone(), false))
+		.collect();
+
+	while let Some((event_id, expanded)) = stack.pop() {
+		self.services.server.check_running()?;
+
+		if expanded {
+			// Post-order emission: every prev of this node is fully classified.
+			let Some(Class::Held(index)) = walk.class.get(&event_id).copied() else {
+				debug_assert!(false, "expanded stack entries are held nodes");
+				walk.fallback = Some(Fallback::Error);
+				return Ok(());
+			};
+
+			walk.order.push(index);
+			continue;
+		}
+
+		if walk.class.contains_key(&event_id) {
+			continue;
+		}
+
+		if let Ok(shortstatehash) = self
+			.services
+			.state
+			.pdu_shortstatehash(&event_id)
+			.await
+		{
+			walk.class
+				.insert(event_id, Class::Committed(shortstatehash));
+
+			continue;
+		}
+
+		if self
+			.db
+			.eventid_resolvedstate
+			.exists(&event_id)
+			.await
+			.is_ok()
+		{
+			walk.class.insert(event_id, Class::Memoized);
+			continue;
+		}
+
+		let Ok(pdu) = self.services.timeline.get_pdu(&event_id).await else {
+			trace!(%event_id, "Ancestor is not held locally.");
+			walk.fallback = Some(Fallback::Absent);
+			return Ok(());
+		};
+
+		if walk.nodes.len() >= walk.max_nodes {
+			walk.fallback = Some(Fallback::Ceiling);
+			return Ok(());
+		}
+
+		if pdu.prev_events().next().is_none() {
+			debug_warn!(%event_id, "Held uncommitted ancestor has no prev events.");
+			walk.fallback = Some(Fallback::Error);
+			return Ok(());
+		}
+
+		if !self.walk_auth_present(walk, &pdu).await {
+			walk.fallback = Some(Fallback::AuthMissing);
+			return Ok(());
+		}
+
+		walk.class
+			.insert(event_id.clone(), Class::Held(walk.nodes.len()));
+
+		stack.push((event_id, true));
+		stack.extend(
+			pdu.prev_events()
+				.map(|prev| (prev.to_owned(), false)),
+		);
+		walk.nodes.push(Node { pdu, consumers: 0 });
+	}
+
+	if walk.nodes.is_empty() {
+		// The sibling builders already failed the all-committed shape before
+		// the walk ran; re-resolving it would only fail again.
+		walk.fallback = Some(Fallback::AllCommitted);
+		return Ok(());
+	}
+
+	walk.count_consumers();
+
+	Ok(())
+}
+
+/// The auth gate must stay evaluable: every auth event of a held node has to
+/// be present locally before the walk commits to building through it. Hydra
+/// rooms chain the create event implied by the room id.
+#[implement(super::Service)]
+async fn walk_auth_present(&self, walk: &Walk<'_>, pdu: &PduEvent) -> bool {
+	let is_hydra = !walk
+		.room_rules
+		.event_format
+		.allow_room_create_in_auth_events;
+
+	let not_create = *pdu.kind() != TimelineEventType::RoomCreate;
+	let hydra_create_id = (not_create && is_hydra)
+		.then(|| pdu.room_id().as_event_id().ok())
+		.flatten();
+
+	pdu.auth_events()
+		.chain(hydra_create_id.as_deref())
+		.stream()
+		.all(|auth_id| self.services.timeline.pdu_exists(auth_id))
+		.await
+}
+
+/// Compute state through the walk sub-DAG in post-order, so every node's
+/// prevs resolve before it, then combine at the incoming event's own prevs.
+#[implement(super::Service)]
+async fn walk_build(&self, walk: &mut Walk<'_>) -> Result<Option<StateIds>> {
+	let order = take(&mut walk.order);
+	for index in order {
+		self.services.server.check_running()?;
+
+		if !self.walk_node(walk, index).await {
+			return Ok(None);
+		}
+	}
+
+	let top_prevs = take(&mut walk.top_prevs);
+	let state = match top_prevs.as_slice() {
+		| [prev] => self.state_after(walk, prev).await,
+		| _ => self.fork_resolve(walk, &top_prevs, None).await,
+	};
+
+	let Some(state) = state else {
+		return Ok(None);
+	};
+
+	// Mirror fetch_state's canary: the original create event must still be in
+	// the built state.
+	let create_entry = self
+		.services
+		.short
+		.get_shortstatekey(&StateEventType::RoomCreate, "")
+		.await
+		.ok()
+		.and_then(|shortstatekey| state.get(&shortstatekey))
+		.map(AsRef::as_ref);
+
+	if state.is_empty() || create_entry != Some(walk.create_event_id) {
+		walk.fallback = Some(Fallback::CreateMismatch);
+		return Ok(None);
+	}
+
+	walk.resolved.clear();
+
+	let state = Arc::try_unwrap(state).unwrap_or_else(|state| (*state).clone());
+
+	Ok(Some(state))
+}
+
+/// Resolve one held node: state-before from its prevs, its own gated fold on
+/// top, retained until the last consumer releases it.
+#[implement(super::Service)]
+async fn walk_node(&self, walk: &mut Walk<'_>, index: usize) -> bool {
+	let node = &walk.nodes[index];
+	let event_id = node.pdu.event_id().to_owned();
+	let prevs: PrevEvents = node
+		.pdu
+		.prev_events()
+		.map(ToOwned::to_owned)
+		.collect();
+
+	let before = match prevs.as_slice() {
+		| [prev] => self.state_after(walk, prev).await,
+		| _ =>
+			self.fork_resolve(walk, &prevs, Some(&event_id))
+				.await,
+	};
+
+	let Some(before) = before else {
+		return false;
+	};
+
+	let after = match walk.nodes[index].pdu.state_key() {
+		| None => Ok(before),
+		| Some(_) =>
+			self.gated_fold(
+				&walk.room_rules,
+				&mut walk.gate_drops,
+				&walk.nodes[index].pdu,
+				&before,
+			)
+			.await,
+	};
+
+	let after = after.inspect_err(|error| {
+		debug_warn!(event_id = %event_id, %error, "Auth gate could not be evaluated.");
+	});
+
+	let Ok(after) = after else {
+		walk.fallback = Some(Fallback::Unevaluable);
+		return false;
+	};
+
+	if !walk.retain(event_id, after) {
+		return false;
+	}
+
+	walk.release(&prevs);
+
+	true
+}
+
+/// State after one prev: an already-resolved node or materialized frontier
+/// entry shares its map; otherwise the frontier materializes here.
+#[implement(super::Service)]
+async fn state_after(&self, walk: &mut Walk<'_>, event_id: &EventId) -> Option<Arc<StateIds>> {
+	if let Some(state) = walk.resolved.get(event_id) {
+		return Some(state.clone());
+	}
+
+	let state = match walk.class.get(event_id).copied() {
+		| Some(Class::Committed(shortstatehash)) =>
+			self.committed_state_after(walk, event_id, shortstatehash)
+				.await,
+		| Some(Class::Memoized) => self.memoized_state_after(walk, event_id).await,
+		| Some(Class::Held(_)) | None => {
+			debug_assert!(false, "held nodes resolve before their consumers");
+			walk.fallback = Some(Fallback::Error);
+			None
+		},
+	}?;
+
+	walk.retain(event_id.to_owned(), state.clone())
+		.then_some(state)
+}
+
+/// State after a committed frontier event: its stored state plus its own key
+/// folded unguarded, exactly the degree-one builder's shape.
+///
+/// Every event holding a `shorteventid_shortstatehash` row passed spec check 5
+/// (auth against the state at its own position) as a hard reject; soft failure
+/// (spec check 6) still writes the row, so soft-failed events are valid fold
+/// inputs while positionally rejected events never gain a row.
+#[implement(super::Service)]
+async fn committed_state_after(
+	&self,
+	walk: &mut Walk<'_>,
+	event_id: &EventId,
+	shortstatehash: ShortStateHash,
+) -> Option<Arc<StateIds>> {
+	let pdu = self.services.timeline.get_pdu(event_id);
+
+	let state = self
+		.services
+		.state_accessor
+		.state_full_ids_strict(shortstatehash)
+		.try_collect::<StateIds>();
+
+	let (pdu, state) = join(pdu, state).await;
+	let Ok(mut state) = state.inspect_err(|e| {
+		debug_warn!(%event_id, %e, "Failed loading complete committed state.");
+	}) else {
+		walk.fallback = Some(Fallback::Unevaluable);
+		return None;
+	};
+
+	let Ok(pdu) = pdu.inspect_err(|e| {
+		debug_warn!(%event_id, %e, "Failed loading committed event.");
+	}) else {
+		walk.fallback = Some(Fallback::Error);
+		return None;
+	};
+
+	if let Some(state_key) = pdu.state_key() {
+		let event_type = pdu.event_type().to_cow_str().into();
+		let shortstatekey = self
+			.services
+			.short
+			.get_or_create_shortstatekey(&event_type, state_key)
+			.await;
+
+		state.insert(shortstatekey, event_id.to_owned());
+	}
+
+	Some(Arc::new(state))
+}
+
+/// State after a memoized frontier event: the memo row is its complete
+/// state-before, so its own gated fold preserves that guarantee for
+/// descendants.
+#[implement(super::Service)]
+async fn memoized_state_after(
+	&self,
+	walk: &mut Walk<'_>,
+	event_id: &EventId,
+) -> Option<Arc<StateIds>> {
+	walk.memo_hits = walk.memo_hits.saturating_add(1);
+
+	let state = self.cached_resolved_state(event_id);
+
+	let pdu = self
+		.services
+		.timeline
+		.get_pdu(event_id)
+		.inspect_err(|e| debug_warn!(%event_id, %e, "Failed loading memoized event."));
+
+	let (state, pdu) = join(state, pdu).await;
+
+	let state = match state {
+		| Ok(Some(state)) => state,
+		| Ok(None) => {
+			walk.fallback = Some(Fallback::Canary);
+			return None;
+		},
+		| Err(e) => {
+			debug_warn!(%event_id, %e, "Failed loading complete memoized state.");
+			walk.fallback = Some(Fallback::Unevaluable);
+			return None;
+		},
+	};
+
+	let Ok(pdu) = pdu else {
+		walk.fallback = Some(Fallback::Error);
+		return None;
+	};
+
+	let before = Arc::new(state);
+	if pdu.state_key().is_none() {
+		return Some(before);
+	}
+
+	let after = self
+		.gated_fold(&walk.room_rules, &mut walk.gate_drops, &pdu, &before)
+		.await;
+
+	match after {
+		| Ok(after) => Some(after),
+		| Err(error) => {
+			debug_warn!(%event_id, %error, "Memoized auth gate could not be evaluated.");
+			walk.fallback = Some(Fallback::Unevaluable);
+			None
+		},
+	}
+}
+
+/// Fold the event's own state key over its state-before, only when the
+/// position-correct auth gate passes; a rejection leaves state unchanged.
+///
+/// Evaluation failures abort the local walk so federation can rebuild a
+/// complete input state.
+#[implement(super::Service)]
+async fn gated_fold(
+	&self,
+	room_rules: &RoomVersionRules,
+	gate_drops: &mut usize,
+	pdu: &PduEvent,
+	before: &Arc<StateIds>,
+) -> Result<Arc<StateIds>> {
+	let create_shortstatekey = self
+		.services
+		.short
+		.get_shortstatekey(&StateEventType::RoomCreate, "")
+		.await?;
+
+	if !before.contains_key(&create_shortstatekey) {
+		return Err(err!(Database("State before event is missing the room create event.")));
+	}
+
+	let state_fetch = IdMapState { services: &self.services, ids: before };
+
+	if let AuthCheckOutcome::Deny(error) =
+		auth_check(room_rules, pdu, &*self.services.timeline, state_fetch).await?
+	{
+		debug!(event_id = %pdu.event_id(), %error, "Auth gate rejected fold.");
+		*gate_drops = gate_drops.saturating_add(1);
+		return Ok(before.clone());
+	}
+
+	let state_key = pdu.state_key().expect("only state events fold");
+
+	let event_type = pdu.event_type().to_cow_str().into();
+	let shortstatekey = self
+		.services
+		.short
+		.get_or_create_shortstatekey(&event_type, state_key)
+		.await;
+
+	let mut state = StateIds::clone(before);
+	state.insert(shortstatekey, pdu.event_id().to_owned());
+
+	Ok(Arc::new(state))
+}
+
+/// State before a fork node, resolving the state after each of its prevs
+/// exactly as the committed-prev fork resolves today. Fork outputs are the
+/// artifacts worth memoizing; chain nodes are cheap to re-derive.
+#[implement(super::Service)]
+async fn fork_resolve(
+	&self,
+	walk: &mut Walk<'_>,
+	prevs: &[OwnedEventId],
+	memo_event_id: Option<&EventId>,
+) -> Option<Arc<StateIds>> {
+	walk.forks = walk.forks.saturating_add(1);
+
+	// Sequential: materializing a frontier prev writes the walk's accounting.
+	let mut afters = Vec::with_capacity(prevs.len());
+	for prev in prevs {
+		afters.push(self.state_after(walk, prev).await?);
+	}
+
+	let (room_id, room_version) = (walk.room_id, walk.room_version);
+	let fork_states: Result<Vec<_>> = afters
+		.iter()
+		.stream()
+		.wide_then(async |after| {
+			let state = after
+				.iter()
+				.map(|(shortstatekey, event_id)| (*shortstatekey, event_id));
+
+			self.fork_state(state).await
+		})
+		.try_collect()
+		.await;
+
+	let Ok(fork_states) = fork_states.inspect_err(|e| {
+		debug_warn!(%e, "Failed converting complete fork state.");
+	}) else {
+		walk.fallback = Some(Fallback::Unevaluable);
+		return None;
+	};
+
+	let chain_complete = AtomicBool::new(true);
+	let auth_chains = prevs
+		.iter()
+		.zip(&afters)
+		.stream()
+		.wide_then(|(prev_event, after)| {
+			self.fork_chain_strict(
+				room_id,
+				room_version,
+				after.values().map(Borrow::borrow),
+				&chain_complete,
+			)
+			.inspect_err(move |e| {
+				debug_warn!(%prev_event, %e, "Failed loading complete fork auth chain.");
+			})
+		})
+		.ready_filter_map(Result::ok);
+
+	let resolved = self
+		.state_resolution(
+			room_id,
+			room_version,
+			fork_states.into_iter().stream(),
+			auth_chains,
+			Some(&chain_complete),
+		)
+		.await;
+
+	// Only polled chains can affect resolution. Check completeness before using
+	// its result or writing the transitively complete memo.
+	if !chain_complete.load(Ordering::Relaxed) {
+		debug_warn!("Polled fork auth chain was incomplete.");
+		walk.fallback = Some(Fallback::Unevaluable);
+		return None;
+	}
+
+	let Ok(resolved) = resolved else {
+		walk.fallback = Some(Fallback::Error);
+		return None;
+	};
+
+	let state: StateIds = resolved
+		.into_iter()
+		.stream()
+		.broad_then(async |((event_type, state_key), event_id)| {
+			self.services
+				.short
+				.get_or_create_shortstatekey(&event_type, &state_key)
+				.map(move |shortstatekey| (shortstatekey, event_id))
+				.await
+		})
+		.collect()
+		.await;
+
+	if let Some(event_id) = memo_event_id.filter(|_| walk.mode == WalkMode::Active) {
+		// Strict frontier loads and the polled-chain sentinel make this state
+		// transitively complete for later memo consumers.
+		let compressed: Arc<CompressedState> = self
+			.services
+			.state_compressor
+			.compress_state_events(
+				state
+					.iter()
+					.map(|(shortstatekey, event_id)| (shortstatekey, event_id.borrow())),
+			)
+			.collect()
+			.map(Arc::new)
+			.await;
+
+		self.cache_resolved_state(walk.room_id, event_id, compressed)
+			.await;
+	}
+
+	Some(Arc::new(state))
+}
+
+impl<'a> Walk<'a> {
+	fn new(
+		room_id: &'a RoomId,
+		room_version: &'a RoomVersionId,
+		create_event_id: &'a EventId,
+		mode: WalkMode,
+		max_nodes: usize,
+		top_prevs: PrevEvents,
+		attempt: Option<WalkAttempt>,
+	) -> Result<Self> {
+		Ok(Self {
+			room_id,
+			room_version,
+			room_rules: room_version::rules(room_version)?,
+			create_event_id,
+			mode,
+			max_nodes,
+			top_prevs,
+			class: HashMap::new(),
+			nodes: Vec::new(),
+			order: Vec::new(),
+			frontier: HashMap::new(),
+			resolved: HashMap::new(),
+			live_entries: 0,
+			peak_entries: 0,
+			forks: 0,
+			gate_drops: 0,
+			memo_hits: 0,
+			fallback: None,
+			attempt,
+		})
+	}
+
+	fn settle(&mut self, outcome: WalkOutcome) {
+		if let Some(attempt) = self.attempt.take() {
+			attempt.settle(outcome, self.gate_drops);
+		}
+	}
+
+	/// Consumer counts drive state-map reaping: each held node's prevs and
+	/// the incoming event's own prevs each count one consumption.
+	fn count_consumers(&mut self) {
+		let mut held = vec![0_usize; self.nodes.len()];
+
+		let edges = self
+			.nodes
+			.iter()
+			.flat_map(|node| node.pdu.prev_events())
+			.chain(self.top_prevs.iter().map(AsRef::as_ref));
+
+		for prev in edges {
+			match self.class.get(prev).copied() {
+				| Some(Class::Held(index)) => held[index] = held[index].saturating_add(1),
+				| Some(_) => {
+					let consumers = self.frontier.entry(prev.to_owned()).or_default();
+
+					*consumers = consumers.saturating_add(1);
+				},
+				| None => debug_assert!(false, "every walk edge is classified"),
+			}
+		}
+
+		for (node, consumers) in self.nodes.iter_mut().zip(held) {
+			node.consumers = consumers;
+		}
+	}
+
+	/// Retain a computed state map until its last consumer releases it; the
+	/// running live-entry total is the walk's memory ceiling. Arc-shared maps
+	/// count once per holder, deliberately over-counting toward the ceiling.
+	fn retain(&mut self, event_id: OwnedEventId, state: Arc<StateIds>) -> bool {
+		let live_entries = self.live_entries.saturating_add(state.len());
+		if live_entries > MAX_LIVE_ENTRIES {
+			self.fallback = Some(Fallback::Entries);
+			return false;
+		}
+
+		self.live_entries = live_entries;
+		self.peak_entries = self.peak_entries.max(live_entries);
+		self.resolved.insert(event_id, state);
+
+		true
+	}
+
+	/// Release one consumption of each prev, dropping maps no consumer
+	/// awaits.
+	fn release(&mut self, prevs: &[OwnedEventId]) {
+		for prev in prevs {
+			let remaining = match self.class.get(prev).copied() {
+				| Some(Class::Held(index)) => {
+					let node = &mut self.nodes[index];
+					node.consumers = node.consumers.saturating_sub(1);
+					node.consumers
+				},
+				| _ => {
+					let Some(consumers) = self.frontier.get_mut(prev) else {
+						continue;
+					};
+
+					*consumers = consumers.saturating_sub(1);
+					*consumers
+				},
+			};
+
+			if remaining == 0
+				&& let Some(state) = self.resolved.remove(prev)
+			{
+				self.live_entries = self.live_entries.saturating_sub(state.len());
+			}
+		}
+	}
+}
+
+impl Drop for Walk<'_> {
+	fn drop(&mut self) { self.settle(WalkOutcome::Failure); }
+}
+
+impl Fallback {
+	fn name(self) -> &'static str {
+		match self {
+			| Self::Absent => "absent",
+			| Self::Ceiling => "ceiling",
+			| Self::AuthMissing => "auth_missing",
+			| Self::AllCommitted => "all_committed",
+			| Self::Entries => "entries",
+			| Self::Canary => "canary",
+			| Self::CreateMismatch => "create_mismatch",
+			| Self::Unevaluable => "unevaluable",
+			| Self::Error => "error",
+		}
+	}
+}

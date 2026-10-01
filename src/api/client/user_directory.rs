@@ -59,7 +59,7 @@ pub(crate) async fn search_users_route(
 				return None;
 			}
 
-			let display_name = services.users.displayname(&user_id).await.ok();
+			let display_name = services.profile.displayname(&user_id).await.ok();
 
 			should_show_user(
 				&services,
@@ -73,7 +73,7 @@ pub(crate) async fn search_users_route(
 			.then_async(async || search_users::v3::User {
 				user_id: user_id.clone(),
 				display_name,
-				avatar_url: services.users.avatar_url(&user_id).await.ok(),
+				avatar_url: services.profile.avatar_url(&user_id).await.ok(),
 			})
 			.await
 		});
@@ -93,10 +93,7 @@ async fn should_show_user(
 	search_term: &str,
 	skip_visibility_check: bool,
 ) -> bool {
-	let user_id_matches = target_user
-		.as_str()
-		.to_lowercase()
-		.contains(search_term);
+	let user_id_matches = target_user.as_str().to_lowercase().contains(search_term);
 
 	let display_name_matches = target_display_name
 		.map(str::to_lowercase)

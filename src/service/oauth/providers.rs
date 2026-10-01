@@ -6,7 +6,7 @@ pub use tuwunel_core::config::IdentityProvider as Provider;
 use tuwunel_core::{Err, Result, debug, debug::INFO_SPAN_LEVEL, err, implement};
 use url::Url;
 
-use crate::SelfServices;
+use crate::{SelfServices, client::read_response_capped};
 
 /// Discovered providers
 #[derive(Default)]
@@ -69,11 +69,11 @@ pub fn get_config(&self, id: &str) -> Result<Provider> {
 
 	if let Some(provider) = providers
 		.values()
-		.find(|config| config.brand == id.to_lowercase())
+		.find(|config| config.brand.eq_ignore_ascii_case(id))
 		.filter(|_| {
 			providers
 				.values()
-				.filter(|config| config.brand == id.to_lowercase())
+				.filter(|config| config.brand.eq_ignore_ascii_case(id))
 				.count()
 				.eq(&1)
 		})
@@ -83,6 +83,26 @@ pub fn get_config(&self, id: &str) -> Result<Provider> {
 	}
 
 	Err!(Request(NotFound("Unrecognized Identity Provider")))
+}
+
+/// Get the ID of the provider considered "default" as selected by the admin or
+/// by fallback.
+#[implement(Providers)]
+pub fn get_default_id(&self) -> Option<String> {
+	self.services
+		.config
+		.identity_provider
+		.values()
+		.find(|idp| idp.default)
+		.or_else(|| {
+			self.services
+				.config
+				.identity_provider
+				.values()
+				.next()
+		})
+		.map(Provider::id)
+		.map(ToOwned::to_owned)
 }
 
 /// Get the discovered provider from the runtime cache. ID may be client_id or
@@ -97,11 +117,11 @@ async fn get_cached(&self, id: &str) -> Option<Provider> {
 
 	providers
 		.values()
-		.find(|provider| provider.brand == id.to_lowercase())
+		.find(|provider| provider.brand.eq_ignore_ascii_case(id))
 		.filter(|_| {
 			providers
 				.values()
-				.filter(|provider| provider.brand == id.to_lowercase())
+				.filter(|provider| provider.brand.eq_ignore_ascii_case(id))
 				.count()
 				.eq(&1)
 		})
@@ -127,18 +147,16 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 		_ = provider
 			.issuer_url
 			.replace(match provider.brand.as_str() {
-				| "github" => "https://github.com".try_into()?,
+				| "github" => "https://github.com/login/oauth".try_into()?,
 				| "gitlab" => "https://gitlab.com".try_into()?,
 				| "google" => "https://accounts.google.com".try_into()?,
 				| _ => return Err!(Config("issuer_url", "Required for this provider.")),
 			});
 	}
 
-	if provider.base_path.is_none() {
-		provider.base_path = match provider.brand.as_str() {
-			| "github" => Some("/login/oauth".to_owned()),
-			| _ => None,
-		};
+	// MAS rejects `profile`; its userinfo returns only `sub` and `username`.
+	if provider.scope.is_empty() && provider.brand == "mas" {
+		provider.scope = ["openid".to_owned()].into();
 	}
 
 	let response = self
@@ -157,7 +175,7 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 			.and_then(JsonValue::as_str)
 			.map(Url::parse)
 			.transpose()?
-			.or_else(|| make_url(&provider, "/authorize").ok())
+			.or_else(|| make_url(&provider, "authorize").ok())
 			.map(|url| provider.authorization_url.replace(url));
 	}
 
@@ -167,7 +185,7 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 			.and_then(JsonValue::as_str)
 			.map(Url::parse)
 			.transpose()?
-			.or_else(|| make_url(&provider, "/revocation").ok())
+			.or_else(|| make_url(&provider, "revocation").ok())
 			.map(|url| provider.revocation_url.replace(url));
 	}
 
@@ -177,7 +195,7 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 			.and_then(JsonValue::as_str)
 			.map(Url::parse)
 			.transpose()?
-			.or_else(|| make_url(&provider, "/introspection").ok())
+			.or_else(|| make_url(&provider, "introspection").ok())
 			.map(|url| provider.introspection_url.replace(url));
 	}
 
@@ -189,7 +207,7 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 			.transpose()?
 			.or_else(|| match provider.brand.as_str() {
 				| "github" => "https://api.github.com/user".try_into().ok(),
-				| _ => make_url(&provider, "/userinfo").ok(),
+				| _ => make_url(&provider, "userinfo").ok(),
 			})
 			.map(|url| provider.userinfo_url.replace(url));
 	}
@@ -202,14 +220,23 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 			.transpose()?
 			.or_else(|| {
 				let path = if provider.brand == "github" {
-					"/access_token"
+					"access_token"
 				} else {
-					"/token"
+					"token"
 				};
 
 				make_url(&provider, path).ok()
 			})
 			.map(|url| provider.token_url.replace(url));
+	}
+
+	if provider.callback_url.is_none()
+		&& let Some(server_url) = self.services.config.well_known.client.as_ref()
+	{
+		let callback_path =
+			format!("_matrix/client/unstable/login/sso/callback/{}", provider.client_id);
+
+		provider.callback_url = Some(server_url.join(&callback_path)?);
 	}
 
 	Ok(provider)
@@ -220,16 +247,19 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 #[implement(Providers)]
 #[tracing::instrument(level = "debug", ret(level = "trace"), skip(self))]
 pub async fn discover(&self, provider: &Provider) -> Result<JsonValue> {
-	self.services
+	let limit = self.services.config.max_response_size;
+	let response = self
+		.services
 		.client
 		.oauth
 		.get(discovery_url(provider)?)
 		.send()
 		.await?
-		.error_for_status()?
-		.json()
-		.await
-		.map_err(Into::into)
+		.error_for_status()?;
+
+	let body = read_response_capped(response, limit).await?;
+
+	serde_json::from_slice(&body).map_err(Into::into)
 }
 
 /// Compute the location of the `/.well-known/openid-configuration` based on the
@@ -237,7 +267,7 @@ pub async fn discover(&self, provider: &Provider) -> Result<JsonValue> {
 fn discovery_url(provider: &Provider) -> Result<Url> {
 	let default_url = provider
 		.discovery
-		.then(|| make_url(provider, "/.well-known/openid-configuration"))
+		.then(|| make_url(provider, ".well-known/openid-configuration"))
 		.transpose()?;
 
 	let Some(url) = provider
@@ -288,14 +318,17 @@ fn make_url(provider: &Provider, path: &str) -> Result<Url> {
 	let mut suffix = provider.base_path.clone().unwrap_or_default();
 
 	suffix.push_str(path);
-	let url = provider
-		.issuer_url
-		.as_ref()
-		.ok_or_else(|| {
-			let id = &provider.client_id;
-			err!(Config("issuer_url", "Provider {id:?} required field"))
-		})?
-		.join(&suffix)?;
+	let issuer = provider.issuer_url.as_ref().ok_or_else(|| {
+		let id = &provider.client_id;
+		err!(Config("issuer_url", "Provider {id:?} required field"))
+	})?;
+	let issuer_path = issuer.path();
 
-	Ok(url)
+	if issuer_path.ends_with('/') {
+		Ok(issuer.join(suffix.as_str())?)
+	} else {
+		let mut url = issuer.to_owned();
+		url.set_path(&format!("{issuer_path}/"));
+		Ok(url.join(&suffix)?)
+	}
 }

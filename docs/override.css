@@ -1,0 +1,15 @@
+:root {
+	--content-max-width: 100%;
+}
+
+body {
+    margin: 1%;
+}
+
+.content main {
+	margin: 1% 4% 1% 4%;
+}
+
+.content table {
+	float: left;
+}

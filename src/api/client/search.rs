@@ -1,12 +1,15 @@
 use std::collections::BTreeMap;
 
 use axum::{extract::State, http::Uri};
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future::join};
 use ruma::{
 	OwnedRoomId, RoomId, UInt, UserId,
 	api::client::search::search_events::{
 		self,
-		v3::{Criteria, EventContextResult, ResultCategories, ResultRoomEvents, SearchResult},
+		v3::{
+			Criteria, EventContext, EventContextResult, ResultCategories, ResultRoomEvents,
+			SearchResult,
+		},
 	},
 	events::AnyStateEvent,
 	serde::Raw,
@@ -15,22 +18,26 @@ use search_events::v3::{Request, Response};
 use tuwunel_core::{
 	Err, Result, at, is_true,
 	matrix::Event,
-	result::FlatOk,
 	utils::{
 		IterStream,
+		math::usize_from_ruma_bounded,
 		option::OptionExt,
-		stream::{BroadbandExt, ReadyExt},
+		stream::{BroadbandExt, ReadyExt, TryIgnore, WidebandExt},
 	},
 };
-use tuwunel_service::{Services, rooms::search::RoomQuery};
+use tuwunel_service::{
+	Services,
+	rooms::{search::RoomQuery, timeline::PdusIterItem},
+};
 
-use crate::Ruma;
+use crate::{Ruma, client::message::visibility_filter};
 
 type RoomStates = BTreeMap<OwnedRoomId, RoomState>;
 type RoomState = Vec<Raw<AnyStateEvent>>;
 
 const LIMIT_DEFAULT: usize = 10;
 const LIMIT_MAX: usize = 100;
+const CONTEXT_MAX: usize = 20;
 const BATCH_MAX: usize = 20;
 
 /// # `POST /_matrix/client/r0/search`
@@ -87,12 +94,9 @@ async fn category_room_events(
 ) -> Result<ResultRoomEvents> {
 	let filter = &criteria.filter;
 
-	let limit: usize = filter
-		.limit
-		.map(TryInto::try_into)
-		.flat_ok()
-		.unwrap_or(LIMIT_DEFAULT)
-		.min(LIMIT_MAX);
+	let limit = filter.limit.map_or(LIMIT_DEFAULT, |limit| {
+		usize_from_ruma_bounded(limit, LIMIT_DEFAULT, LIMIT_MAX)
+	});
 
 	let next_batch: usize = next_batch
 		.map(str::parse)
@@ -179,17 +183,20 @@ async fn category_room_events(
 		.map(at!(2))
 		.flatten()
 		.stream()
-		.map(Event::into_format)
-		.map(|result| SearchResult {
-			rank: None,
-			result: Some(result),
-			context: EventContextResult {
-				profile_info: BTreeMap::new(), //TODO
-				events_after: Vec::new(),      //TODO
-				events_before: Vec::new(),     //TODO
-				start: None,                   //TODO
-				end: None,                     //TODO
-			},
+		.map(Event::into_pdu)
+		.wide_then(async |pdu| {
+			let context = event_context(services, sender_user, &pdu, &criteria.event_context).await;
+
+			let pdu = services
+				.pdu_metadata
+				.bundle_aggregations(sender_user, pdu)
+				.await;
+
+			SearchResult {
+				rank: None,
+				result: Some(pdu.into_format()),
+				context,
+			}
 		})
 		.collect()
 		.await;
@@ -211,8 +218,110 @@ async fn category_room_events(
 		results,
 		state,
 		highlights,
-		groups: BTreeMap::new(), // TODO
+		groups: Default::default(), // TODO
 	})
+}
+
+async fn event_context<E>(
+	services: &Services,
+	sender_user: &UserId,
+	pdu: &E,
+	event_context: &EventContext,
+) -> EventContextResult
+where
+	E: Event,
+{
+	// An absent event_context deserializes to the default 5/5; treat that as no
+	// request.
+	if event_context.is_default() {
+		return EventContextResult::default();
+	}
+
+	let Ok(base_count) = services.timeline.get_pdu_count(pdu.event_id()).await else {
+		return EventContextResult::default();
+	};
+
+	let room_id = pdu.room_id();
+	let before_limit = usize_from_ruma_bounded(event_context.before_limit, 0, CONTEXT_MAX);
+	let after_limit = usize_from_ruma_bounded(event_context.after_limit, 0, CONTEXT_MAX);
+
+	let events_before = collect_context_half(
+		services,
+		services
+			.timeline
+			.pdus_rev(Some(sender_user), room_id, Some(base_count)),
+		sender_user,
+		before_limit,
+	);
+
+	let events_after = collect_context_half(
+		services,
+		services
+			.timeline
+			.pdus(Some(sender_user), room_id, Some(base_count)),
+		sender_user,
+		after_limit,
+	);
+
+	let (events_before, events_after) = join(events_before, events_after).await;
+
+	let start = events_before
+		.last()
+		.map(at!(0))
+		.or(Some(base_count))
+		.as_ref()
+		.map(ToString::to_string);
+
+	let end = events_after
+		.last()
+		.map(at!(0))
+		.or_else(|| Some(base_count.saturating_add(1)))
+		.as_ref()
+		.map(ToString::to_string);
+
+	let events_before = events_before
+		.into_iter()
+		.map(at!(1))
+		.map(Event::into_format)
+		.collect();
+
+	let events_after = events_after
+		.into_iter()
+		.map(at!(1))
+		.map(Event::into_format)
+		.collect();
+
+	EventContextResult {
+		start,
+		end,
+		events_before,
+		events_after,
+		profile_info: BTreeMap::new(),
+	}
+}
+
+async fn collect_context_half<'a, S>(
+	services: &'a Services,
+	pdus: S,
+	sender_user: &'a UserId,
+	take: usize,
+) -> Vec<PdusIterItem>
+where
+	S: Stream<Item = Result<PdusIterItem>> + Send + 'a,
+{
+	pdus.ignore_err()
+		.wide_filter_map(|item| visibility_filter(services, item, sender_user))
+		.take(take)
+		.wide_then(async |(count, pdu)| {
+			let pdu = services
+				.pdu_metadata
+				.bundle_aggregations(sender_user, pdu)
+				.await;
+
+			(count, pdu)
+		})
+		.collect()
+		.await
 }
 
 async fn procure_room_state(services: &Services, room_id: &RoomId) -> Result<RoomState> {
@@ -235,11 +344,7 @@ async fn check_room_visible(
 	let check_visible = search.filter.rooms.is_some();
 	let check_state = check_visible && search.include_state.is_some_and(is_true!());
 
-	let is_joined = !check_visible
-		|| services
-			.state_cache
-			.is_joined(user_id, room_id)
-			.await;
+	let is_joined = !check_visible || services.state_cache.is_joined(user_id, room_id).await;
 
 	let state_visible = !check_state
 		|| services
@@ -248,7 +353,9 @@ async fn check_room_visible(
 			.await;
 
 	if !is_joined || !state_visible {
-		return Err!(Request(Forbidden("You don't have permission to view {room_id:?}")));
+		return Err!(Request(Forbidden(
+			"You don't have permission to view {room_id:?}"
+		)));
 	}
 
 	Ok(())

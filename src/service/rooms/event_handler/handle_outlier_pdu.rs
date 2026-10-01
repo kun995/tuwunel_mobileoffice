@@ -3,17 +3,23 @@ use ruma::{
 	CanonicalJsonObject, EventId, RoomId, RoomVersionId, ServerName, events::TimelineEventType,
 };
 use tuwunel_core::{
-	Err, Result, debug, debug_info, err, implement,
+	Err, Result, debug, debug_info, implement,
 	matrix::{Event, PduEvent, event::TypeExt, room_version},
-	pdu::format::from_incoming_federation,
-	ref_at, state_res, trace,
-	utils::{future::TryExtExt, stream::IterStream},
+	trace,
+	utils::{ReadyExt, future::TryExtExt, stream::IterStream},
 	warn,
 };
 
-use super::check_room_id;
+use crate::rooms::state_res::auth_check;
 
 #[implement(super::Service)]
+#[cfg_attr(unabridged, tracing::instrument(
+    name = "outlier",
+    level = "debug",
+    skip_all,
+    fields(lev = %recursion_level)
+))]
+#[expect(clippy::too_many_arguments)]
 pub(super) async fn handle_outlier_pdu(
 	&self,
 	origin: &ServerName,
@@ -21,9 +27,10 @@ pub(super) async fn handle_outlier_pdu(
 	event_id: &EventId,
 	mut pdu_json: CanonicalJsonObject,
 	room_version: &RoomVersionId,
+	recursion_level: usize,
 	auth_events_known: bool,
 ) -> Result<(PduEvent, CanonicalJsonObject)> {
-	debug!(?event_id, ?auth_events_known, "handle outlier");
+	debug!(?event_id, ?auth_events_known, %recursion_level, "handle outlier");
 
 	// 1. Remove unsigned field
 	pdu_json.remove("unsigned");
@@ -32,7 +39,7 @@ pub(super) async fn handle_outlier_pdu(
 	// anywhere?: https://matrix.org/docs/spec/rooms/v6#canonical-json
 	// 2. Check signatures, otherwise drop
 	// 3. check content hash, redact if doesn't match
-	let mut pdu_json = match self
+	let pdu_json = match self
 		.services
 		.server_keys
 		.verify_event(&pdu_json, Some(room_version))
@@ -48,7 +55,8 @@ pub(super) async fn handle_outlier_pdu(
 				)));
 			};
 
-			let Ok(obj) = ruma::canonical_json::redact(pdu_json, &rules.redaction, None) else {
+			let Ok(pdu_json) = ruma::canonical_json::redact(pdu_json, &rules.redaction, None)
+			else {
 				return Err!(Request(InvalidParam("Redaction failed")));
 			};
 
@@ -59,7 +67,7 @@ pub(super) async fn handle_outlier_pdu(
 				)));
 			}
 
-			obj
+			pdu_json
 		},
 		| Err(e) => {
 			return Err!(Request(InvalidParam(debug_error!(
@@ -68,15 +76,11 @@ pub(super) async fn handle_outlier_pdu(
 		},
 	};
 
-	let room_rules = room_version::rules(room_version)?;
-
-	state_res::check_pdu_format(&pdu_json, &room_rules.event_format)?;
-
 	// Now that we have checked the signature and hashes we can make mutations and
 	// convert to our PduEvent type.
-	let event = from_incoming_federation(room_id, event_id, &mut pdu_json, &room_rules)?;
-
-	check_room_id(room_id, &event)?;
+	let room_rules = room_version::rules(room_version)?;
+	let (event, pdu_json) =
+		PduEvent::from_object_federation(room_id, event_id, pdu_json, &room_rules)?;
 
 	if !auth_events_known {
 		// 4. fetch any missing auth events doing all checks listed here starting at 1.
@@ -85,7 +89,15 @@ pub(super) async fn handle_outlier_pdu(
 		//    the auth events are also rejected "due to auth events"
 		// NOTE: Step 5 is not applied anymore because it failed too often
 		debug!("Fetching auth events");
-		Box::pin(self.fetch_auth(origin, room_id, event.auth_events(), room_version)).await;
+		// size firewall
+		Box::pin(self.fetch_auth(
+			origin,
+			room_id,
+			event.auth_events(),
+			room_version,
+			recursion_level,
+		))
+		.await;
 	}
 
 	// 6. Reject "due to auth events" if the event doesn't pass auth based on the
@@ -103,40 +115,27 @@ pub(super) async fn handle_outlier_pdu(
 
 	let auth_events: Vec<_> = event
 		.auth_events()
-		.chain(hydra_create_id.as_deref().into_iter())
+		.chain(hydra_create_id.as_deref())
 		.stream()
 		.filter_map(|auth_event_id| {
 			self.event_fetch(auth_event_id)
 				.inspect_err(move |e| warn!("Missing auth_event {auth_event_id}: {e}"))
 				.ok()
 		})
-		.map(|auth_event| {
+		.ready_filter_map(|auth_event| {
+			let state_key = auth_event.state_key()?;
 			let event_type = auth_event.event_type();
-			let state_key = auth_event
-				.state_key()
-				.expect("all auth events have state_key");
 
-			(event_type.with_state_key(state_key), auth_event)
+			Some((event_type.with_state_key(state_key), auth_event))
 		})
 		.collect()
 		.await;
 
-	state_res::auth_check(
-		&room_rules,
-		&event,
-		&async |event_id| self.event_fetch(&event_id).await,
-		&async |event_type, state_key| {
-			let target = event_type.with_state_key(state_key);
-			auth_events
-				.iter()
-				.find(|(type_state_key, _)| *type_state_key == target)
-				.map(ref_at!(1))
-				.cloned()
-				.ok_or_else(|| err!(Request(NotFound("state not found"))))
-		},
-	)
-	.inspect_ok(|()| trace!("Validation successful."))
-	.await?;
+	auth_check(&room_rules, &event, &*self.services.timeline, auth_events.as_slice())
+		.await?
+		.into_result()?;
+
+	trace!("Validation successful.");
 
 	// 7. Persist the event as an outlier.
 	self.services

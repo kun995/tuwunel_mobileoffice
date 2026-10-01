@@ -2,69 +2,96 @@ use std::{fmt::Debug, time::Duration};
 
 use http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, HeaderValue};
 use ruma::{
-	Mxc, ServerName, UserId,
+	Mxc, ServerName,
 	api::{
 		OutgoingRequest,
-		client::{
-			error::ErrorKind::{NotFound, Unrecognized},
-			media,
-		},
+		client::media,
+		error::ErrorKind::{NotFound, Unrecognized},
 		federation,
 		federation::authenticated_media::{Content, FileOrLocation},
 	},
+	http_headers::ContentDisposition,
 };
 use tuwunel_core::{
 	Err, Error, Result, debug_warn, err, implement,
 	utils::content_disposition::make_content_disposition,
 };
+use url::Url;
 
-use super::{Dim, FileMeta};
+use super::{Animate, Dim, Fetched, Media, preview::Agent, thumbnail::sequence};
+use crate::{
+	client::read_response_capped,
+	federation::scheme::{FedAuth, FedPath},
+};
 
+/// Which client fetches a media location, and as whom.
+///
+/// The client and the agent are not independent, so they travel together:
+/// only preview media carries a configured agent, and only the extern client
+/// serves federation and remote-media downloads.
+pub(super) enum Fetch {
+	Extern,
+	Preview(Agent),
+}
+
+/// Fetches a thumbnail at this dimension from the origin server.
+///
+/// The authenticated endpoint is asked first, falling back to the legacy one
+/// only where the peer answers no such media and this server is configured to
+/// ask. What the walk filing the answer settled travels back with it, so a
+/// caller deciding whether the picture may be served reads no bytes again.
 #[implement(super::Service)]
+#[tracing::instrument(level = "debug", skip(self))]
 pub async fn fetch_remote_thumbnail(
 	&self,
 	mxc: &Mxc<'_>,
-	user: Option<&UserId>,
 	server: Option<&ServerName>,
 	timeout_ms: Duration,
 	dim: &Dim,
-) -> Result<FileMeta> {
+	animate: Animate,
+) -> Result<Fetched> {
 	self.check_fetch_authorized(mxc)?;
 
 	let result = self
-		.fetch_thumbnail_authenticated(mxc, user, server, timeout_ms, dim)
+		.fetch_thumbnail_authenticated(mxc, server, timeout_ms, dim, animate)
 		.await;
 
 	if let Err(Error::Request(NotFound, ..)) = &result
 		&& self.services.server.config.request_legacy_media
 	{
 		return self
-			.fetch_thumbnail_unauthenticated(mxc, user, server, timeout_ms, dim)
+			.fetch_thumbnail_unauthenticated(mxc, server, timeout_ms, dim, animate)
 			.await;
 	}
 
 	result
 }
 
+/// Fetches the original file from the origin server.
+///
+/// The authenticated endpoint is asked first, falling back to the legacy one
+/// only where the peer answers no such media and this server is configured to
+/// ask. What the walk filing the answer settled travels back with it, so a
+/// caller deciding whether the picture may be served reads no bytes again.
 #[implement(super::Service)]
+#[tracing::instrument(level = "debug", skip(self))]
 pub async fn fetch_remote_content(
 	&self,
 	mxc: &Mxc<'_>,
-	user: Option<&UserId>,
 	server: Option<&ServerName>,
 	timeout_ms: Duration,
-) -> Result<FileMeta> {
+) -> Result<Fetched> {
 	self.check_fetch_authorized(mxc)?;
 
 	let result = self
-		.fetch_content_authenticated(mxc, user, server, timeout_ms)
+		.fetch_content_authenticated(mxc, server, timeout_ms)
 		.await;
 
 	if let Err(Error::Request(NotFound, ..)) = &result
 		&& self.services.server.config.request_legacy_media
 	{
 		return self
-			.fetch_content_unauthenticated(mxc, user, server, timeout_ms)
+			.fetch_content_unauthenticated(mxc, server, timeout_ms)
 			.await;
 	}
 
@@ -75,11 +102,11 @@ pub async fn fetch_remote_content(
 async fn fetch_thumbnail_authenticated(
 	&self,
 	mxc: &Mxc<'_>,
-	user: Option<&UserId>,
 	server: Option<&ServerName>,
 	timeout_ms: Duration,
 	dim: &Dim,
-) -> Result<FileMeta> {
+	animate: Animate,
+) -> Result<Fetched> {
 	use federation::authenticated_media::get_content_thumbnail::v1::{Request, Response};
 
 	let request = Request {
@@ -87,19 +114,19 @@ async fn fetch_thumbnail_authenticated(
 		method: dim.method.clone().into(),
 		width: dim.width.into(),
 		height: dim.height.into(),
-		animated: true.into(),
+		animated: animate.into(),
 		timeout_ms,
 	};
 
 	let Response { content, .. } = self
-		.federation_request(mxc, user, server, request)
+		.federation_request(mxc, server, request)
 		.await?;
 
 	match content {
 		| FileOrLocation::File(content) =>
-			self.handle_thumbnail_file(mxc, user, dim, content)
+			self.handle_thumbnail_file(mxc, dim, content)
 				.await,
-		| FileOrLocation::Location(location) => self.handle_location(mxc, user, &location).await,
+		| FileOrLocation::Location(location) => self.handle_location(mxc, &location).await,
 	}
 }
 
@@ -107,10 +134,9 @@ async fn fetch_thumbnail_authenticated(
 async fn fetch_content_authenticated(
 	&self,
 	mxc: &Mxc<'_>,
-	user: Option<&UserId>,
 	server: Option<&ServerName>,
 	timeout_ms: Duration,
-) -> Result<FileMeta> {
+) -> Result<Fetched> {
 	use federation::authenticated_media::get_content::v1::{Request, Response};
 
 	let request = Request {
@@ -119,12 +145,12 @@ async fn fetch_content_authenticated(
 	};
 
 	let Response { content, .. } = self
-		.federation_request(mxc, user, server, request)
+		.federation_request(mxc, server, request)
 		.await?;
 
 	match content {
-		| FileOrLocation::File(content) => self.handle_content_file(mxc, user, content).await,
-		| FileOrLocation::Location(location) => self.handle_location(mxc, user, &location).await,
+		| FileOrLocation::File(content) => self.handle_content_file(mxc, content).await,
+		| FileOrLocation::Location(location) => self.handle_location(mxc, &location).await,
 	}
 }
 
@@ -133,17 +159,17 @@ async fn fetch_content_authenticated(
 async fn fetch_thumbnail_unauthenticated(
 	&self,
 	mxc: &Mxc<'_>,
-	user: Option<&UserId>,
 	server: Option<&ServerName>,
 	timeout_ms: Duration,
 	dim: &Dim,
-) -> Result<FileMeta> {
+	animate: Animate,
+) -> Result<Fetched> {
 	use media::get_content_thumbnail::v3::{Request, Response};
 
 	let request = Request {
 		allow_remote: true,
 		allow_redirect: true,
-		animated: true.into(),
+		animated: animate.into(),
 		method: dim.method.clone().into(),
 		width: dim.width.into(),
 		height: dim.height.into(),
@@ -155,12 +181,12 @@ async fn fetch_thumbnail_unauthenticated(
 	let Response {
 		file, content_type, content_disposition, ..
 	} = self
-		.federation_request(mxc, user, server, request)
+		.federation_request(mxc, server, request)
 		.await?;
 
 	let content = Content { file, content_type, content_disposition };
 
-	self.handle_thumbnail_file(mxc, user, dim, content)
+	self.handle_thumbnail_file(mxc, dim, content)
 		.await
 }
 
@@ -169,10 +195,9 @@ async fn fetch_thumbnail_unauthenticated(
 async fn fetch_content_unauthenticated(
 	&self,
 	mxc: &Mxc<'_>,
-	user: Option<&UserId>,
 	server: Option<&ServerName>,
 	timeout_ms: Duration,
-) -> Result<FileMeta> {
+) -> Result<Fetched> {
 	use media::get_content::v3::{Request, Response};
 
 	let request = Request {
@@ -186,97 +211,142 @@ async fn fetch_content_unauthenticated(
 	let Response {
 		file, content_type, content_disposition, ..
 	} = self
-		.federation_request(mxc, user, server, request)
+		.federation_request(mxc, server, request)
 		.await?;
 
 	let content = Content { file, content_type, content_disposition };
 
-	self.handle_content_file(mxc, user, content).await
+	self.handle_content_file(mxc, content).await
 }
 
 #[implement(super::Service)]
 async fn handle_thumbnail_file(
 	&self,
 	mxc: &Mxc<'_>,
-	user: Option<&UserId>,
 	dim: &Dim,
 	content: Content,
-) -> Result<FileMeta> {
+) -> Result<Fetched> {
 	let content_disposition = make_content_disposition(
 		content.content_disposition.as_ref(),
 		content.content_type.as_deref(),
 		None,
 	);
 
-	self.upload_thumbnail(
-		mxc,
-		user,
-		Some(&content_disposition),
-		content.content_type.as_deref(),
-		dim,
-		&content.file,
-	)
-	.await
-	.map(|()| FileMeta {
-		content: Some(content.file),
-		content_type: content.content_type.map(Into::into),
-		content_disposition: Some(content_disposition),
-	})
+	let walk = sequence(&content.file);
+	let content_type = walk.stored_type(content.content_type.as_deref());
+
+	self.upload_thumbnail(mxc, Some(&content_disposition), content_type, dim, &content.file)
+		.await?;
+
+	let animates = Some(walk.animates());
+	let media = fetched_media(content, content_disposition);
+
+	Ok(Fetched { media, animates })
 }
 
 #[implement(super::Service)]
-async fn handle_content_file(
-	&self,
-	mxc: &Mxc<'_>,
-	user: Option<&UserId>,
-	content: Content,
-) -> Result<FileMeta> {
+async fn handle_content_file(&self, mxc: &Mxc<'_>, content: Content) -> Result<Fetched> {
 	let content_disposition = make_content_disposition(
 		content.content_disposition.as_ref(),
 		content.content_type.as_deref(),
 		None,
 	);
 
-	self.create(
-		mxc,
-		user,
-		Some(&content_disposition),
-		content.content_type.as_deref(),
-		&content.file,
-	)
-	.await
-	.map(|()| FileMeta {
-		content: Some(content.file),
-		content_type: content.content_type.map(Into::into),
-		content_disposition: Some(content_disposition),
-	})
+	let animates = self
+		.create(
+			mxc,
+			None,
+			Some(&content_disposition),
+			content.content_type.as_deref(),
+			&content.file,
+		)
+		.await
+		.map(Some)?;
+
+	let media = fetched_media(content, content_disposition);
+
+	Ok(Fetched { media, animates })
 }
 
 #[implement(super::Service)]
-async fn handle_location(
-	&self,
-	mxc: &Mxc<'_>,
-	user: Option<&UserId>,
-	location: &str,
-) -> Result<FileMeta> {
-	self.location_request(location)
+async fn handle_location(&self, mxc: &Mxc<'_>, location: &str) -> Result<Fetched> {
+	let limit = self.services.server.config.max_response_size;
+
+	let media = self
+		.location_request(Fetch::Extern, location, limit)
 		.await
 		.map_err(|error| {
 			err!(Request(NotFound(
-				debug_warn!(%mxc, ?user, ?location, ?error, "Fetching media from location failed")
+				debug_warn!(%mxc, ?location, ?error, "Fetching media from location failed")
 			)))
-		})
+		})?;
+
+	// nothing files a redirected object, so no walk of it has happened and the
+	// one caller that asks pays for its own
+	Ok(Fetched { media, animates: None })
+}
+
+/// Assembles what a peer answered into media under the disposition it was
+/// filed with.
+///
+/// The type reported is the one the peer declared, where the row it was filed
+/// under carries whatever its own container named instead.
+fn fetched_media(content: Content, content_disposition: ContentDisposition) -> Media {
+	Media {
+		content: content.file,
+		content_type: content.content_type.map(Into::into),
+		content_disposition: Some(content_disposition),
+	}
 }
 
 #[implement(super::Service)]
-async fn location_request(&self, location: &str) -> Result<FileMeta> {
-	let response = self
+pub(super) async fn location_request(
+	&self,
+	fetch: Fetch,
+	location: &str,
+	limit: usize,
+) -> Result<Media> {
+	let url = Url::parse(location)
+		.map_err(|e| err!(Request(Unknown("Invalid media location URL: {e}"))))?;
+
+	self.check_url_host(&url)?;
+
+	let request = match fetch {
+		| Fetch::Extern => self
+			.services
+			.client
+			.extern_media
+			.get(url.as_str()),
+		| Fetch::Preview(agent) => {
+			let request = self.services.client.url_preview.get(url.as_str());
+
+			self.preview_headers(request, &url, agent)
+		},
+	};
+
+	let response = request.send().await?;
+
+	// a missing peer address cannot be screened, so fail closed
+	let Some(remote_addr) = response.remote_addr() else {
+		return Err!(Request(Forbidden("Media response has no peer address")));
+	};
+
+	if !self
 		.services
 		.client
-		.extern_media
-		.get(location)
-		.send()
-		.await?;
+		.valid_cidr_range_remote_addr(response.url(), remote_addr)
+	{
+		return Err!(Request(Forbidden("Requesting from this address is forbidden")));
+	}
+
+	// an upstream error document must not be relayed as media
+	if !response.status().is_success() {
+		return Err!(Request(NotFound(debug_warn!(
+			status = ?response.status(),
+			%url,
+			"Fetching media from location failed"
+		))));
+	}
 
 	let content_type = response
 		.headers()
@@ -292,53 +362,43 @@ async fn location_request(&self, location: &str) -> Result<FileMeta> {
 		.map(TryFrom::try_from)
 		.and_then(Result::ok);
 
-	response
-		.bytes()
-		.await
-		.map(Vec::from)
-		.map_err(Into::into)
-		.map(|content| FileMeta {
-			content: Some(content),
-			content_type: content_type.clone(),
-			content_disposition: Some(make_content_disposition(
-				content_disposition.as_ref(),
-				content_type.as_deref(),
-				None,
-			)),
-		})
+	let content = read_response_capped(response, limit).await?;
+
+	Ok(Media {
+		content: content.to_vec(),
+		content_type: content_type.clone(),
+		content_disposition: Some(make_content_disposition(
+			content_disposition.as_ref(),
+			content_type.as_deref(),
+			None,
+		)),
+	})
 }
 
 #[implement(super::Service)]
 async fn federation_request<Request>(
 	&self,
 	mxc: &Mxc<'_>,
-	user: Option<&UserId>,
 	server: Option<&ServerName>,
 	request: Request,
 ) -> Result<Request::IncomingResponse>
 where
 	Request: OutgoingRequest + Send + Debug,
+	Request::Authentication: FedAuth,
+	Request::PathBuilder: FedPath,
 {
 	self.services
 		.federation
 		.execute(server.unwrap_or(mxc.server_name), request)
 		.await
-		.map_err(|error| handle_federation_error(mxc, user, server, error))
+		.map_err(|error| handle_federation_error(mxc, server, error))
 }
 
 // Handles and adjusts the error for the caller to determine if they should
 // request the fallback endpoint or give up.
-fn handle_federation_error(
-	mxc: &Mxc<'_>,
-	user: Option<&UserId>,
-	server: Option<&ServerName>,
-	error: Error,
-) -> Error {
-	let fallback = || {
-		err!(Request(NotFound(
-			debug_error!(%mxc, ?user, ?server, ?error, "Remote media not found")
-		)))
-	};
+fn handle_federation_error(mxc: &Mxc<'_>, server: Option<&ServerName>, error: Error) -> Error {
+	let fallback =
+		|| err!(Request(NotFound(debug_error!(%mxc, ?server, ?error, "Remote media not found"))));
 
 	// Matrix server responses for fallback always taken.
 	if error.kind() == NotFound || error.kind() == Unrecognized {
@@ -359,47 +419,42 @@ fn handle_federation_error(
 	error
 }
 
+/// Fetches a thumbnail from the origin server over the legacy media API.
+///
+/// The dimension the origin is asked for is the dimension its answer is filed
+/// under, and every later lookup normalizes before it seeks, so the two have
+/// to agree or nothing cached on one request is found on the next. A request
+/// too large for any thumbnail size normalizes to the original file, which is
+/// fetched rather than asked for at a dimension that is not a size.
 #[implement(super::Service)]
-#[expect(deprecated)]
 pub async fn fetch_remote_thumbnail_legacy(
 	&self,
-	body: &media::get_content_thumbnail::v3::Request,
-) -> Result<media::get_content_thumbnail::v3::Response> {
-	let mxc = Mxc {
-		server_name: &body.server_name,
-		media_id: &body.media_id,
+	mxc: &Mxc<'_>,
+	timeout_ms: Duration,
+	dim: &Dim,
+	animate: Animate,
+) -> Result<Media> {
+	self.check_legacy_freeze()?;
+	self.check_fetch_authorized(mxc)?;
+
+	let dim = dim.normalized();
+
+	// both helpers cache what they fetch, so a picture the request forbids is
+	// kept beside the still derived from it rather than shadowed by it later
+	let fetched = match dim.is_original() {
+		| true =>
+			self.fetch_content_unauthenticated(mxc, None, timeout_ms)
+				.await?,
+		| false =>
+			self.fetch_thumbnail_unauthenticated(mxc, None, timeout_ms, &dim, animate)
+				.await?,
 	};
 
-	self.check_legacy_freeze()?;
-	self.check_fetch_authorized(&mxc)?;
-	let response = self
-		.services
-		.federation
-		.execute(mxc.server_name, media::get_content_thumbnail::v3::Request {
-			allow_remote: body.allow_remote,
-			height: body.height,
-			width: body.width,
-			method: body.method.clone(),
-			server_name: body.server_name.clone(),
-			media_id: body.media_id.clone(),
-			timeout_ms: body.timeout_ms,
-			allow_redirect: body.allow_redirect,
-			animated: body.animated,
-		})
-		.await?;
+	if animate.accepts_fetched(&fetched) {
+		return Ok(fetched.media);
+	}
 
-	let dim = Dim::from_ruma(body.width, body.height, body.method.clone())?;
-	self.upload_thumbnail(
-		&mxc,
-		None,
-		None,
-		response.content_type.as_deref(),
-		&dim,
-		&response.file,
-	)
-	.await?;
-
-	Ok(response)
+	self.store_still(mxc, &dim, fetched.media).await
 }
 
 #[implement(super::Service)]
@@ -454,8 +509,7 @@ fn check_fetch_authorized(&self, mxc: &Mxc<'_>) -> Result {
 			.services
 			.server
 			.config
-			.forbidden_remote_server_names
-			.is_match(mxc.server_name.host())
+			.is_forbidden_remote_server_name(mxc.server_name)
 	{
 		// we'll lie to the client and say the blocked server's media was not found and
 		// log. the client has no way of telling anyways so this is a security bonus.

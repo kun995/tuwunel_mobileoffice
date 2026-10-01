@@ -1,15 +1,13 @@
 use std::time::{Duration, SystemTime};
 
 use axum::extract::State;
-use base64::{Engine as _, engine::general_purpose};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hmac::{Hmac, Mac};
-use ruma::{SecondsSinceUnixEpoch, UserId, api::client::voip::get_turn_server_info};
+use ruma::{SecondsSinceUnixEpoch, api::client::voip::get_turn_server_info};
 use sha1::Sha1;
-use tuwunel_core::{Err, Result, info, utils};
+use tuwunel_core::{Err, Result};
 
 use crate::Ruma;
-
-const RANDOM_USER_ID_LENGTH: usize = 10;
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -22,52 +20,41 @@ pub(crate) async fn turn_server_route(
 ) -> Result<get_turn_server_info::v3::Response> {
 	// MSC4166: return M_NOT_FOUND 404 if no TURN URIs are specified in any way
 	if services.server.config.turn_uris.is_empty() {
-		info!("TURN server info requested but no TURN URIs are configured");
 		return Err!(Request(NotFound("Not Found")));
 	}
 
-	let turn_secret = &services.globals.turn_secret;
-	let requested_by = body
-		.sender_user
-		.as_deref()
-		.map(ToString::to_string)
-		.unwrap_or_else(|| "<guest-or-unknown>".to_owned());
+	let user = body.sender_user();
 
-	let (username, password) = if let Some(turn_secret) = turn_secret {
-		let expiry = SecondsSinceUnixEpoch::from_system_time(
-			SystemTime::now()
-				.checked_add(Duration::from_secs(services.config.turn_ttl))
-				.expect("TURN TTL should not get this high"),
-		)
-		.expect("time is valid");
+	if !services.config.turn_allow_guests
+		&& body.appservice_info.is_none()
+		&& services
+			.users
+			.is_deactivated(user)
+			.await
+			.unwrap_or(false)
+	{
+		return Err!(Request(Forbidden("Guest users are not allowed to get TURN credentials")));
+	}
 
-		let user = body.sender_user.unwrap_or_else(|| {
-			UserId::parse_with_server_name(
-				utils::random_string(RANDOM_USER_ID_LENGTH).to_lowercase(),
-				&services.server.name,
+	let (username, password) = services.globals.turn_secret().map_or_else(
+		|| (services.config.turn_username.clone(), services.config.turn_password.clone()),
+		|turn_secret| {
+			let expiry = SecondsSinceUnixEpoch::from_system_time(
+				SystemTime::now()
+					.checked_add(Duration::from_secs(services.config.turn_ttl))
+					.expect("TURN TTL should not get this high"),
 			)
-			.unwrap()
-		});
+			.expect("time is valid");
 
-		let username: String = format!("{}:{}", expiry.get(), user);
+			let username = format!("{}:{}", expiry.get(), user);
+			let mut mac = HmacSha1::new_from_slice(turn_secret.as_bytes())
+				.expect("HMAC can take key of any size");
 
-		let mut mac = HmacSha1::new_from_slice(turn_secret.as_bytes())
-			.expect("HMAC can take key of any size");
-		mac.update(username.as_bytes());
+			mac.update(username.as_bytes());
+			let password = STANDARD.encode(mac.finalize().into_bytes());
 
-		let password: String = general_purpose::STANDARD.encode(mac.finalize().into_bytes());
-
-		(username, password)
-	} else {
-		(services.config.turn_username.clone(), services.config.turn_password.clone())
-	};
-
-	info!(
-		requested_by,
-		ttl_seconds = services.config.turn_ttl,
-		uris_count = services.config.turn_uris.len(),
-		uses_shared_secret = turn_secret.is_some(),
-		"Returning TURN server info"
+			(username, password)
+		},
 	);
 
 	Ok(get_turn_server_info::v3::Response {

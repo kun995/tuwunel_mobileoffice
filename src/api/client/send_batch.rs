@@ -6,7 +6,7 @@ use axum_extra::{
 	TypedHeader,
 	headers::{Authorization, authorization::Bearer},
 };
-use ruma::{RoomId, api::client::error::ErrorKind};
+use ruma::{RoomId, api::error::ErrorKind};
 use serde::Deserialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tuwunel_core::{Err, Error, Result, err, matrix::pdu::PduBuilder, utils};
@@ -38,7 +38,7 @@ pub(crate) struct SendBatchEventItem {
 pub(crate) async fn send_batch_events_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
-	Path(room_id): Path<Box<RoomId>>,
+	Path(room_id): Path<ruma::OwnedRoomId>,
 	Json(body): Json<SendBatchEventsBody>,
 ) -> Result<Json<serde_json::Value>> {
 	let (sender_user, sender_device, _token) = services
@@ -47,16 +47,12 @@ pub(crate) async fn send_batch_events_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
-	if !services
-		.state_cache
-		.is_joined(&sender_user, &room_id)
-		.await
-	{
+	if !services.state_cache.is_joined(&sender_user, &room_id).await {
 		return Err!(Request(Forbidden("You are not a member of this room.")));
 	}
 
@@ -87,14 +83,17 @@ pub(crate) async fn send_batch_events_route(
 			"transaction_id".to_owned(),
 			format!("batch:{}:{index}", sender_device).into(),
 		);
-		unsigned.insert(MESSAGE_BATCH_ID_FIELD.to_owned(), JsonValue::String(batch_id.clone()));
+		unsigned.insert(
+			MESSAGE_BATCH_ID_FIELD.to_owned(),
+			JsonValue::String(batch_id.clone()),
+		);
 
 		let event_id = services
 			.timeline
 			.build_and_append_pdu(
 				PduBuilder {
 					event_type: event_type.as_str().into(),
-					content,
+					content: content.into(),
 					unsigned: Some(unsigned),
 					..Default::default()
 				},
@@ -125,7 +124,10 @@ fn normalize_content(
 		.ok_or_else(|| err!(Request(BadJson("Event content must be a JSON object"))))?;
 
 	if object.get(MESSAGE_BATCH_ID_FIELD).is_none() {
-		object.insert(MESSAGE_BATCH_ID_FIELD.to_owned(), JsonValue::String(batch_id.to_owned()));
+		object.insert(
+			MESSAGE_BATCH_ID_FIELD.to_owned(),
+			JsonValue::String(batch_id.to_owned()),
+		);
 	}
 
 	if let Some(message) = message

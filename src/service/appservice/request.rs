@@ -1,11 +1,18 @@
 use std::{fmt::Debug, mem};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
+use reqwest::Request;
 use ruma::api::{
-	IncomingResponse, MatrixVersion, OutgoingRequest, SendAccessToken, SupportedVersions,
+	IncomingResponse, OutgoingRequest, OutgoingRequestExt,
 	appservice::Registration,
+	auth_scheme::{AuthScheme, SendAccessToken},
+	path_builder::PathBuilder,
 };
-use tuwunel_core::{Err, Result, debug_error, err, implement, trace, utils, warn};
+use tuwunel_core::{
+	Err, Result, debug_error, err, implement, trace, utils::string_from_bytes, warn,
+};
+
+use crate::client::read_response_capped;
 
 /// Sends a request to an appservice
 ///
@@ -19,12 +26,9 @@ pub async fn send_request<T>(
 ) -> Result<Option<T::IncomingResponse>>
 where
 	T: OutgoingRequest + Debug + Send,
+	for<'a> T::Authentication: AuthScheme<Input<'a> = SendAccessToken<'a>>,
+	for<'a> T::PathBuilder: PathBuilder<Input<'a> = ()>,
 {
-	const VERSIONS: [MatrixVersion; 1] = [MatrixVersion::V1_7];
-	let supported = SupportedVersions {
-		versions: VERSIONS.into(),
-		features: Default::default(),
-	};
 	let client = &self.services.client.appservice;
 
 	let Some(dest) = registration.url else {
@@ -39,11 +43,7 @@ where
 
 	let hs_token = registration.hs_token.as_str();
 	let mut http_request = request
-		.try_into_http_request::<BytesMut>(
-			&dest,
-			SendAccessToken::IfRequired(hs_token),
-			&supported,
-		)
+		.try_into_http_request::<BytesMut>(&dest, SendAccessToken::IfRequired(hs_token), ())
 		.map_err(|e| {
 			err!(BadServerResponse(
 				warn!(appservice = %registration.id, "Failed to find destination {dest}: {e:?}")
@@ -51,20 +51,9 @@ where
 		})?
 		.map(BytesMut::freeze);
 
-	let mut parts = http_request.uri().clone().into_parts();
-	let old_path_and_query = parts.path_and_query.unwrap().as_str().to_owned();
-	let symbol = if old_path_and_query.contains('?') { "&" } else { "?" };
+	add_access_token_query(&mut http_request, hs_token);
 
-	parts.path_and_query = Some(
-		(old_path_and_query + symbol + "access_token=" + hs_token)
-			.parse()
-			.unwrap(),
-	);
-	*http_request.uri_mut() = parts
-		.try_into()
-		.expect("our manipulation is always valid");
-
-	let reqwest_request = reqwest::Request::try_from(http_request)?;
+	let reqwest_request = Request::try_from(http_request)?;
 
 	let mut response = client
 		.execute(reqwest_request)
@@ -90,10 +79,18 @@ where
 			.expect("http::response::Builder is usable"),
 	);
 
-	let body = response.bytes().await?; // TODO: handle timeout
+	let limit = self.services.config.max_response_size;
+	let body = read_response_capped(response, limit)
+		.await
+		.map_err(|e| {
+			err!(BadServerResponse(warn!(
+				"Failed reading response from appservice \"{}\" at {dest}: {e}",
+				registration.id
+			)))
+		})?;
 
 	if !status.is_success() {
-		debug_error!("Appservice response bytes: {:?}", utils::string_from_bytes(&body));
+		debug_error!("Appservice response bytes: {:?}", string_from_bytes(&body));
 		return Err!(BadServerResponse(warn!(
 			"Appservice \"{}\" returned unsuccessful HTTP response {status} at {dest}",
 			registration.id
@@ -112,4 +109,27 @@ where
 			registration.id
 		)))
 	})
+}
+
+/// Appends the `hs_token` as an `access_token` query parameter, the legacy
+/// authentication scheme some appservices still require.
+pub(super) fn add_access_token_query(request: &mut http::Request<Bytes>, hs_token: &str) {
+	let mut parts = request.uri().clone().into_parts();
+	let old_path_and_query = parts
+		.path_and_query
+		.expect("valid request uri path and query")
+		.as_str()
+		.to_owned();
+
+	let symbol = if old_path_and_query.contains('?') { "&" } else { "?" };
+
+	parts.path_and_query = Some(
+		format!("{old_path_and_query}{symbol}access_token={hs_token}")
+			.parse()
+			.expect("valid path and query"),
+	);
+
+	*request.uri_mut() = parts
+		.try_into()
+		.expect("our manipulation is always valid");
 }

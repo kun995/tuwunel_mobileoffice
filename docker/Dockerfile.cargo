@@ -1,6 +1,10 @@
 # syntax = docker/dockerfile:1.11-labs
 
-FROM input AS cargo
+# cook: dependency build via cargo-chef, against recipe.json only.
+#
+# Cache invalidation key: recipe.json content. Source-only changes do not
+# invalidate this stage.
+FROM input AS cook
 ARG sys_triple
 ARG rust_target
 ARG rust_toolchain
@@ -9,16 +13,12 @@ ARG RUSTUP_HOME
 ARG CARGO_HOME
 ARG CARGO_TARGET
 ARG CARGO_TARGET_DIR
-ARG cargo_target_profile
-ARG cargo_target_artifact
-ARG cargo_target_share
-ARG cargo_share
 ARG CARGO_TERM_VERBOSE=0
 ARG RUST_BACKTRACE
 ARG JEMALLOC_OVERRIDE
 ARG ROCKSDB_LIB_DIR
-ARG VALGRINDFLAGS=""
-ARG VALGRIND_MAX_WORKERS=128
+ARG ROCKSDB_INCLUDE_DIR
+ARG RUSTDOCFLAGS
 ARG CARGO_BUILD_RUSTFLAGS
 ARG CARGO_PROFILE_TEST_DEBUG
 ARG CARGO_PROFILE_TEST_INCREMENTAL
@@ -30,18 +30,15 @@ ARG CARGO_PROFILE_RELEASE_DEBUGINFO_LTO
 ARG cargo_profile
 ARG cargo_features
 ARG cargo_spec_features
-ARG cargo_cmd
+ARG cargo_cmd="chef cook --all-targets --no-build"
 ARG color_args="--color always"
-ARG recipe_args=""
-ARG cargo_args=""
-ARG git_checkout
-ARG targ_dir="${CARGO_TARGET_DIR}/${cargo_target_profile}"
-ARG targ_targ_dir="${CARGO_TARGET_DIR}/${rust_target}/${cargo_target_profile}"
+ARG cargo_flags=""
+ARG sched_policy="--batch"
+ARG sched_prio=0
 
 WORKDIR /
-COPY --link --from=input . .
 COPY --link --from=rust ${RUST_HOME} ${RUST_HOME}
-COPY --link --from=deps /usr/src/tuwunel /usr/src/tuwunel
+COPY --link --from=recipe recipe.json /usr/src/tuwunel/recipe.json
 
 WORKDIR /usr/lib/${sys_triple}
 COPY --link --from=rocksdb . .
@@ -53,8 +50,16 @@ ENV CARGO_TERM_VERBOSE="${CARGO_TERM_VERBOSE}"
 ENV RUST_BACKTRACE="${RUST_BACKTRACE}"
 ENV JEMALLOC_OVERRIDE="${JEMALLOC_OVERRIDE}"
 ENV ROCKSDB_LIB_DIR="${ROCKSDB_LIB_DIR}"
-ENV VALGRINDFLAGS="${VALGRINDFLAGS}"
-ENV TUWUNEL_DB_POOL_MAX_WORKERS="${VALGRIND_MAX_WORKERS}"
+ENV ROCKSDB_INCLUDE_DIR="${ROCKSDB_INCLUDE_DIR}"
+# Link the C++ stdlib via bake's static_libs/dynamic_libs, not the rust-rocksdb
+# System backend. Its build script emits a dynamic `dylib=stdc++`; in the fully
+# static (crt-static) Test/Bench build that leaves dynamic relocations against
+# libstdc++ vtable symbols (e.g. __cxa_pure_virtual) in a binary with no dynamic
+# loader, so glibc aborts at startup ("Unexpected reloc type in static binary",
+# before main). An empty CXXSTDLIB suppresses that directive. Must match the
+# cargo stage's value or the build script re-emits it (rerun-if-env-changed).
+ENV CXXSTDLIB=""
+ENV RUSTDOCFLAGS="${RUSTDOCFLAGS}"
 ENV CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG}"
 ENV CARGO_PROFILE_TEST_INCREMENTAL="${CARGO_PROFILE_TEST_INCREMENTAL}"
 ENV CARGO_PROFILE_BENCH_DEBUG="${CARGO_PROFILE_BENCH_DEBUG}"
@@ -64,25 +69,87 @@ ENV CARGO_PROFILE_RELEASE_DEBUGINFO_DEBUG="${CARGO_PROFILE_RELEASE_DEBUGINFO_DEB
 ENV CARGO_PROFILE_RELEASE_DEBUGINFO_LTO="${CARGO_PROFILE_RELEASE_DEBUGINFO_LTO}"
 ENV CARGO_BUILD_RUSTFLAGS="${CARGO_BUILD_RUSTFLAGS}"
 ENV CARGO_TARGET_DIR="${CARGO_TARGET_DIR}"
+ENV sched_policy=${sched_policy}
+ENV sched_prio=${sched_prio}
 RUN \
---mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=shared \
---mount=type=cache,dst=${CARGO_HOME}/registry,sharing=shared \
---mount=type=cache,dst=${CARGO_HOME}/git,sharing=shared \
---mount=type=cache,dst=${targ_dir}/deps,id=${cargo_share}/deps,sharing=locked \
---mount=type=cache,dst=${targ_dir}/build,id=${cargo_share}/build,sharing=locked \
---mount=type=cache,dst=${targ_dir}/examples,id=${cargo_share}/examples,sharing=locked \
---mount=type=cache,dst=${targ_dir}/incremental,id=${cargo_share}/incremental,sharing=locked \
---mount=type=cache,dst=${targ_dir}/.fingerprint,id=${cargo_share}/fingerprint,sharing=locked \
---mount=type=cache,dst=${targ_targ_dir}/deps,id=${cargo_target_share}/deps,sharing=locked \
---mount=type=cache,dst=${targ_targ_dir}/build,id=${cargo_target_share}/build,sharing=locked \
---mount=type=cache,dst=${targ_targ_dir}/examples,id=${cargo_target_share}/examples,sharing=locked \
---mount=type=cache,dst=${targ_targ_dir}/incremental,id=${cargo_target_share}/incremental,sharing=locked \
---mount=type=cache,dst=${targ_targ_dir}/.fingerprint,id=${cargo_target_share}/fingerprint,sharing=locked \
+--mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=locked \
+--mount=type=cache,dst=${CARGO_HOME}/registry,sharing=locked \
+--mount=type=cache,dst=${CARGO_HOME}/git,sharing=locked \
 <<EOF
     set -eux
     ulimit -n 65535
 
-    rustup run "${rust_toolchain}" \
+    rustup run "${rust_toolchain}" sched_wrap.sh \
+        cargo ${cargo_cmd} \
+            --verbose \
+            --locked \
+            --workspace \
+            "${cargo_spec_features}" \
+            "--features=${cargo_features}" \
+            "--profile=${cargo_profile}" \
+            "--target=${CARGO_TARGET}" \
+            "--target-dir=${CARGO_TARGET_DIR}" \
+            --recipe-path=recipe.json \
+            ${color_args} \
+            ${cargo_flags}
+EOF
+
+
+# cargo: workspace build, reusing cook's compiled dependencies.
+#
+# COPY --from=source merges into /usr/src/tuwunel: real Cargo.toml and
+# src/<member>/src/* overwrite the chef stubs; target/ from cook is
+# preserved (the source-rust allowlist carries no target/).
+#
+# cargo_target_prune trims the target complex from the result layer when
+# nothing downstream consumes it: "all" removes it outright (check, clippy);
+# "bins" keeps only the built binaries for the install and packaging stages.
+FROM input AS cargo
+ARG rust_toolchain
+ARG RUSTUP_HOME
+ARG CARGO_HOME
+ARG CARGO_TARGET
+ARG CARGO_TARGET_DIR
+ARG cargo_profile
+ARG cargo_target_profile
+ARG cargo_target_prune=""
+ARG cargo_features
+ARG cargo_spec_features
+ARG cargo_cmd="build"
+ARG cargo_args=""
+ARG color_args="--color always"
+ARG cargo_flags=""
+ARG VALGRINDFLAGS=""
+ARG VALGRIND_MAX_WORKERS=64
+ARG ROCKSDB_PARALLELISM_THREADS=2
+ARG sched_policy="--batch"
+ARG sched_prio=0
+
+WORKDIR /
+COPY --link --from=source /usr/src/tuwunel /usr/src/tuwunel
+
+WORKDIR /usr/src/tuwunel
+SHELL ["/bin/bash", "-c"]
+# Keep in sync with the cook stage: an empty CXXSTDLIB stops the rust-rocksdb
+# System backend emitting a dynamic `dylib=stdc++` (bake links the stdlib itself).
+# A mismatch with cook would re-run the build script and reintroduce the directive.
+ENV CXXSTDLIB=""
+ENV VALGRINDFLAGS="${VALGRINDFLAGS}"
+ENV TUWUNEL_DB_POOL_MAX_WORKERS="${VALGRIND_MAX_WORKERS}"
+ENV TUWUNEL_ROCKSDB_PARALLELISM_THREADS="${ROCKSDB_PARALLELISM_THREADS}"
+ENV sched_policy=${sched_policy}
+ENV sched_prio=${sched_prio}
+RUN \
+--mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=locked \
+--mount=type=cache,dst=${CARGO_HOME}/registry,sharing=locked \
+--mount=type=cache,dst=${CARGO_HOME}/git,sharing=locked \
+<<EOF
+    set -eux
+    ulimit -n 65535
+
+    example_sha=$(sha1sum tuwunel-example.toml)
+
+    rustup run "${rust_toolchain}" sched_wrap.sh \
         cargo ${cargo_cmd} \
             --verbose \
             --locked \
@@ -93,15 +160,28 @@ RUN \
             "--target=${CARGO_TARGET}" \
             "--target-dir=${CARGO_TARGET_DIR}" \
             "--manifest-path=Cargo.toml" \
-            ${recipe_args} \
             ${color_args} \
+            ${cargo_flags} \
             ${cargo_args}
 
-    # If this image is further reused with other cargo commands, all
-    # modifications made by cargo chef cook outside of target-dir have to be
-    # cleared. If not, resulting build artifacts will link incorrectly, even
-    # without error. For example, a target executable may be produced which
-    # does nothing except exit(0). If you have observed a smoketest failing in
-    # such a manner, investigate this as a cause of the issue.
-    git restore -W -S --source=${git_checkout} .
+    if ! echo "$example_sha" | sha1sum --check --status; then
+        echo "tuwunel-example.toml drift: run cargo check yourself and commit the result." >&2
+        exit 1
+    fi
+
+    case "${cargo_target_prune}" in
+    all)
+        rm -rf "${CARGO_TARGET_DIR}"
+        ;;
+    bins)
+        dir="${CARGO_TARGET_DIR}/${CARGO_TARGET}/${cargo_target_profile}"
+        rm -rf \
+            "${dir}/deps" \
+            "${dir}/build" \
+            "${dir}/.fingerprint" \
+            "${dir}/incremental" \
+            "${dir}/examples" \
+            "${CARGO_TARGET_DIR}/${cargo_target_profile}"
+        ;;
+    esac
 EOF

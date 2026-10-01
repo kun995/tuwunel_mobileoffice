@@ -1,9 +1,15 @@
 use std::path::PathBuf;
 
 use serde::Deserialize;
+use tuwunel_macros::config_example_generator;
 
 /// Media storage configuration
 #[derive(Clone, Debug, Deserialize)]
+#[config_example_generator(
+	filename = "tuwunel-example.toml",
+	section = "global.media_storage",
+	ignore = "filesystem s3 hybrid"
+)]
 pub struct MediaStorageConfig {
 	/// Storage strategy to use
 	///
@@ -53,6 +59,10 @@ pub enum StorageStrategy {
 
 /// Filesystem storage configuration
 #[derive(Clone, Debug, Deserialize)]
+#[config_example_generator(
+	filename = "tuwunel-example.toml",
+	section = "global.media_storage.filesystem"
+)]
 pub struct FilesystemStorageConfig {
 	/// Path to store media files. If not set, uses {database_path}/media
 	pub path: Option<PathBuf>,
@@ -66,6 +76,10 @@ impl Default for FilesystemStorageConfig {
 
 /// S3/MinIO storage configuration
 #[derive(Clone, Debug, Deserialize)]
+#[config_example_generator(
+	filename = "tuwunel-example.toml",
+	section = "global.media_storage.s3"
+)]
 pub struct S3StorageConfig {
 	/// S3 endpoint URL
 	///
@@ -109,6 +123,10 @@ pub struct S3StorageConfig {
 
 /// Hybrid storage strategy configuration
 #[derive(Clone, Debug, Deserialize)]
+#[config_example_generator(
+	filename = "tuwunel-example.toml",
+	section = "global.media_storage.hybrid"
+)]
 pub struct HybridStrategyConfig {
 	/// Write to both primary and secondary storage
 	///

@@ -13,10 +13,36 @@
 
 You can reinvite yourself to the admin room through the following methods:
 - Use the `--execute "users make_user_admin <username>"` Tuwunel binary
-argument once to invite yourslf to the admin room on startup
+argument once to invite yourself to the admin room on startup
 - Use the Tuwunel console/CLI to run the `users make_user_admin` command
 - Or specify the `emergency_password` config option to allow you to temporarily
 log into the server account (`@conduit`) from a web client
+
+#### A room created with federation disabled cannot federate later
+
+`m.federate` lives in the room's `m.room.create` event, so it is fixed for the
+life of the room. Element sets it from the "Block anyone not part of `<server>`
+from ever joining this room" checkbox, whose own help text says the choice
+cannot be changed later. Inviting a user from another server into such a room
+is rejected with:
+
+```
+Auth check failed: MSC4361: room is not federated and target user domain does not match `m.room.create` event's sender domain
+```
+
+Synapse rejects the same event ("This room has been marked as unfederatable"),
+so the restriction is not specific to Tuwunel.
+
+`!admin federation enable-room` does not lift it. That command clears an
+inbound-PDU block set earlier by `!admin federation disable-room`, a separate
+mechanism described under [Policy and Moderation](./moderation.md); run it on a
+non-federating room and it says so in its reply. The `federate_created_rooms`
+config option is no help either: it applies when a room is created, so
+changing it leaves every existing room alone.
+
+Upgrading the room is not a workaround either: the replacement room inherits
+`m.federate` from its predecessor, as it does on Synapse. Moving the
+conversation to a newly created room is the only remedy.
 
 ## General potential issues
 
@@ -84,6 +110,17 @@ If your DNS server supports it, some users have reported enabling
 reliability at a slight performance cost due to TCP overhead.
 
 ## RocksDB / database issues
+
+#### Disk fills up but the database does not appear to grow
+
+On btrfs, `du` can report a database of a few hundred megabytes while `df`
+shows tens of gigabytes consumed and still climbing. RocksDB preallocates its
+write-ahead logs with `fallocate(2)`, and Copy-on-Write keeps the whole
+preallocated extent pinned after the log is truncated on close, so the space a
+file occupies bears no relation to its length.
+Set `rocksdb_allow_fallocate = false`; see
+[the btrfs section of maintenance](maintenance.md#btrfs) for how to confirm the
+diagnosis and reclaim the space.
 
 #### Database corruption
 
@@ -233,14 +270,22 @@ bandwidth and computationally.
 
 #### Allocator memory stats
 
-When using jemalloc with jemallocator's `stats` feature (`--enable-stats`), you
-can see Tuwunel's high-level allocator stats by using
-`!admin server memory-usage` at the bottom.
+`!admin server memory-usage` reports the memory held by Tuwunel's caches and
+the database, not the allocator's own figures.
 
-If you are a developer, you can also view the raw jemalloc statistics with
+If you are a developer, you can view jemalloc's raw report with
 `!admin debug memory-stats`. Please note that this output is extremely large
 which may only be visible in the Tuwunel console CLI due to PDU size limits,
-and is not easy for non-developers to understand.
+and is not easy for non-developers to understand. When jemalloc is built as part
+of Tuwunel, statistics collection is disabled, so the report shows the
+allocator's configuration but no usage counters.
 
 [unbound-tuning]: https://unbound.docs.nlnetlabs.nl/en/latest/topics/core/performance.html
 [unbound-arch]: https://wiki.archlinux.org/title/Unbound
+
+#### Matrix RTC test tool
+
+[testmatrix](https://pypi.org/project/testmatrix/) is a command line tool for testing
+various aspects of a matrix server and guiding debugging. Details for troubleshooting
+Matrix RTC can be found in the Matrix RTC
+[chapter on troubleshooting](./calls/matrix_rtc.md#troubleshooting).

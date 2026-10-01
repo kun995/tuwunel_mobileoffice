@@ -1,17 +1,27 @@
 # syntax = docker/dockerfile:1.11-labs
 
 FROM input AS source
-ARG git_checkout
 
-ADD --link --keep-git-dir . /usr/src/tuwunel
+ADD --link . /usr/src/tuwunel
+
+
+# source-rust: the source subset needed to build and test the workspace. Cargo
+# stages copy from this allowlist so commits touching only docs, workflows, or
+# other non-build files keep their cache keys and do not rebuild the workspace.
+FROM scratch AS source-rust
+
 WORKDIR /usr/src/tuwunel
-RUN <<EOF
-    set -eux
-    git reset \
-        --hard \
-        --no-recurse-submodules \
-        ${git_checkout}
-EOF
+COPY --link --from=source /usr/src/tuwunel/.cargo .cargo
+COPY --link --from=source /usr/src/tuwunel/Cargo.toml Cargo.toml
+COPY --link --from=source /usr/src/tuwunel/Cargo.lock Cargo.lock
+COPY --link --from=source /usr/src/tuwunel/clippy.toml clippy.toml
+COPY --link --from=source /usr/src/tuwunel/rust-toolchain.toml rust-toolchain.toml
+COPY --link --from=source /usr/src/tuwunel/tuwunel-example.toml tuwunel-example.toml
+COPY --link --from=source /usr/src/tuwunel/src src
+COPY --link --from=source \
+	/usr/src/tuwunel/nix/pkgs/complement/certificate.crt \
+	/usr/src/tuwunel/nix/pkgs/complement/private_key.key \
+	nix/pkgs/complement/
 
 
 FROM input AS ingredients
@@ -25,6 +35,9 @@ ARG CARGO_TERM_VERBOSE=0
 ARG RUST_BACKTRACE
 ARG JEMALLOC_OVERRIDE
 ARG ROCKSDB_LIB_DIR
+ARG ROCKSDB_INCLUDE_DIR
+ARG sched_policy="--rr"
+ARG sched_prio=1
 
 WORKDIR /
 COPY --link --from=rust ${RUST_HOME} ${RUST_HOME}
@@ -36,20 +49,16 @@ ENV CARGO_TERM_VERBOSE="${CARGO_TERM_VERBOSE}"
 ENV RUST_BACKTRACE="${RUST_BACKTRACE}"
 ENV JEMALLOC_OVERRIDE="${JEMALLOC_OVERRIDE}"
 ENV ROCKSDB_LIB_DIR="${ROCKSDB_LIB_DIR}"
+ENV ROCKSDB_INCLUDE_DIR="${ROCKSDB_INCLUDE_DIR}"
+ENV sched_policy=${sched_policy}
+ENV sched_prio=${sched_prio}
 RUN \
 --mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=locked \
 --mount=type=cache,dst=${CARGO_HOME}/registry,sharing=locked \
 --mount=type=cache,dst=${CARGO_HOME}/git,sharing=locked \
 <<EOF
     set -eux
-    git submodule update \
-        --remote \
-        --no-fetch \
-        --recursive \
-        --checkout \
-        --init
-
-    rustup run ${rust_toolchain} \
+    rustup run ${rust_toolchain} sched_wrap.sh \
         cargo fetch \
             --locked \
             --target ${CARGO_TARGET}
@@ -62,31 +71,35 @@ ARG rust_toolchain
 ARG RUSTUP_HOME
 ARG CARGO_HOME
 ARG CARGO_TARGET
+ARG sched_policy="--rr"
+ARG sched_prio=1
 
 WORKDIR /usr/src/tuwunel
+ENV sched_policy=${sched_policy}
+ENV sched_prio=${sched_prio}
 RUN \
 --mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=locked \
 --mount=type=cache,dst=${CARGO_HOME}/registry,sharing=locked \
 --mount=type=cache,dst=${CARGO_HOME}/git,sharing=locked \
 <<EOF
     set -euxo pipefail
-    rustup run ${rust_toolchain} \
+    rustup run ${rust_toolchain} sched_wrap.sh \
         cargo chef prepare \
             --recipe-path recipe.json
 
-    manifest="Cargo.toml"
-    package="rust-librocksdb-sys"
-    cmd="cargo tree --manifest-path ${manifest} -f {r} -p ${package}"
-    url="$(rustup run ${rust_toolchain} ${cmd} | head -n 1)"
-    url="https://github.com/matrix-construct/rust-rocksdb" #TODO fixme
-    echo "$url" > rocksdb.url
+    rocksdb_pkgid="$(rustup run ${rust_toolchain} cargo pkgid --locked -p rust-librocksdb-sys)"
+    rocksdb_url="${rocksdb_pkgid#git+}"
+    rocksdb_rev="${rocksdb_pkgid##*rev=}"
+    echo "${rocksdb_url%%[?]*}" > rocksdb.url
+    echo "${rocksdb_rev%%#*}" > rocksdb.rev
 
-    sha1sum recipe.json rocksdb.url
+    sha1sum recipe.json rocksdb.url rocksdb.rev
 EOF
 
 
 FROM scratch AS recipe
 
 WORKDIR /
-COPY --from=preparing /usr/src/tuwunel/recipe.json .
-COPY --from=preparing /usr/src/tuwunel/rocksdb.url .
+COPY --link --from=preparing /usr/src/tuwunel/recipe.json .
+COPY --link --from=preparing /usr/src/tuwunel/rocksdb.url .
+COPY --link --from=preparing /usr/src/tuwunel/rocksdb.rev .

@@ -2,7 +2,7 @@ use futures::FutureExt;
 use ruma::{UserId, events::GlobalAccountDataEventType, push};
 use tuwunel_core::{Err, Result, error, implement, info, is_equal_to, warn};
 
-use crate::appservice::RegistrationInfo;
+use crate::{membership::Join, profile::Propagation};
 
 #[derive(Debug, Default)]
 pub struct Register<'a> {
@@ -10,7 +10,7 @@ pub struct Register<'a> {
 	pub username: Option<&'a str>,
 	pub password: Option<&'a str>,
 	pub origin: Option<&'a str>,
-	pub appservice_info: Option<&'a RegistrationInfo>,
+	pub is_appservice: bool,
 	pub is_guest: bool,
 	pub grant_first_user_admin: bool,
 	pub displayname: Option<&'a str>,
@@ -29,7 +29,7 @@ pub async fn full_register(
 		user_id,
 		password,
 		origin,
-		appservice_info,
+		is_appservice,
 		is_guest,
 		grant_first_user_admin,
 		displayname,
@@ -76,8 +76,9 @@ pub async fn full_register(
 	}
 
 	self.services
-		.users
-		.set_displayname(user_id, Some(displayname));
+		.profile
+		.set_displayname(user_id, Some(displayname), Some(Propagation::None))
+		.await?;
 
 	// Initial account data
 	self.services
@@ -100,6 +101,7 @@ pub async fn full_register(
 	// users
 	// Note: the server user is generated first
 	if !is_guest
+		&& !is_appservice
 		&& grant_first_user_admin
 		&& self.services.config.grant_admin_to_first_user
 		&& let Ok(admin_room) = self.services.admin.get_admin_room().await
@@ -118,9 +120,7 @@ pub async fn full_register(
 		warn!("Granting {user_id} admin privileges as the first user");
 	}
 
-	if appservice_info.is_none()
-		&& (self.services.config.allow_guests_auto_join_rooms || !is_guest)
-	{
+	if !is_appservice && (self.services.config.allow_guests_auto_join_rooms || !is_guest) {
 		for room in &self.services.server.config.auto_join_rooms {
 			let Ok(room_id) = self.services.alias.maybe_resolve(room).await else {
 				error!(
@@ -142,21 +142,18 @@ pub async fn full_register(
 				continue;
 			}
 
-			let state_lock = self.services.state.mutex.lock(&room_id).await;
-
 			match self
 				.services
 				.membership
-				.join(
-					user_id,
-					&room_id,
-					Some(room),
-					Some("Automatically joining this room upon registration".to_owned()),
-					&[],
-					false,
-					&state_lock,
-				)
-				.boxed()
+				.join(Join {
+					sender_user: user_id,
+					room_id: &room_id,
+					orig_room_id: Some(room),
+					reason: Some("Automatically joining this room upon registration".to_owned()),
+					servers: &[],
+					is_appservice: false,
+					extra_content: None,
+				})
 				.await
 			{
 				| Err(e) => {
@@ -167,8 +164,6 @@ pub async fn full_register(
 					info!("Automatically joined room {room} for user {user_id}");
 				},
 			}
-
-			drop(state_lock);
 		}
 	}
 

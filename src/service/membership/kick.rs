@@ -21,14 +21,13 @@ pub async fn kick(
 	sender_user: &UserId,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
-	// kicking doesn't make sense if there is no membership
 	let Ok(event) = self
 		.services
 		.state_accessor
 		.get_member(room_id, user_id)
 		.await
 	else {
-		return Ok(());
+		return Err!(Request(Forbidden("Cannot kick a user who is not in the room.")));
 	};
 
 	// this is required to prevent ban -> leave transitions
@@ -48,7 +47,7 @@ pub async fn kick(
 			PduBuilder::state(user_id.to_string(), &RoomMemberEventContent {
 				membership: MembershipState::Leave,
 				reason: reason.cloned(),
-				is_direct: None,
+				is_direct: false,
 				join_authorized_via_users_server: None,
 				third_party_invite: None,
 				..event

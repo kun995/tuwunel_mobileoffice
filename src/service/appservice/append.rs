@@ -1,3 +1,4 @@
+use futures::{FutureExt, StreamExt, TryFutureExt};
 use ruma::{UserId, events::TimelineEventType};
 use tuwunel_core::{
 	Result, error, implement,
@@ -5,7 +6,10 @@ use tuwunel_core::{
 		event::Event,
 		pdu::{Pdu, RawPduId},
 	},
-	utils::ReadyExt,
+	utils::{
+		ReadyExt,
+		stream::{IterStream, automatic_width},
+	},
 };
 
 use super::RegistrationInfo;
@@ -14,18 +18,23 @@ use super::RegistrationInfo;
 #[implement(super::Service)]
 #[tracing::instrument(name = "append", level = "debug", skip_all)]
 pub(crate) async fn append_pdu(&self, pdu_id: RawPduId, pdu: &Pdu) -> Result {
-	for appservice in self.read().await.values() {
-		self.append_pdu_to(appservice, pdu_id, pdu)
-			.await
-			.inspect_err(|e| {
-				error!(
-					event_id = %pdu.event_id(),
-					appservice = ?appservice.registration.id,
-					"Failed to send PDU to appservice: {e}"
-				);
-			})
-			.ok();
-	}
+	let guard = self.read().await;
+
+	guard
+		.values()
+		.stream()
+		.for_each_concurrent(automatic_width(), |appservice| {
+			self.append_pdu_to(appservice, pdu_id, pdu)
+				.inspect_err(|e| {
+					error!(
+						event_id = %pdu.event_id(),
+						appservice = ?appservice.registration.id,
+						"Failed to send PDU to appservice: {e}"
+					);
+				})
+				.map(drop)
+		})
+		.await;
 
 	Ok(())
 }
@@ -72,7 +81,7 @@ async fn should_append_to(&self, appservice: &RegistrationInfo, pdu: &Pdu) -> bo
 			.state_key
 			.as_ref()
 			.and_then(|state_key| UserId::parse(state_key.as_str()).ok())
-			.is_some_and(|user_id| appservice.is_user_match(user_id))
+			.is_some_and(|user_id| appservice.is_user_match(&user_id))
 	{
 		return true;
 	}

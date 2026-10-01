@@ -21,6 +21,12 @@ impl OnceServices {
 			.get()
 			.expect("services must be initialized")
 	}
+
+	/// Borrow the services if they are initialized, without panicking on the
+	/// pre-init window. Returns `None` only before `set` runs, a state reached
+	/// by unit harnesses that build a service without an initialized graph.
+	#[inline]
+	pub(crate) fn try_get(&self) -> Option<&Arc<Services>> { self.lock.get() }
 }
 
 impl Deref for OnceServices {

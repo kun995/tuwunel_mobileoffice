@@ -1,25 +1,31 @@
 mod alias;
-mod commands;
+mod clear_soft_failed_events;
+mod delete;
 mod directory;
+mod exists;
 mod info;
+mod list;
+mod list_extremities;
+mod list_joined_members;
 mod moderation;
+mod prune_empty;
+mod prune_extremities;
+mod purge_user;
 
 use clap::Subcommand;
-use ruma::OwnedRoomId;
+use ruma::{OwnedRoomId, OwnedRoomOrAliasId};
 use tuwunel_core::Result;
 
 use self::{
-	alias::RoomAliasCommand, directory::RoomDirectoryCommand, info::RoomInfoCommand,
-	moderation::RoomModerationCommand,
+	alias::RoomAliasCommand, directory::RoomDirectoryCommand, moderation::RoomModerationCommand,
 };
 use crate::admin_command_dispatch;
 
-#[admin_command_dispatch]
+#[admin_command_dispatch(handler_prefix = "room")]
 #[derive(Debug, Subcommand)]
 pub(super) enum RoomCommand {
 	/// - List all rooms the server knows about
-	#[clap(alias = "list")]
-	ListRooms {
+	List {
 		page: Option<usize>,
 
 		/// Excludes rooms that we have federation disabled with
@@ -36,16 +42,31 @@ pub(super) enum RoomCommand {
 		no_details: bool,
 	},
 
-	#[command(subcommand)]
-	/// - View information about a room we know about
-	Info(RoomInfoCommand),
+	/// - Get general information about a room
+	///
+	/// Shows the room's name, topic, canonical alias, local aliases, and
+	/// admins (users with a power level greater than or equal to
+	/// state_default).
+	Info {
+		/// Room ID or alias
+		room: OwnedRoomOrAliasId,
+	},
+
+	/// - List joined members in a room
+	ListJoinedMembers {
+		room_id: OwnedRoomId,
+
+		/// Lists only our local users in the specified room
+		#[arg(long)]
+		local_only: bool,
+	},
 
 	#[command(subcommand)]
 	/// - Manage moderation of remote or local rooms
 	Moderation(RoomModerationCommand),
 
 	#[command(subcommand)]
-	/// - Manage rooms' aliases
+	/// - Manage room aliases
 	Alias(RoomAliasCommand),
 
 	#[command(subcommand)]
@@ -57,11 +78,68 @@ pub(super) enum RoomCommand {
 		room_id: OwnedRoomId,
 	},
 
+	/// - Clear stored soft-fail and policy decisions for a room
+	///
+	/// Changes stored moderation state so matching events are re-checked on the
+	/// next delivery instead of waiting out the retry window. Does not replay
+	/// or insert events.
+	ClearSoftFailedEvents {
+		/// Room ID or alias
+		room_id: OwnedRoomOrAliasId,
+	},
+
 	/// - Delete room
-	DeleteRoom {
+	Delete {
 		room_id: OwnedRoomId,
 
 		#[arg(short, long)]
 		force: bool,
+	},
+
+	/// - Prune empty rooms
+	PruneEmpty {
+		#[arg(short, long)]
+		force: bool,
+	},
+
+	/// - List a room's forward extremities with a total
+	ListExtremities {
+		room_id: OwnedRoomOrAliasId,
+	},
+
+	/// - Scored prune of a room's forward extremities down to a target
+	PruneExtremities {
+		room_id: OwnedRoomOrAliasId,
+
+		/// Target frontier size (default: forward_extremities_max, min 1)
+		target: Option<usize>,
+
+		/// Show the plan without writing
+		#[arg(long)]
+		dry_run: bool,
+	},
+
+	/// - Delete every room a user is joined to
+	///
+	/// Useful for cleaning up after spam invitations or a faulty appservice
+	/// registration. With --regex the argument is a pattern matched against
+	/// every joined member of each room, so a whole namespace
+	/// (e.g. `@bot_[A-Za-z0-9]+:example\.com`) can be cleared at once.
+	PurgeUser {
+		/// A user ID, or (with --regex) a pattern matched against the joined
+		/// members of every room
+		user_id: String,
+
+		/// Interpret user_id as a regular expression
+		#[arg(long)]
+		regex: bool,
+
+		/// Only delete rooms where the matched user is the only joined member
+		#[arg(long)]
+		sole_member: bool,
+
+		/// List the rooms that would be deleted without deleting them
+		#[arg(long)]
+		dry_run: bool,
 	},
 }

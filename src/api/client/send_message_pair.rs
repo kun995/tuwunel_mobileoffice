@@ -6,7 +6,7 @@ use axum_extra::{
 	TypedHeader,
 	headers::{Authorization, authorization::Bearer},
 };
-use ruma::{EventId, OwnedEventId, RoomId, api::client::error::ErrorKind};
+use ruma::{EventId, OwnedEventId, RoomId, api::error::ErrorKind};
 use serde::Deserialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tuwunel_core::{Err, Error, Result, err, matrix::event::Event, utils};
@@ -40,7 +40,7 @@ pub(crate) struct SendMessagePairBody {
 pub(crate) async fn send_message_pair_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
-	Path(room_id): Path<Box<RoomId>>,
+	Path(room_id): Path<ruma::OwnedRoomId>,
 	Json(body): Json<SendMessagePairBody>,
 ) -> Result<Json<serde_json::Value>> {
 	let (sender_user, _sender_device, _token) = services
@@ -49,16 +49,12 @@ pub(crate) async fn send_message_pair_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
-	if !services
-		.state_cache
-		.is_joined(&sender_user, &room_id)
-		.await
-	{
+	if !services.state_cache.is_joined(&sender_user, &room_id).await {
 		return Err!(Request(Forbidden("You are not a member of this room.")));
 	}
 
@@ -91,8 +87,11 @@ pub(crate) async fn send_message_pair_route(
 		.event_type
 		.unwrap_or_else(|| "m.room.message".to_owned());
 
-	let event_id = OwnedEventId::parse(format!("${}", utils::random_string(32)))
-		.map_err(|e| err!(Request(InvalidParam("Could not create translation id: {e}"))))?;
+	let event_id = OwnedEventId::parse(format!("${}", utils::random_string(32))).map_err(|e| {
+		err!(Request(InvalidParam(
+			"Could not create translation id: {e}"
+		)))
+	})?;
 	services.message_pairs.insert(&MessagePair {
 		event_id: event_id.clone(),
 		room_id: room_id.clone(),
@@ -117,13 +116,18 @@ pub(crate) async fn send_message_pair_route(
 pub(crate) async fn list_message_pairs_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
-	Path(room_id): Path<Box<RoomId>>,
+	Path(room_id): Path<ruma::OwnedRoomId>,
 ) -> Result<Json<serde_json::Value>> {
 	let (sender_user, ..) = services
 		.users
 		.find_from_token(token.token())
 		.await
-		.map_err(|_| Error::BadRequest(ErrorKind::UnknownToken { soft_logout: false }, "Unknown access token."))?;
+		.map_err(|_| {
+			Error::BadRequest(
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
+				"Unknown access token.",
+			)
+		})?;
 
 	if !services.state_cache.is_joined(&sender_user, &room_id).await {
 		return Err!(Request(Forbidden("You are not a member of this room.")));
@@ -139,7 +143,7 @@ pub(crate) async fn list_message_pairs_route(
 pub(crate) async fn delete_message_pair_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
-	Path((room_id, event_id)): Path<(Box<RoomId>, Box<EventId>)>,
+	Path((room_id, event_id)): Path<(ruma::OwnedRoomId, ruma::OwnedEventId)>,
 ) -> Result<Json<serde_json::Value>> {
 	let (sender_user, ..) = services
 		.users
@@ -147,16 +151,12 @@ pub(crate) async fn delete_message_pair_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
-	if !services
-		.state_cache
-		.is_joined(&sender_user, &room_id)
-		.await
-	{
+	if !services.state_cache.is_joined(&sender_user, &room_id).await {
 		return Err!(Request(Forbidden("You are not a member of this room.")));
 	}
 
@@ -192,7 +192,9 @@ pub(crate) async fn delete_message_pair_route(
 	if legacy.room_id() != &*room_id || legacy.sender() != &*sender_user || !is_pair {
 		return Err!(Request(NotFound("Translation not found.")));
 	}
-	services.deleted_events.delete_event(&sender_user, &event_id);
+	services
+		.deleted_events
+		.delete_event(&sender_user, &event_id);
 	Ok(Json(serde_json::json!({
 		"deleted_event_id": event_id,
 		"batch_id": content.get(MESSAGE_BATCH_ID_FIELD),
@@ -210,11 +212,17 @@ fn normalize_content(
 		.ok_or_else(|| err!(Request(BadJson("Event content must be a JSON object"))))?;
 
 	if object.get(MESSAGE_BATCH_ID_FIELD).is_none() {
-		object.insert(MESSAGE_BATCH_ID_FIELD.to_owned(), JsonValue::String(batch_id.to_owned()));
+		object.insert(
+			MESSAGE_BATCH_ID_FIELD.to_owned(),
+			JsonValue::String(batch_id.to_owned()),
+		);
 	}
 
 	if object.get(MESSAGE_BATCH_SEQUENCE_FIELD).is_none() {
-		object.insert(MESSAGE_BATCH_SEQUENCE_FIELD.to_owned(), JsonValue::from(sequence));
+		object.insert(
+			MESSAGE_BATCH_SEQUENCE_FIELD.to_owned(),
+			JsonValue::from(sequence),
+		);
 	}
 
 	if let Some(message) = message
@@ -310,7 +318,10 @@ mod tests {
 		let content = add_reference_relation(content, original_event_id.as_ref()).unwrap();
 
 		assert_eq!(content[MESSAGE_RELATES_TO_FIELD]["rel_type"], "m.reference");
-		assert_eq!(content[MESSAGE_RELATES_TO_FIELD]["event_id"], "$original:example.org");
+		assert_eq!(
+			content[MESSAGE_RELATES_TO_FIELD]["event_id"],
+			"$original:example.org"
+		);
 		// m.new_content should NOT be present
 		assert!(content.get("m.new_content").is_none());
 	}

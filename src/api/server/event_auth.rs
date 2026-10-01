@@ -2,16 +2,13 @@ use std::{borrow::Borrow, iter::once};
 
 use axum::extract::State;
 use futures::StreamExt;
-use ruma::{
-	RoomId,
-	api::{client::error::ErrorKind, federation::authorization::get_event_authorization},
-};
+use ruma::api::federation::authorization::get_event_authorization;
 use tuwunel_core::{
-	Error, Result,
+	Result,
 	utils::stream::{BroadbandExt, ReadyExt},
 };
 
-use super::AccessCheck;
+use super::{AccessCheck, utils::require_event_in_room};
 use crate::Ruma;
 
 /// # `GET /_matrix/federation/v1/event_auth/{roomId}/{eventId}`
@@ -23,34 +20,25 @@ pub(crate) async fn get_event_authorization_route(
 	State(services): State<crate::State>,
 	body: Ruma<get_event_authorization::v1::Request>,
 ) -> Result<get_event_authorization::v1::Response> {
-	AccessCheck {
+	let access_check = AccessCheck {
 		services: &services,
 		origin: body.origin(),
 		room_id: &body.room_id,
 		event_id: None,
-	}
-	.check()
-	.await?;
+	};
 
-	let event = services
-		.timeline
-		.get_pdu_json(&body.event_id)
-		.await
-		.map_err(|_| Error::BadRequest(ErrorKind::NotFound, "Event not found."))?;
+	access_check.check().await?;
 
-	let room_id_str = event
-		.get("room_id")
-		.and_then(|val| val.as_str())
-		.ok_or_else(|| Error::bad_database("Invalid event in database."))?;
+	require_event_in_room(&services, &body.event_id, &body.room_id).await?;
 
-	let room_id = <&RoomId>::try_from(room_id_str)
-		.map_err(|_| Error::bad_database("Invalid room_id in event in database."))?;
-
-	let room_version = services.state.get_room_version(room_id).await?;
+	let room_version = services
+		.state
+		.get_room_version(&body.room_id)
+		.await?;
 
 	let auth_chain = services
 		.auth_chain
-		.event_ids_iter(room_id, &room_version, once(body.event_id.borrow()))
+		.event_ids_iter(&body.room_id, &room_version, once(body.event_id.borrow()))
 		.ready_filter_map(Result::ok)
 		.broad_filter_map(async |id| {
 			let pdu = services.timeline.get_pdu_json(&id).await.ok()?;

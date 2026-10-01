@@ -19,19 +19,31 @@ name = "tuwunel"
 maintainer = "Jason Volk <jason@zemos.net>"
 copyright = "2025, Tuwunel Contributors"
 license-file = ["../../LICENSE", "3"]
-depends = "$auto, ca-certificates"
+# The release binary is statically linked, so $auto has no shared library to
+# discover and only sends cargo-deb looking for a dpkg-shlibdeps that the build
+# image does not carry. procps owns /usr/bin/kill, which the unit's ExecReload=
+# invokes; it is only Priority: important, so a trimmed install would not
+# otherwise carry it.
+depends = "ca-certificates, adduser, procps"
+recommends = "apparmor"
+conflicts = "conduwuit, matrix-conduit"
 extended-description = """\
 High performance Matrix homeserver written in Rust"""
 section = "net"
 priority = "optional"
-conf-files = ["/etc/tuwunel/tuwunel.toml"]
+conf-files = ["/etc/tuwunel/tuwunel.toml", "/etc/apparmor.d/usr.sbin.tuwunel"]
 maintainer-scripts = "../../debian/"
-systemd-units = { unit-name = "tuwunel", start = false }
+# cargo-deb enables every unit it installs into the systemd directory, and
+# socket activation stays opt-in, so nothing is enabled from here and
+# debian/postinst enables the service alone.
+systemd-units = { unit-name = "tuwunel", enable = false, start = false }
 assets = [
 	["../../debian/README.md", "usr/share/doc/tuwunel/README.Debian", "644"],
 	["../../README.md", "usr/share/doc/tuwunel/", "644"],
 	["target/release/tuwunel", "usr/sbin/tuwunel", "755"],
 	["../../tuwunel-example.toml", "etc/tuwunel/tuwunel.toml", "640"],
+	["../../debian/units/tuwunel.socket", "usr/lib/systemd/system/tuwunel.socket", "644"],
+	["../../debian/apparmor/usr.sbin.tuwunel", "etc/apparmor.d/usr.sbin.tuwunel", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -39,12 +51,22 @@ name = "tuwunel"
 summary = """\
 High performance Matrix homeserver written in Rust"""
 require-sh = false
+# The binary reads its trust roots from the platform store rather than bundling
+# webpki roots, so a host without a CA bundle refuses to start. --auto-req only
+# discovers shared libraries, which leaves this one undeclared. rpm/tuwunel.spec
+# states the same requirement for the COPR build.
+requires = { ca-certificates = "*" }
+# Same reasoning as the deb metadata above: one database directory, one server.
+conflicts = { conduwuit = "*", matrix-conduit = "*" }
 post_install_script = "rpm/postinst"
 assets = [
 	{ source = "target/release/tuwunel", dest = "/usr/sbin/tuwunel", mode = "755" },
+	{ source = "rpm/adopt-legacy-database", dest = "/usr/libexec/tuwunel/adopt-legacy-database", mode = "755" },
 	{ source = "README.md", dest = "/usr/share/doc/tuwunel/", mode = "644", doc = true },
-	{ source = "tuwunel-example.toml", dest = "/etc/tuwunel/tuwunel.toml", mode = "640", config = "noreplace" },
+	{ source = "tuwunel-example.toml", dest = "/etc/tuwunel/tuwunel.toml", mode = "640", config = "noreplace", user = "tuwunel", group = "tuwunel" },
 	{ source = "rpm/tuwunel.service", dest = "/etc/systemd/system/", mode = "644" },
+	{ source = "rpm/tuwunel.socket", dest = "/etc/systemd/system/", mode = "644" },
+	{ source = "rpm/sysusers", dest = "/usr/lib/sysusers.d/tuwunel.conf", mode = "644" },
 ]
 
 [package.metadata.arch]
@@ -52,6 +74,7 @@ name = "tuwunel"
 pkgdesc = "High performance Matrix homeserver written in Rust"
 
 [features]
+s3_storage = ["tuwunel-service/s3_storage"]
 default = [
 	"brotli_compression",
 	"element_hacks",
@@ -66,9 +89,6 @@ default = [
 	"zstd_compression",
 ]
 
-blurhashing = [
-	"tuwunel-service/blurhashing",
-]
 brotli_compression = [
 	"tuwunel-admin/brotli_compression",
 	"tuwunel-api/brotli_compression",
@@ -146,20 +166,20 @@ media_thumbnail = [
 ]
 perf_measurements = [
 	"dep:opentelemetry",
+	"dep:opentelemetry-otlp",
+	"dep:opentelemetry_sdk",
 	"dep:tracing-flame",
 	"dep:tracing-opentelemetry",
-	"dep:opentelemetry_sdk",
-	#"dep:opentelemetry-jaeger",
 	"tuwunel-core/perf_measurements",
 	"tuwunel-core/sentry_telemetry",
 ]
 # increases performance, reduces build times, and reduces binary size by not compiling or
 # genreating code for log level filters that users will generally not use (debug and trace)
 release_max_log_level = [
-	"tracing/max_level_trace",
-	"tracing/release_max_level_info",
 	"log/max_level_trace",
 	"log/release_max_level_info",
+	"tracing/max_level_trace",
+	"tracing/release_max_level_info",
 	"tuwunel-admin/release_max_log_level",
 	"tuwunel-api/release_max_log_level",
 	"tuwunel-core/release_max_log_level",
@@ -168,19 +188,24 @@ release_max_log_level = [
 	"tuwunel-service/release_max_log_level",
 ]
 sentry_telemetry = [
+	"dep:reqwest",
 	"dep:sentry",
-	"dep:sentry-tracing",
 	"dep:sentry-tower",
+	"dep:sentry-tracing",
 	"tuwunel-core/sentry_telemetry",
 	"tuwunel-router/sentry_telemetry",
 ]
 systemd = [
 	"tuwunel-router/systemd",
+	"tuwunel-service/systemd",
 ]
 # enable the tokio_console server ncompatible with release_max_log_level
 tokio_console = [
-	#"dep:console-subscriber",
+	"dep:console-subscriber",
 	"tokio/tracing",
+]
+tuwunel_mods = [
+	"tuwunel-core/tuwunel_mods",
 ]
 url_preview = [
 	"tuwunel-service/url_preview",
@@ -193,9 +218,6 @@ zstd_compression = [
 	"tuwunel-router/zstd_compression",
 	"tuwunel-service/zstd_compression",
 ]
-tuwunel_mods = [
-	"tuwunel-core/tuwunel_mods",
-]
 
 [dependencies]
 tuwunel-admin.workspace = true
@@ -207,17 +229,20 @@ tuwunel-router.workspace = true
 tuwunel-service.workspace = true
 
 clap.workspace = true
-#console-subscriber.optional = true
-#console-subscriber.workspace = true
+console-subscriber.optional = true
+console-subscriber.workspace = true
 const-str.workspace = true
 ctor.workspace = true
+dtor.workspace = true
 log.workspace = true
-#opentelemetry-jaeger.optional = true
-#opentelemetry-jaeger.workspace = true
+opentelemetry-otlp.optional = true
+opentelemetry-otlp.workspace = true
 opentelemetry.optional = true
 opentelemetry.workspace = true
 opentelemetry_sdk.optional = true
 opentelemetry_sdk.workspace = true
+reqwest.optional = true
+reqwest.workspace = true
 sentry-tower.optional = true
 sentry-tower.workspace = true
 sentry-tracing.optional = true
@@ -234,10 +259,27 @@ tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
 
+# tokio hard-errors on this feature without the cfg, so it tracks the same gate
+# as the code enabling the histogram.
+[target.'cfg(tokio_unstable)'.dependencies.tokio]
+features = ["schedule-latency"]
+workspace = true
+
 [dev-dependencies]
+axum.workspace = true
+axum-server.workspace = true
+axum-server.features = ["tls-rustls"]
 criterion.workspace = true
+futures.workspace = true
+image.workspace = true
 insta.workspace = true
 maplit.workspace = true
+quoted_printable.workspace = true
+reqwest.workspace = true
+reqwest.features = ["form", "query"]
+rust-rocksdb.workspace = true
+serde_json.workspace = true
+serde_urlencoded.workspace = true
 similar.workspace = true
 
 [lints]

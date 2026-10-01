@@ -1,4 +1,6 @@
-mod commands;
+mod issue;
+mod list;
+mod revoke;
 
 use clap::Subcommand;
 use tuwunel_core::Result;

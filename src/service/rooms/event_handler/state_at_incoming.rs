@@ -1,18 +1,29 @@
-use std::{collections::HashMap, iter::Iterator};
+use std::{collections::HashMap, sync::atomic::AtomicBool};
 
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, future::try_join};
-use ruma::{OwnedEventId, RoomId, RoomVersionId};
+use futures::{
+	FutureExt, StreamExt, TryFutureExt, TryStreamExt,
+	future::{join, try_join},
+};
+use ruma::{EventId, OwnedEventId, RoomId, RoomVersionId};
 use tuwunel_core::{
-	Result, apply, debug, debug_warn, err, implement,
-	matrix::{Event, StateMap, state_res::AuthSet},
+	Error, Result, debug, debug_warn, err, implement,
+	matrix::Event,
 	ref_at, trace,
 	utils::{
 		option::OptionExt,
-		stream::{BroadbandExt, IterStream, ReadyExt, TryBroadbandExt, TryWidebandExt},
+		stream::{BroadbandExt, IterStream, TryBroadbandExt, WidebandExt},
 	},
 };
 
-use crate::rooms::short::ShortStateHash;
+use crate::rooms::{
+	short::{ShortStateHash, ShortStateKey},
+	state_res::{AuthSet, StateMap},
+};
+
+enum ForkError {
+	State(Error),
+	Chain(Error),
+}
 
 // TODO: if we know the prev_events of the incoming event we can avoid the
 #[implement(super::Service)]
@@ -56,11 +67,26 @@ where
 	let state = self
 		.services
 		.state_accessor
-		.state_full_ids(prev_event_sstatehash)
-		.collect::<HashMap<_, _>>()
+		.state_full_ids_strict(prev_event_sstatehash)
+		.try_collect::<HashMap<_, _>>()
+		.map(|state| {
+			state
+				.inspect_err(|error| {
+					debug_warn!(
+						%prev_event_id,
+						?prev_event_sstatehash,
+						%error,
+						"Failed to materialize state at prev_event.",
+					);
+				})
+				.ok()
+		})
 		.map(Ok);
 
-	let (prev_event, mut state) = try_join(prev_event, state).await?;
+	let (prev_event, state) = try_join(prev_event, state).await?;
+	let Some(mut state) = state else {
+		return Ok(None);
+	};
 
 	debug!(
 		?prev_event_id,
@@ -69,6 +95,10 @@ where
 		"Resolved state at prev_event.",
 	);
 
+	// Every event holding a `shorteventid_shortstatehash` row passed spec check 5
+	// (auth against the state at its own position) as a hard reject; soft failure
+	// (spec check 6) still writes the row, so soft-failed events are valid fold
+	// inputs while positionally rejected events never gain a row.
 	if let Some(state_key) = prev_event.state_key() {
 		let prev_event_type = prev_event.event_type().to_cow_str().into();
 
@@ -134,22 +164,43 @@ where
 	};
 
 	trace!("Calculating fork states...");
-	let (fork_states, auth_chain_sets) = extremity_sstatehashes
+	let forks = extremity_sstatehashes
 		.into_iter()
-		.try_stream()
-		.wide_and_then(|(sstatehash, prev_event)| {
+		.stream()
+		.wide_then(|(sstatehash, prev_event)| {
 			self.state_at_incoming_fork(room_id, room_version, sstatehash, prev_event)
 		})
-		.try_collect()
-		.map_ok(Vec::into_iter)
-		.map_ok(Iterator::unzip)
-		.map_ok(apply!(2, Vec::into_iter))
-		.map_ok(apply!(2, IterStream::stream))
+		.map(|fork| match fork {
+			| Ok(fork) => Ok(Ok(fork)),
+			| Err(ForkError::State(error)) => Ok(Err(error)),
+			| Err(ForkError::Chain(error)) => Err(error),
+		})
+		.try_collect::<Vec<_>>()
 		.await?;
+
+	let mut state_error = None;
+	let mut complete_forks = Vec::with_capacity(forks.len());
+	for fork in forks {
+		match fork {
+			| Ok(fork) => complete_forks.push(fork),
+			| Err(error) => {
+				state_error.get_or_insert(error);
+			},
+		}
+	}
+
+	if let Some(error) = state_error {
+		debug_warn!(%error, "Failed to materialize sibling fork state.");
+		return Ok(None);
+	}
+
+	let (fork_states, auth_chain_sets): (Vec<_>, Vec<_>) = complete_forks.into_iter().unzip();
+	let fork_states = fork_states.into_iter().stream();
+	let auth_chain_sets = auth_chain_sets.into_iter().stream();
 
 	trace!("Resolving state");
 	let Ok(new_state) = self
-		.state_resolution(room_id, room_version, fork_states, auth_chain_sets)
+		.state_resolution(room_id, room_version, fork_states, auth_chain_sets, None)
 		.inspect_ok(|_| trace!("State resolution done."))
 		.await
 	else {
@@ -189,10 +240,14 @@ async fn state_at_incoming_fork<Pdu>(
 	room_version: &RoomVersionId,
 	sstatehash: ShortStateHash,
 	prev_event: Pdu,
-) -> Result<(StateMap<OwnedEventId>, AuthSet<OwnedEventId>)>
+) -> Result<(StateMap<OwnedEventId>, AuthSet<OwnedEventId>), ForkError>
 where
 	Pdu: Event,
 {
+	// Every event holding a `shorteventid_shortstatehash` row passed spec check 5
+	// (auth against the state at its own position) as a hard reject; soft failure
+	// (spec check 6) still writes the row, so soft-failed events are valid fold
+	// inputs while positionally rejected events never gain a row.
 	let leaf = prev_event
 		.state_key()
 		.map_stream(async |state_key| {
@@ -210,10 +265,11 @@ where
 	let leaf_state_after_event: Vec<_> = self
 		.services
 		.state_accessor
-		.state_full_ids(sstatehash)
-		.chain(leaf)
-		.collect()
-		.await;
+		.state_full_ids_strict(sstatehash)
+		.chain(leaf.map(Ok))
+		.try_collect()
+		.await
+		.map_err(ForkError::State)?;
 
 	trace!(
 		prev_event = ?prev_event.event_id(),
@@ -222,29 +278,91 @@ where
 		"leaf state after event"
 	);
 
+	let state = leaf_state_after_event
+		.iter()
+		.map(|(shortstatekey, event_id)| (*shortstatekey, event_id));
+
 	let starting_events = leaf_state_after_event
 		.iter()
 		.map(ref_at!(1))
 		.map(AsRef::as_ref);
 
-	let auth_chain = self
-		.services
-		.auth_chain
-		.event_ids_iter(room_id, room_version, starting_events)
-		.try_collect();
+	let (state, chain) =
+		join(self.fork_state(state), self.fork_chain(room_id, room_version, starting_events))
+			.await;
 
-	let fork_state = leaf_state_after_event
-		.iter()
+	let chain = chain.map_err(ForkError::Chain)?;
+	let state = state.map_err(ForkError::State)?;
+
+	Ok((state, chain))
+}
+
+/// Converts one fork branch from short state keys to typed state keys.
+///
+/// A later duplicate state key replaces an earlier entry. Short state key
+/// lookup failures are returned without constructing a partial map.
+#[implement(super::Service)]
+pub(super) async fn fork_state<'a, State>(
+	&'a self,
+	state: State,
+) -> Result<StateMap<OwnedEventId>>
+where
+	State: Iterator<Item = (ShortStateKey, &'a OwnedEventId)> + Send + 'a,
+{
+	state
 		.stream()
-		.broad_then(|(k, id)| {
+		.wide_then(|(k, id)| {
 			self.services
 				.short
-				.get_statekey_from_short(*k)
+				.get_statekey_from_short(k)
 				.map_ok(|(ty, sk)| ((ty, sk), id.clone()))
 		})
-		.ready_filter_map(Result::ok)
-		.collect()
-		.map(Ok);
+		.try_collect()
+		.await
+}
 
-	try_join(fork_state, auth_chain).await
+/// Collects the full auth chain for one fork branch.
+///
+/// The ids are distinct as [`AuthSet::from_distinct`] requires: the chain
+/// walk dedups short ids and the short-to-event-id mapping is injective.
+/// Iteration order is arbitrary.
+#[implement(super::Service)]
+pub(super) async fn fork_chain<'a, Events>(
+	&'a self,
+	room_id: &'a RoomId,
+	room_version: &'a RoomVersionId,
+	starting_events: Events,
+) -> Result<AuthSet<OwnedEventId>>
+where
+	Events: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send + 'a,
+{
+	self.services
+		.auth_chain
+		.event_ids_iter(room_id, room_version, starting_events)
+		.try_collect()
+		.map_ok(AuthSet::from_distinct)
+		.await
+}
+
+/// Collects the strict full auth chain for one fork branch.
+///
+/// The shared completeness flag is cleared when a polled chain source cannot
+/// be loaded.
+#[implement(super::Service)]
+pub(super) async fn fork_chain_strict<'a, Events>(
+	&'a self,
+	room_id: &'a RoomId,
+	room_version: &'a RoomVersionId,
+	starting_events: Events,
+	complete: &'a AtomicBool,
+) -> Result<AuthSet<OwnedEventId>>
+where
+	Events: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send + 'a,
+{
+	self.services
+		.auth_chain
+		.event_ids_iter_strict(room_id, room_version, starting_events, complete)
+		.try_collect()
+		.map_ok(AuthSet::from_distinct)
+		.await
 }

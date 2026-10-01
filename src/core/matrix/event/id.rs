@@ -7,6 +7,14 @@ use crate::{Result, debug_error, err, matrix::room_version};
 ///
 /// Returns a tuple of the new `EventId` and the PDU as a `BTreeMap<String,
 /// CanonicalJsonValue>`.
+#[tracing::instrument(
+	name = "gen_event_id",
+	level = "debug",
+	skip_all,
+	fields(
+		len = pdu.get().len(),
+	)
+)]
 pub fn gen_event_id_canonical_json(
 	pdu: &RawJsonValue,
 	room_version_id: &RoomVersionId,
@@ -23,6 +31,14 @@ pub fn gen_event_id_canonical_json(
 /// Generates a correct eventId for the PDU. For v1/v2 incoming PDU's the
 /// value's event_id is passed through. For all outgoing PDU's and for v3+
 /// incoming PDU's it is generated.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	fields(
+		members = value.len(),
+		room_version = ?room_version_id,
+	)
+)]
 pub fn gen_event_id(
 	value: &CanonicalJsonObject,
 	room_version_id: &RoomVersionId,

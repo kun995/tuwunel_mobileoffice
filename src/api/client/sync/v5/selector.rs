@@ -1,21 +1,28 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::BTreeMap};
 
-use futures::{FutureExt, StreamExt, TryFutureExt, future::join5};
-use ruma::{OwnedRoomId, UInt, events::room::member::MembershipState, uint};
+use futures::{
+	FutureExt, StreamExt,
+	future::{join, join3},
+};
+use ruma::{
+	OwnedRoomId, RoomId, UInt, api::client::sync::sync_events::v5::ListId,
+	events::room::member::MembershipState, uint,
+};
 use tuwunel_core::{
-	apply, is_true,
+	Result, apply, debug_error, is_true,
 	matrix::PduCount,
 	trace,
 	utils::{
-		BoolExt, TryFutureExtExt,
+		BoolExt,
 		math::usize_from_ruma,
 		option::OptionExt,
 		stream::{BroadbandExt, IterStream},
 	},
 };
-use tuwunel_service::sync::Connection;
+use tuwunel_service::{sync::Connection, users::InviteFilter};
 
 use super::{
+	super::invite_permitted_room,
 	ListIds, ResponseLists, SyncInfo, Window, WindowRoom,
 	filter::{filter_room, filter_room_meta},
 };
@@ -27,17 +34,58 @@ pub(super) async fn selector(
 ) -> (Window, ResponseLists) {
 	use MembershipState::*;
 
-	let SyncInfo { services, sender_user, .. } = sync_info;
+	let SyncInfo {
+		services,
+		sender_user,
+		..
+	} = sync_info;
+
+	// MSC4155: a stored invite whose sender the recipient ignores or blocks is
+	// kept out of the window, and relaxing the configuration re-exposes it.
+	let invite_filter = services.users.invite_filter(sender_user).await;
 
 	let memberships = services
 		.state_cache
 		.user_memberships(sender_user, Some(&[Join, Invite, Knock]))
-		.map(|(membership, room_id)| (room_id.to_owned(), Some(membership)))
-		.collect::<Vec<_>>()
-		.await;
+		.map(|(membership, room_id)| (room_id.to_owned(), membership));
+
+	// A recipient filtering nothing is the common case, and judging an invite
+	// costs a stripped-state load, so only the filtering path buffers futures.
+	let actives = match invite_filter.is_permissive() {
+		true => memberships
+			.map(|(room_id, membership)| (room_id, Some(membership)))
+			.left_stream(),
+		false => memberships
+			.broad_filter_map(async |(room_id, membership)| {
+				let permitted = !matches!(membership, Invite)
+					|| invite_permitted_room(services, sender_user, &room_id, &invite_filter).await;
+
+				permitted.then_some((room_id, Some(membership)))
+			})
+			.right_stream(),
+	};
+
+	// Source retractions from tracked rooms, not a full left-state scan.
+	let retracted = conn
+		.rooms
+		.keys()
+		.stream()
+		.broad_filter_map(async |room_id| {
+			services
+				.state_cache
+				.is_left(sender_user, room_id)
+				.await
+				.then_some((room_id.clone(), Some(Leave)))
+		});
+
+	let memberships = actives.chain(retracted).collect::<Vec<_>>().await;
 	let mut visible = Vec::with_capacity(memberships.len());
 	for (room_id, membership) in memberships {
-		if services.deleted_rooms.should_hide_room(sender_user, &room_id).await {
+		if services
+			.deleted_rooms
+			.should_hide_room(sender_user, &room_id)
+			.await
+		{
 			// A room removed from a list must be sent as initial when a new event reopens it.
 			conn.rooms.remove(&room_id);
 		} else {
@@ -60,23 +108,16 @@ pub(super) async fn selector(
 		.collect::<Vec<_>>()
 		.await;
 
-	rooms.sort_by(room_sort);
-	rooms
-		.iter_mut()
-		.enumerate()
-		.for_each(|(i, room)| {
-			room.ranked = i;
-
-			conn.rooms
-				.entry(room.room_id.clone())
-				.or_default();
-		});
+	rooms.sort_unstable_by(room_sort);
+	for room in &rooms {
+		conn.rooms.entry(room.room_id.clone()).or_default();
+	}
 
 	trace!(?rooms);
 	let lists = response_lists(rooms.iter());
 
 	trace!(?lists);
-	let window = window(sync_info, conn, rooms.iter(), &lists).await;
+	let window = window(sync_info, conn, rooms.iter(), &lists, &invite_filter).await;
 
 	trace!(?window);
 	(window, lists)
@@ -94,7 +135,11 @@ async fn matcher(
 	room_id: OwnedRoomId,
 	membership: Option<MembershipState>,
 ) -> Option<WindowRoom> {
-	let SyncInfo { services, sender_user, .. } = sync_info;
+	let SyncInfo {
+		services,
+		sender_user,
+		..
+	} = sync_info;
 
 	let (matched, lists) = conn
 		.lists
@@ -114,63 +159,186 @@ async fn matcher(
 		.map(|lists| (lists.is_empty().is_false(), lists))
 		.await;
 
-	let last_notification = matched.then_async(|| {
-		services
+	let selected = matched
+		|| conn.subscriptions.contains_key(&room_id)
+		|| matches!(
+			membership,
+			Some(MembershipState::Leave | MembershipState::Ban)
+		);
+
+	if !selected {
+		return None;
+	}
+
+	let membership_only = membership_only(membership.as_ref());
+
+	let last_notification = async {
+		if membership_only {
+			return ActivityProbe::default();
+		}
+
+		let result = services
 			.pusher
 			.last_notification_read(sender_user, &room_id)
-			.unwrap_or_default()
-	});
-
-	let last_privateread = matched.then_async(|| {
-		services
-			.read_receipt
-			.last_privateread_update(sender_user, &room_id)
-	});
-
-	let last_receipt = matched.then_async(|| {
-		services
-			.read_receipt
-			.last_receipt_count(&room_id, sender_user.into(), None)
-			.unwrap_or_default()
-	});
-
-	let last_account = matched.then_async(|| {
-		services
-			.account_data
-			.last_count(Some(room_id.as_ref()), sender_user, Some(conn.next_batch))
-			.unwrap_or_default()
-	});
-
-	let last_timeline = matched.then_async(|| {
-		services
-			.timeline
-			.last_timeline_count(None, &room_id, Some(conn.next_batch.into()))
-			.map_ok(PduCount::into_unsigned)
-			.unwrap_or_default()
-	});
-
-	let (last_timeline, last_notification, last_account, last_receipt, last_privateread) =
-		join5(last_timeline, last_notification, last_account, last_receipt, last_privateread)
 			.await;
 
+		activity_probe(result, &room_id, "notification read", true)
+	};
+
+	let last_timeline = async {
+		if membership_only {
+			return ActivityProbe::default();
+		}
+
+		let result = services
+			.timeline
+			.last_timeline_count(None, &room_id, Some(conn.next_batch.into()))
+			.await
+			.map(PduCount::into_unsigned);
+
+		activity_probe(result, &room_id, "timeline", false)
+	};
+
+	let last_membership = async {
+		let result = match &membership {
+			Some(MembershipState::Join) => Some(
+				services
+					.state_cache
+					.get_joined_count(&room_id, sender_user)
+					.await,
+			),
+			Some(MembershipState::Invite) => Some(
+				services
+					.state_cache
+					.get_invite_count(&room_id, sender_user)
+					.await,
+			),
+			Some(MembershipState::Knock) => Some(
+				services
+					.state_cache
+					.get_knock_count(&room_id, sender_user)
+					.await,
+			),
+			Some(MembershipState::Leave | MembershipState::Ban) => Some(
+				services
+					.state_cache
+					.get_left_count(&room_id, sender_user)
+					.await,
+			),
+			_ => None,
+		};
+
+		result.map_or_else(ActivityProbe::default, |result| {
+			activity_probe(result, &room_id, "membership", false)
+		})
+	};
+
+	let (last_timeline, last_notification, last_membership) =
+		join3(last_timeline, last_notification, last_membership).await;
+
+	let (event_count, payload_count) = activity_counts(
+		membership.as_ref(),
+		conn.next_batch,
+		ActivityCounts {
+			timeline: last_timeline.count,
+			notification: last_notification.count,
+			membership: last_membership.count,
+			payload_probe_failed: last_timeline.failed
+				|| last_notification.failed
+				|| last_membership.failed,
+		},
+	);
+
 	Some(WindowRoom {
-		room_id: room_id.clone(),
+		room_id,
 		membership,
 		lists,
-		ranked: 0,
-		last_count: [
-			last_timeline,
-			last_notification,
-			last_account,
-			last_receipt,
-			last_privateread,
-		]
-		.into_iter()
-		.map(Option::unwrap_or_default)
-		.filter(|count| conn.next_batch.ge(count))
-		.max()
-		.unwrap_or_default(),
+		event_count,
+		payload_count,
 	})
+}
+
+#[derive(Copy, Clone, Default)]
+struct ActivityProbe {
+	count: Option<u64>,
+	failed: bool,
+}
+
+#[derive(Copy, Clone)]
+struct ActivityCounts {
+	timeline: Option<u64>,
+	notification: Option<u64>,
+	membership: Option<u64>,
+	payload_probe_failed: bool,
+}
+
+fn activity_counts(
+	membership: Option<&MembershipState>,
+	next_batch: u64,
+	counts: ActivityCounts,
+) -> (u64, u64) {
+	let timeline = bounded_count(next_batch, counts.timeline);
+	let notification = bounded_count(next_batch, counts.notification);
+	let membership_count = bounded_count(next_batch, counts.membership);
+	let membership_only = membership_only(membership);
+	let event_count = if membership_only {
+		membership_count
+	} else {
+		timeline.max(membership_count)
+	};
+	let fresh_count = if membership_only {
+		membership_count
+	} else {
+		timeline.max(notification).max(membership_count)
+	};
+	let payload_count = if counts.payload_probe_failed {
+		next_batch
+	} else {
+		fresh_count
+	};
+
+	(event_count, payload_count)
+}
+
+fn activity_probe(
+	result: Result<u64>,
+	room_id: &RoomId,
+	source: &'static str,
+	missing_is_zero: bool,
+) -> ActivityProbe {
+	match result {
+		Ok(count) => ActivityProbe {
+			count: Some(count),
+			failed: false,
+		},
+		Err(error) if missing_is_zero && error.is_not_found() => ActivityProbe::default(),
+		Err(error) => {
+			debug_error!(%room_id, %source, "Failed to read sliding sync activity: {error}");
+			ActivityProbe {
+				count: None,
+				failed: true,
+			}
+		}
+	}
+}
+
+#[inline]
+fn membership_only(membership: Option<&MembershipState>) -> bool {
+	matches!(
+		membership,
+		Some(
+			MembershipState::Invite
+				| MembershipState::Knock
+				| MembershipState::Leave
+				| MembershipState::Ban
+		)
+	)
+}
+
+fn bounded_count(next_batch: u64, count: Option<u64>) -> u64 {
+	count
+		.filter(|count| next_batch.ge(count))
+		.unwrap_or_default()
 }
 
 #[tracing::instrument(
@@ -183,47 +351,56 @@ async fn window<'a, Rooms>(
 	conn: &Connection,
 	rooms: Rooms,
 	lists: &ResponseLists,
+	invite_filter: &InviteFilter,
 ) -> Window
 where
 	Rooms: Iterator<Item = &'a WindowRoom> + Clone + Send + Sync,
 {
 	static FULL_RANGE: (UInt, UInt) = (UInt::MIN, UInt::MAX);
 
-	let SyncInfo { services, sender_user, .. } = sync_info;
+	let SyncInfo {
+		services,
+		sender_user,
+		..
+	} = sync_info;
 
 	let selections = lists
 		.keys()
-		.cloned()
-		.filter_map(|id| conn.lists.get(&id).map(|list| (id, list)))
+		.filter_map(|id| conn.lists.get(id).map(|list| (id, list)))
 		.flat_map(|(id, list)| {
-			let full_range = list
-				.ranges
-				.is_empty()
-				.then_some(&FULL_RANGE)
-				.into_iter();
+			let full_range = list.ranges.is_empty().then_some(&FULL_RANGE).into_iter();
 
 			list.ranges
 				.iter()
 				.chain(full_range)
 				.map(apply!(2, usize_from_ruma))
-				.map(move |range| (id.clone(), range))
+				.map(move |range| (id, range))
 		})
 		.flat_map(|(id, (start, end))| {
-			rooms
-				.clone()
-				.filter(move |&room| room.lists.contains(&id))
-				.filter(|&room| {
-					conn.rooms
-						.get(&room.room_id)
-						.is_some_and(|conn_room| {
-							conn_room.roomsince == 0 || room.last_count > conn_room.roomsince
-						})
-				})
-				.enumerate()
-				.skip_while(move |&(i, _)| i < start)
-				.take(end.saturating_add(1).saturating_sub(start))
-				.map(|(_, room)| (room.room_id.clone(), room.clone()))
+			select_list_range(rooms.clone(), id, start, end)
+				.map(|room| (room.room_id.clone(), room.clone()))
 		})
+		.stream();
+
+	let indexed_subscriptions = (conn.subscriptions.len() > 1).then(|| {
+		rooms
+			.clone()
+			.filter(|room| conn.subscriptions.contains_key(&room.room_id))
+			.map(|room| (&room.room_id, room))
+			.collect::<BTreeMap<_, _>>()
+	});
+
+	let retractions = rooms
+		.clone()
+		.filter(|room| {
+			matches!(
+				room.membership,
+				Some(MembershipState::Leave | MembershipState::Ban)
+			) && conn.rooms.get(&room.room_id).is_some_and(|conn_room| {
+				conn_room.roomsince != 0 && room.payload_count > conn_room.roomsince
+			})
+		})
+		.map(|room| (room.room_id.clone(), detached_room(room.clone())))
 		.stream();
 
 	let subscriptions = conn
@@ -239,24 +416,82 @@ where
 				return None;
 			}
 
-			filter_room_meta(sync_info, room_id)
-				.await
-				.into_option()?;
+			let room = indexed_subscriptions
+				.as_ref()
+				.map_or_else(
+					|| rooms.clone().find(|room| room.room_id == *room_id),
+					|indexed| indexed.get(&room_id).copied(),
+				)
+				.cloned();
 
-			Some(WindowRoom {
-				room_id: room_id.clone(),
-				lists: Default::default(),
-				ranked: usize::MAX,
-				last_count: 0,
-				membership: services
-					.state_cache
-					.user_membership(sender_user, room_id)
-					.await,
-			})
+			let (membership, filter) = if let Some(room) = &room {
+				(
+					room.membership.clone(),
+					filter_room_meta(sync_info, room_id).await,
+				)
+			} else {
+				join(
+					services.state_cache.user_membership(sender_user, room_id),
+					filter_room_meta(sync_info, room_id),
+				)
+				.await
+			};
+
+			if !filter {
+				return None;
+			}
+
+			if let Some(room) = room {
+				return Some(detached_room(room));
+			}
+
+			// MSC4155: a subscription the window never admitted has no verdict
+			// yet, so an ignored or blocked invite is judged here instead.
+			if matches!(membership, Some(MembershipState::Invite))
+				&& !invite_permitted_room(services, sender_user, room_id, invite_filter).await
+			{
+				return None;
+			}
+
+			matcher(sync_info, conn, room_id.clone(), membership)
+				.await
+				.map(detached_room)
 		})
 		.map(|room| (room.room_id.clone(), room));
 
-	subscriptions.chain(selections).collect().await
+	retractions
+		.chain(subscriptions)
+		.chain(selections)
+		.collect()
+		.await
+}
+
+fn detached_room(room: WindowRoom) -> WindowRoom {
+	WindowRoom {
+		lists: ListIds::new(),
+		..room
+	}
+}
+
+fn select_list_range<'a, Rooms>(
+	rooms: Rooms,
+	id: &ListId,
+	start: usize,
+	end: usize,
+) -> impl Iterator<Item = &'a WindowRoom>
+where
+	Rooms: Iterator<Item = &'a WindowRoom>,
+{
+	rooms
+		.filter(move |room| room.lists.contains(id))
+		.filter(|room| {
+			!matches!(
+				room.membership,
+				Some(MembershipState::Leave | MembershipState::Ban)
+			)
+		})
+		.skip(start)
+		.take(end.saturating_add(1).saturating_sub(start))
 }
 
 fn response_lists<'a, Rooms>(rooms: Rooms) -> ResponseLists
@@ -264,6 +499,12 @@ where
 	Rooms: Iterator<Item = &'a WindowRoom>,
 {
 	rooms
+		.filter(|room| {
+			!matches!(
+				room.membership,
+				Some(MembershipState::Leave | MembershipState::Ban)
+			)
+		})
 		.flat_map(|room| room.lists.iter())
 		.fold(ResponseLists::default(), |mut lists, id| {
 			let list = lists.entry(id.clone()).or_default();
@@ -277,5 +518,183 @@ where
 }
 
 fn room_sort(a: &WindowRoom, b: &WindowRoom) -> Ordering {
-	b.last_count.cmp(&a.last_count)
+	b.event_count
+		.cmp(&a.event_count)
+		.then_with(|| a.room_id.cmp(&b.room_id))
+}
+
+#[cfg(test)]
+mod tests {
+	use ruma::{
+		OwnedRoomId, api::client::sync::sync_events::v5::ListId,
+		events::room::member::MembershipState, room_id,
+	};
+
+	use super::{
+		ActivityCounts, ListIds, WindowRoom, activity_counts, detached_room, room_sort,
+		select_list_range,
+	};
+
+	const NEXT_BATCH: u64 = 10;
+
+	#[test]
+	fn notification_activity_refreshes_payload_without_reordering() {
+		let (event_count, payload_count) = activity_counts(
+			Some(&MembershipState::Join),
+			NEXT_BATCH,
+			ActivityCounts {
+				timeline: Some(2),
+				notification: Some(8),
+				membership: Some(1),
+				payload_probe_failed: false,
+			},
+		);
+
+		assert_eq!((event_count, payload_count), (2, 8));
+
+		let mut rooms = [
+			room(room_id!("!current:example.com").to_owned(), 3, 3, None),
+			room(
+				room_id!("!notification:example.com").to_owned(),
+				event_count,
+				payload_count,
+				None,
+			),
+		];
+
+		rooms.sort_by(room_sort);
+		assert_eq!(rooms[0].room_id, room_id!("!current:example.com"));
+	}
+
+	#[test]
+	fn stripped_membership_rooms_use_only_membership_activity() {
+		for membership in [
+			MembershipState::Invite,
+			MembershipState::Knock,
+			MembershipState::Leave,
+			MembershipState::Ban,
+		] {
+			let counts = activity_counts(
+				Some(&membership),
+				NEXT_BATCH,
+				ActivityCounts {
+					timeline: Some(9),
+					notification: Some(8),
+					membership: Some(4),
+					payload_probe_failed: false,
+				},
+			);
+
+			assert_eq!(counts, (4, 4));
+		}
+	}
+
+	#[test]
+	fn activity_probe_failure_forces_payload_without_reordering() {
+		let counts = activity_counts(
+			Some(&MembershipState::Join),
+			NEXT_BATCH,
+			ActivityCounts {
+				timeline: Some(2),
+				notification: None,
+				membership: Some(1),
+				payload_probe_failed: true,
+			},
+		);
+
+		assert_eq!(counts, (2, NEXT_BATCH));
+	}
+
+	#[test]
+	fn full_list_range_ignores_payload_freshness_and_departed_rooms() {
+		let list = ListId::from("main");
+		let mut rooms = [
+			room(
+				room_id!("!departed:example.com").to_owned(),
+				40,
+				40,
+				Some(MembershipState::Leave),
+			),
+			room(room_id!("!stale:example.com").to_owned(), 30, 1, None),
+			room(room_id!("!fresh:example.com").to_owned(), 20, 20, None),
+			room(room_id!("!tail:example.com").to_owned(), 10, 10, None),
+		];
+
+		for room in &mut rooms {
+			room.lists.push(list.clone());
+		}
+
+		let selected = select_list_range(rooms.iter(), &list, 0, 1)
+			.map(|room| room.room_id.clone())
+			.collect::<Vec<_>>();
+
+		assert_eq!(
+			selected,
+			[
+				room_id!("!stale:example.com").to_owned(),
+				room_id!("!fresh:example.com").to_owned(),
+			]
+		);
+	}
+
+	#[test]
+	fn equal_activity_rooms_have_deterministic_order() {
+		let mut rooms = [
+			room(room_id!("!z:example.com").to_owned(), 5, 5, None),
+			room(room_id!("!a:example.com").to_owned(), 5, 5, None),
+		];
+
+		rooms.sort_by(room_sort);
+
+		assert_eq!(
+			rooms.map(|room| room.room_id),
+			[
+				room_id!("!a:example.com").to_owned(),
+				room_id!("!z:example.com").to_owned(),
+			]
+		);
+	}
+
+	#[test]
+	fn subscription_keeps_computed_payload_freshness() {
+		let mut room = room(room_id!("!subscribed:example.com").to_owned(), 7, 9, None);
+		room.lists.push(ListId::from("outside-range"));
+
+		let room = detached_room(room);
+
+		assert_eq!(room.payload_count, 9);
+		assert!(room.lists.is_empty());
+	}
+
+	#[test]
+	fn retraction_has_no_list_provenance() {
+		let mut room = room(
+			room_id!("!departed:example.com").to_owned(),
+			7,
+			9,
+			Some(MembershipState::Leave),
+		);
+
+		room.lists.push(ListId::from("matched-before-leave"));
+
+		let room = detached_room(room);
+
+		assert!(room.lists.is_empty());
+		assert_eq!(room.membership, Some(MembershipState::Leave));
+	}
+
+	fn room(
+		room_id: OwnedRoomId,
+		event_count: u64,
+		payload_count: u64,
+		membership: Option<MembershipState>,
+	) -> WindowRoom {
+		WindowRoom {
+			room_id,
+			membership,
+			lists: ListIds::new(),
+			event_count,
+			payload_count,
+		}
+	}
 }

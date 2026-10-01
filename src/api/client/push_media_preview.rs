@@ -47,9 +47,9 @@ pub(crate) async fn get_push_media_thumbnail_route(
 	}
 
 	let method = match query.method.as_str() {
-		| "scale" => Method::Scale,
-		| "crop" => Method::Crop,
-		| _ => return Err!(Request(InvalidParam("Unsupported thumbnail method."))),
+		"scale" => Method::Scale,
+		"crop" => Method::Crop,
+		_ => return Err!(Request(InvalidParam("Unsupported thumbnail method."))),
 	};
 
 	let server_name: &ServerName = server_name
@@ -70,21 +70,20 @@ pub(crate) async fn get_push_media_thumbnail_route(
 		)
 		.await
 	{
-		return Err!(Request(Forbidden("Invalid or expired media preview signature.")));
+		return Err!(Request(Forbidden(
+			"Invalid or expired media preview signature."
+		)));
 	}
 
-	let mxc = Mxc { server_name, media_id: &media_id };
+	let mxc = Mxc {
+		server_name,
+		media_id: &media_id,
+	};
 	let dim = Dim::new(query.width, query.height, Some(method));
-	let Some(file) = services
-		.media
-		.get_push_thumbnail(&mxc, &dim)
-		.await?
-	else {
+	let Some(file) = services.media.get_push_thumbnail(&mxc, &dim).await? else {
 		return Err!(Request(NotFound("Media thumbnail not found.")));
 	};
-	let Some(content) = file.content else {
-		return Err!(Request(NotFound("Media thumbnail not found.")));
-	};
+	let content = file.content;
 
 	let now = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)

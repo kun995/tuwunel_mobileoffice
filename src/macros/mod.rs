@@ -1,4 +1,5 @@
 mod admin;
+mod async_noinline;
 mod cargo;
 mod config;
 mod debug;
@@ -43,6 +44,11 @@ pub fn rustc_flags_capture(args: TokenStream) -> TokenStream { rustc::flags_capt
 pub fn rustc_version(args: TokenStream) -> TokenStream { rustc::version(args) }
 
 #[proc_macro_attribute]
+pub fn async_noinline(args: TokenStream, input: TokenStream) -> TokenStream {
+	attribute_macro::<ItemFn, _>(args, input, async_noinline::async_noinline)
+}
+
+#[proc_macro_attribute]
 pub fn implement(args: TokenStream, input: TokenStream) -> TokenStream {
 	attribute_macro::<ItemFn, _>(args, input, implement::implement)
 }
@@ -66,7 +72,7 @@ where
 	let item = parse_macro_input!(input as I);
 	syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated
 		.parse(args)
-		.map(|args| args.iter().cloned().collect::<Vec<_>>())
-		.and_then(|ref args| func(item, args))
+		.map(|args| args.into_iter().collect::<Vec<_>>())
+		.and_then(|args| func(item, &args))
 		.unwrap_or_else(|e| e.to_compile_error().into())
 }

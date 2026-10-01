@@ -6,7 +6,7 @@ use axum_extra::{
 	TypedHeader,
 	headers::{Authorization, authorization::Bearer},
 };
-use ruma::{EventId, OwnedEventId, RoomId, api::client::error::ErrorKind};
+use ruma::{EventId, OwnedEventId, RoomId, api::error::ErrorKind};
 use serde::Deserialize;
 use tuwunel_core::{Err, Error, Result, err, matrix::event::Event};
 
@@ -18,7 +18,7 @@ use tuwunel_core::{Err, Error, Result, err, matrix::event::Event};
 pub(crate) async fn delete_event_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
-	Path((room_id, event_id)): Path<(Box<RoomId>, Box<EventId>)>,
+	Path((room_id, event_id)): Path<(ruma::OwnedRoomId, ruma::OwnedEventId)>,
 ) -> Result<Json<serde_json::Value>> {
 	// Authenticate user from Bearer token
 	let (sender_user, ..) = services
@@ -27,17 +27,13 @@ pub(crate) async fn delete_event_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
 	// Verify the user is in the room
-	if !services
-		.state_cache
-		.is_joined(&sender_user, &room_id)
-		.await
-	{
+	if !services.state_cache.is_joined(&sender_user, &room_id).await {
 		return Err!(Request(Forbidden("You are not a member of this room.")));
 	}
 
@@ -72,7 +68,7 @@ pub(crate) struct DeleteEventsBody {
 pub(crate) async fn delete_events_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
-	Path(room_id): Path<Box<RoomId>>,
+	Path(room_id): Path<ruma::OwnedRoomId>,
 	Json(body): Json<DeleteEventsBody>,
 ) -> Result<Json<serde_json::Value>> {
 	// Authenticate user from Bearer token
@@ -82,17 +78,13 @@ pub(crate) async fn delete_events_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
 	// Verify the user is in the room
-	if !services
-		.state_cache
-		.is_joined(&sender_user, &room_id)
-		.await
-	{
+	if !services.state_cache.is_joined(&sender_user, &room_id).await {
 		return Err!(Request(Forbidden("You are not a member of this room.")));
 	}
 

@@ -7,7 +7,7 @@ use axum_extra::{
 	headers::{Authorization, authorization::Bearer},
 };
 use futures::{FutureExt, StreamExt, stream};
-use ruma::{OwnedUserId, RoomId, UserId, api::client::error::ErrorKind};
+use ruma::{OwnedUserId, RoomId, UserId, api::error::ErrorKind};
 use serde::{Deserialize, Serialize};
 use tuwunel_core::{Err, Error, Result};
 
@@ -30,7 +30,7 @@ pub(crate) struct DissolveRoomResponse {
 pub(crate) async fn dissolve_room_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
-	Path(room_id): Path<Box<RoomId>>,
+	Path(room_id): Path<ruma::OwnedRoomId>,
 	Json(body): Json<DissolveRoomBody>,
 ) -> Result<Json<DissolveRoomResponse>> {
 	let (sender_user, ..) = services
@@ -39,7 +39,7 @@ pub(crate) async fn dissolve_room_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
@@ -60,10 +60,7 @@ pub(crate) async fn dissolve_room_route(
 
 	let state_lock = services.state.mutex.lock(room_id_ref).await;
 	let target_user_ids: Vec<_> = stream::select_all([
-		services
-			.state_cache
-			.room_members(room_id_ref)
-			.boxed(),
+		services.state_cache.room_members(room_id_ref).boxed(),
 		services
 			.state_cache
 			.room_members_invited(room_id_ref)
@@ -85,7 +82,9 @@ pub(crate) async fn dissolve_room_route(
 		.await?;
 	let sender_power = power_levels.for_user(sender_user_ref);
 	if sender_power < power_levels.kick {
-		return Err!(Request(Forbidden("You do not have permission to dissolve this room.")));
+		return Err!(Request(Forbidden(
+			"You do not have permission to dissolve this room."
+		)));
 	}
 
 	let blocking_user_ids: Vec<_> = target_user_ids
@@ -119,7 +118,13 @@ pub(crate) async fn dissolve_room_route(
 
 		services
 			.membership
-			.kick(room_id_ref, &user_id, Some(&reason), sender_user_ref, &state_lock)
+			.kick(
+				room_id_ref,
+				&user_id,
+				Some(&reason),
+				sender_user_ref,
+				&state_lock,
+			)
 			.boxed()
 			.await?;
 		removed_user_ids.push(user_id);
@@ -127,7 +132,13 @@ pub(crate) async fn dissolve_room_route(
 
 	services
 		.membership
-		.leave(sender_user_ref, room_id_ref, Some(reason), false, &state_lock)
+		.leave(
+			sender_user_ref,
+			room_id_ref,
+			Some(reason),
+			false,
+			&state_lock,
+		)
 		.boxed()
 		.await?;
 

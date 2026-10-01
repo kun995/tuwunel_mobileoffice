@@ -1,3 +1,10 @@
+//! Evaluates user visibility and event-authoring permissions.
+//!
+//! Historical visibility checks combine event-time state with retained
+//! membership metadata. Invite and tombstone checks use the normal event-build
+//! pipeline as non-persisting authorization probes.
+
+use futures::pin_mut;
 use ruma::{
 	EventId, RoomId, UserId,
 	events::{
@@ -11,16 +18,19 @@ use ruma::{
 };
 use tuwunel_core::{
 	Err, Result, implement,
-	matrix::{Event, StateKey},
+	matrix::{Event, PduCount, StateKey},
 	pdu::PduBuilder,
+	utils::FutureBoolExt,
 };
 
-use crate::rooms::state::RoomMutexGuard;
+use crate::rooms::{short::ShortStateHash, state::RoomMutexGuard};
 
-/// Checks if a given user can redact a given event
+/// Reports whether a user may redact an event in a room.
 ///
-/// If federation is true, it allows redaction events from any user of the
-/// same server as the original event sender
+/// Cross-room targets are denied, while create and server-ACL targets return a
+/// forbidden error. Federation permits the own-event rule for any sender on
+/// the target sender's server; power-level failures fall back to create-event
+/// ownership and exact sender equality.
 #[implement(super::Service)]
 pub async fn user_can_redact(
 	&self,
@@ -33,9 +43,18 @@ pub async fn user_can_redact(
 
 	if redacting_event
 		.as_ref()
+		.is_ok_and(|pdu| pdu.room_id() != room_id)
+	{
+		return Ok(false);
+	}
+
+	if redacting_event
+		.as_ref()
 		.is_ok_and(|pdu| *pdu.kind() == TimelineEventType::RoomCreate)
 	{
-		return Err!(Request(Forbidden("Redacting m.room.create is not safe, forbidding.")));
+		return Err!(Request(Forbidden(
+			"Redacting m.room.create is not safe, forbidding."
+		)));
 	}
 
 	if redacting_event
@@ -49,38 +68,41 @@ pub async fn user_can_redact(
 	}
 
 	match self.get_power_levels(room_id).await {
-		| Ok(power_levels) => Ok(power_levels.user_can_redact_event_of_other(sender)
+		Ok(power_levels) => Ok(power_levels.user_can_redact_event_of_other(sender)
 			|| power_levels.user_can_redact_own_event(sender)
 				&& match redacting_event {
-					| Ok(redacting_event) => {
+					Ok(redacting_event) => {
 						if federation {
 							redacting_event.sender().server_name() == sender.server_name()
 						} else {
 							redacting_event.sender() == sender
 						}
-					},
-					| _ => false,
+					}
+					_ => false,
 				}),
-		| _ => {
+		_ => {
 			// Falling back on m.room.create to judge power level
 			match self
 				.room_state_get(room_id, &StateEventType::RoomCreate, "")
 				.await
 			{
-				| Ok(room_create) => Ok(room_create.sender() == sender
+				Ok(room_create) => Ok(room_create.sender() == sender
 					|| redacting_event
 						.as_ref()
 						.is_ok_and(|redacting_event| redacting_event.sender() == sender)),
-				| _ => Err!(Database(
+				_ => Err!(Database(
 					"No m.room.power_levels or m.room.create events in database for room"
 				)),
 			}
-		},
+		}
 	}
 }
 
-/// Whether a user is allowed to see an event, based on
-/// the room's history_visibility at that event's state.
+/// Reports whether a user may see an event under its historical visibility.
+///
+/// Missing event state is allowed, and missing or invalid history visibility
+/// defaults to `shared`. The `shared` decision also accounts for the user's
+/// membership intervals around the event.
 #[implement(super::Service)]
 #[tracing::instrument(skip_all, level = "trace")]
 pub async fn user_can_see_event(
@@ -89,88 +111,130 @@ pub async fn user_can_see_event(
 	room_id: &RoomId,
 	event_id: &EventId,
 ) -> bool {
-	let Ok(shortstatehash) = self
-		.services
-		.state
-		.pdu_shortstatehash(event_id)
-		.await
-	else {
+	let Ok(shortstatehash) = self.services.state.pdu_shortstatehash(event_id).await else {
 		return true;
 	};
 
 	let history_visibility = self
 		.state_get_content(shortstatehash, &StateEventType::RoomHistoryVisibility, "")
 		.await
-		.map_or(HistoryVisibility::Shared, |c: RoomHistoryVisibilityEventContent| {
-			c.history_visibility
-		});
+		.map_or(
+			HistoryVisibility::Shared,
+			|c: RoomHistoryVisibilityEventContent| c.history_visibility,
+		);
 
 	match history_visibility {
-		| HistoryVisibility::WorldReadable => true,
+		HistoryVisibility::WorldReadable => true,
 
 		// Allow if any member on requesting server was AT LEAST invited, else deny
-		| HistoryVisibility::Invited => {
-			self.user_was_invited(shortstatehash, user_id)
-				.await
-		},
+		HistoryVisibility::Invited => self.user_was_invited(shortstatehash, user_id).await,
 
 		// Allow if any member on requested server was joined, else deny
-		| HistoryVisibility::Joined => {
-			self.user_was_joined(shortstatehash, user_id)
-				.await
-		},
+		HistoryVisibility::Joined => self.user_was_joined(shortstatehash, user_id).await,
 
-		| HistoryVisibility::Shared | _ => {
-			self.services
-				.state_cache
-				.is_joined(user_id, room_id)
+		// An unrecognized value is treated as shared.
+		HistoryVisibility::Shared | _ => {
+			self.user_shared_history(shortstatehash, room_id, event_id, user_id)
 				.await
-		},
+		}
 	}
 }
 
-/// Whether a user is allowed to see an event, based on
-/// the room's history_visibility at that event's state.
+/// Whether a user may see an event under `shared` history visibility.
+///
+/// A current member sees the whole room, which the first check answers without
+/// touching room state. A former member keeps events through their latest
+/// leave, and lookup failures deny access.
+#[implement(super::Service)]
+async fn user_shared_history(
+	&self,
+	shortstatehash: ShortStateHash,
+	room_id: &RoomId,
+	event_id: &EventId,
+	user_id: &UserId,
+) -> bool {
+	let state_cache = &self.services.state_cache;
+
+	if state_cache.is_joined(user_id, room_id).await
+		|| self.user_was_joined(shortstatehash, user_id).await
+	{
+		return true;
+	}
+
+	if !state_cache.once_joined(user_id, room_id).await {
+		return false;
+	}
+
+	let Ok(left_count) = state_cache.get_left_count(room_id, user_id).await else {
+		return false;
+	};
+
+	let Ok(event_count) = self.services.timeline.get_pdu_count(event_id).await else {
+		return false;
+	};
+
+	event_count <= PduCount::from_unsigned(left_count)
+}
+
+/// Reports whether a user may read the room's current state events.
+///
+/// Current membership grants immediate access. Otherwise world-readable
+/// history grants access; invited and shared visibility consult current
+/// invitation or retained once-joined metadata. Missing visibility defaults
+/// to `shared`.
 #[implement(super::Service)]
 #[tracing::instrument(skip_all, level = "trace")]
 pub async fn user_can_see_state_events(&self, user_id: &UserId, room_id: &RoomId) -> bool {
-	if self
-		.services
-		.state_cache
-		.is_joined(user_id, room_id)
-		.await
-	{
+	if self.services.state_cache.is_joined(user_id, room_id).await {
 		return true;
 	}
 
 	let history_visibility = self
 		.room_state_get_content(room_id, &StateEventType::RoomHistoryVisibility, "")
 		.await
-		.map_or(HistoryVisibility::Shared, |c: RoomHistoryVisibilityEventContent| {
-			c.history_visibility
-		});
+		.map_or(
+			HistoryVisibility::Shared,
+			|c: RoomHistoryVisibilityEventContent| c.history_visibility,
+		);
 
 	match history_visibility {
-		| HistoryVisibility::WorldReadable => true,
+		HistoryVisibility::WorldReadable => true,
 
-		| HistoryVisibility::Invited => {
-			self.services
-				.state_cache
-				.is_invited(user_id, room_id)
-				.await
-		},
+		HistoryVisibility::Invited => self.services.state_cache.is_invited(user_id, room_id).await,
 
-		| HistoryVisibility::Shared => {
+		HistoryVisibility::Shared => {
 			self.services
 				.state_cache
 				.once_joined(user_id, room_id)
 				.await
-		},
+		}
 
-		| _ => false,
+		_ => false,
 	}
 }
 
+/// Reports whether a user may discover or inspect a room.
+///
+/// Current join, invite, retained left membership, or world-readable history
+/// grants access. Forgetting a room clears the retained left membership and can
+/// therefore remove this visibility.
+#[implement(super::Service)]
+pub async fn user_can_see_room(&self, user_id: &UserId, room_id: &RoomId) -> bool {
+	let state_cache = &self.services.state_cache;
+	let joined = state_cache.is_joined(user_id, room_id);
+	let invited = state_cache.is_invited(user_id, room_id);
+	let left = state_cache.is_left(user_id, room_id);
+	let world_readable = self.is_world_readable(room_id);
+
+	pin_mut!(joined, invited, left, world_readable);
+	joined.or(invited).or(left).or(world_readable).await
+}
+
+/// Probes whether a sender may invite a target user.
+///
+/// The normal event-build, authorization, and signing path runs under the
+/// caller's room-state lock, but the synthetic membership event is not stored.
+/// Any build error denies the invite, while build-time ID allocations may remain.
 #[implement(super::Service)]
 pub async fn user_can_invite(
 	&self,
@@ -194,6 +258,11 @@ pub async fn user_can_invite(
 		.is_ok()
 }
 
+/// Probes whether a user may send a room tombstone.
+///
+/// The user must currently be joined. The normal event-build, authorization,
+/// and signing path evaluates a synthetic tombstone without storing it; any
+/// build error denies permission, while build-time ID allocations may remain.
 #[implement(super::Service)]
 pub async fn user_can_tombstone(
 	&self,
@@ -201,12 +270,7 @@ pub async fn user_can_tombstone(
 	user_id: &UserId,
 	state_lock: &RoomMutexGuard,
 ) -> bool {
-	if !self
-		.services
-		.state_cache
-		.is_joined(user_id, room_id)
-		.await
-	{
+	if !self.services.state_cache.is_joined(user_id, room_id).await {
 		return false;
 	}
 
@@ -227,3 +291,6 @@ pub async fn user_can_tombstone(
 		.await
 		.is_ok()
 }
+
+#[cfg(test)]
+mod tests;

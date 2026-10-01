@@ -1,0 +1,53 @@
+name: Stats
+
+on:
+  workflow_call:
+    inputs:
+      machines:
+        type: string
+        description: Hardware platform vector
+      checkout:
+        type: string
+        default: ${{github.sha}}
+
+jobs:
+  stats:
+    if: >
+      !cancelled()
+
+    name: Stats
+    runs-on: ["${{fromJSON(inputs.machines)[0]}}", "het"]
+
+    permissions:
+      actions: read
+
+    env:
+      GH_TOKEN: ${{github.token}}
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{inputs.checkout || github.sha}}
+
+    - name: Load Timings History
+      uses: actions/cache/restore@v5
+      with:
+        path: _ci_digest/timings-${{github.ref_name}}.json
+        key: ci-timings-${{github.ref_name}}-${{github.run_id}}-${{github.run_attempt}}
+        restore-keys: |
+          ci-timings-${{github.ref_name}}-
+
+    - name: Summarise Timings
+      env:
+        TIMINGS_HISTORY_IN: ${{github.workspace}}/_ci_digest/timings-${{github.ref_name}}.json
+        TIMINGS_HISTORY_OUT: ${{github.workspace}}/_ci_digest/timings-${{github.ref_name}}.json
+        TIMINGS_KEEP: '3'
+      run: |
+        python3 .github/workflows/summarise/ci_timings.py
+
+    - name: Store Timings History
+      continue-on-error: true
+      uses: actions/cache/save@v5
+      with:
+        path: _ci_digest/timings-${{github.ref_name}}.json
+        key: ci-timings-${{github.ref_name}}-${{github.run_id}}-${{github.run_attempt}}

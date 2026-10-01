@@ -11,7 +11,6 @@
   removeReferencesTo,
   rust,
   autoPatchelfHook,
-  rust-jemalloc-sys-unprefixed,
   stdenv,
 
   # Options (keep sorted)
@@ -19,8 +18,6 @@
   default_features ? true,
   # default list of disabled features
   disable_features ? [
-    # dont include experimental features
-    "experimental"
     # jemalloc profiling/stats features are expensive and shouldn't
     # be expected on non-debug builds.
     "jemalloc_prof"
@@ -63,40 +60,14 @@ let
 
   enableLiburing = featureEnabled "io_uring" && !stdenv.hostPlatform.isDarwin;
 
-  # This derivation will set the JEMALLOC_OVERRIDE variable, causing the
-  # tikv-jemalloc-sys crate to use the nixpkgs jemalloc instead of building it's
-  # own. In order for this to work, we need to set flags on the build that match
-  # whatever flags tikv-jemalloc-sys was going to use. These are dependent on
-  # which features we enable in tikv-jemalloc-sys.
-  rust-jemalloc-sys' =
-    # tikv-jemalloc-sys/unprefixed_malloc_on_supported_platforms feature
-    rust-jemalloc-sys-unprefixed.overrideAttrs (old: {
-      configureFlags =
-        old.configureFlags
-        ++
-          # we dont need docs
-          [ "--disable-doc" ]
-        ++
-          # we dont need cxx/C++ integration
-          [ "--disable-cxx" ]
-        ++
-          # tikv-jemalloc-sys/profiling feature
-          lib.optional (featureEnabled "jemalloc_prof") "--enable-prof"
-        ++
-          # tikv-jemalloc-sys/stats feature
-          (if (featureEnabled "jemalloc_stats") then [ "--enable-stats" ] else [ "--disable-stats" ]);
-    });
-
   rocksdb' =
     (rocksdb.override {
-      jemalloc = lib.optional (featureEnabled "jemalloc") rust-jemalloc-sys';
-      # rocksdb fails to build with prefixed jemalloc, which is required on
-      # darwin due to [1]. In this case, fall back to building rocksdb with
-      # libc malloc. This should not cause conflicts, because all of the
-      # jemalloc symbols are prefixed.
-      #
-      # [1]: https://github.com/tikv/jemallocator/blob/ab0676d77e81268cd09b059260c75b38dbef2d51/jemalloc-sys/src/env.rs#L17
-      enableJemalloc = featureEnabled "jemalloc" && !stdenv.hostPlatform.isDarwin;
+      # RocksDB's C++ allocations reach jemalloc by symbol interposition
+      # from the unprefixed allocator the Rust build links, so it needs
+      # none of its own. A second jemalloc here would serve only the
+      # opt-in nodump allocator and malloc-stats, out of a separate heap,
+      # and tuwunel uses neither.
+      enableJemalloc = false;
 
       # for some reason enableLiburing in nixpkgs rocksdb is default true
       # which breaks Darwin entirely
@@ -184,7 +155,27 @@ let
         ];
       };
 
-    doCheck = true;
+    # The check phase reaches /etc/resolv.conf through libredirect, which works
+    # by LD_PRELOAD and is therefore inert in a statically linked binary. A
+    # static build would run the tests with no resolver configuration at all and
+    # fail before reaching them, so it packages without checking; the unit and
+    # integ jobs cover that code on the dynamic path.
+    doCheck = !stdenv.hostPlatform.isStatic;
+
+    # Cargo applies the selected profile to every target, so checking under
+    # release links each test binary with thin LTO. Tests build under the test
+    # profile instead, matching the profile the unit and integ jobs use.
+    # Full-server integration binaries are large enough that concurrent links
+    # can exhaust memory and drive the builder into swap.
+    #
+    # Only the unit tests run here. The 41 integration targets under
+    # src/main/tests each boot a server, which a nix builder cannot support: it
+    # has no network, denies io_uring, and offers no resolver configuration. The
+    # unit and integ CI jobs run them with those things available. What is left
+    # is what the check phase is actually useful for, confirming that the
+    # nixpkgs-linked build of our own crates works.
+    cargoTestCommand = "cargo test --lib --bins -j 1";
+    RUST_TEST_THREADS = "1";
 
     cargoExtraArgs =
       "--no-default-features --locked "
@@ -195,9 +186,8 @@ let
     dontPatchELF = profile == "dev" || profile == "test";
 
     buildInputs =
-      lib.optional (featureEnabled "jemalloc") rust-jemalloc-sys-unprefixed
       # needed to build Rust applications on macOS
-      ++ lib.optionals stdenv.hostPlatform.isDarwin [
+      lib.optionals stdenv.hostPlatform.isDarwin [
         # https://github.com/NixOS/nixpkgs/issues/206242
         # ld: library not found for -liconv
         libiconv
@@ -235,8 +225,13 @@ craneLib.buildPackage (
     nativeBuildInputs = (commonAttrs.nativeBuildInputs or [ ]) ++ [
       autoPatchelfHook
     ];
-    # This is needed for tests to link
-    LD_LIBRARY_PATH = lib.makeLibraryPath buildInputs;
+    # The check phase runs the freshly built test binaries before
+    # autoPatchelfHook rewrites their RPATH, so every shared library they
+    # load must be reachable through LD_LIBRARY_PATH. rocksdb' covers the
+    # system backend; stdenv.cc.cc supplies libstdc++.so.6, which the
+    # rust-rocksdb system backend links directly (rustc-link-lib=dylib=stdc++)
+    # rather than transitively through librocksdb.
+    LD_LIBRARY_PATH = lib.makeLibraryPath (buildInputs ++ [ stdenv.cc.cc ]);
 
     nativeCheckInputs = [
       pkgsBuildHost.libredirect.hook
@@ -254,8 +249,9 @@ craneLib.buildPackage (
       ''
         export NIX_REDIRECTS="/etc/resolv.conf=${fakeResolvConf}"
         export TUWUNEL_DATABASE_PATH="$(mktemp -d)/smoketest.db"
+        export SSL_CERT_FILE="${pkgsBuildHost.cacert}/etc/ssl/certs/ca-bundle.crt"
       '';
-    doCheck = true;
+    doCheck = !stdenv.hostPlatform.isStatic;
 
     doBenchmark = false;
 

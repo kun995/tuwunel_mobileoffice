@@ -8,7 +8,7 @@ use super::password_login;
 /// Authenticates the given user through the configured LDAP server.
 ///
 /// Creates the user if the user is found in the LDAP and do not already have an
-/// account.
+/// account. A deactivated local account is refused after a successful bind.
 #[tracing::instrument(skip_all, fields(%user_id), name = "ldap")]
 pub(super) async fn ldap_login(
 	services: &Services,
@@ -16,11 +16,13 @@ pub(super) async fn ldap_login(
 	lowercased_user_id: &UserId,
 	password: &str,
 ) -> Result<OwnedUserId> {
-	let (user_dn, is_ldap_admin) = match services.config.ldap.bind_dn.as_ref() {
-		| Some(bind_dn) if bind_dn.contains("{username}") => {
-			(bind_dn.replace("{username}", lowercased_user_id.localpart()), false)
-		},
-		| _ => {
+	let bind_dn = services
+		.users
+		.ldap_bind_dn(lowercased_user_id.localpart());
+
+	let (user_dn, is_ldap_admin) = match bind_dn {
+		| Some(user_dn) => (user_dn, false),
+		| None => {
 			debug!("Searching user in LDAP");
 
 			let dns = services.users.search_ldap(user_id).await?;
@@ -42,11 +44,16 @@ pub(super) async fn ldap_login(
 		.await
 		.map(|()| lowercased_user_id.to_owned())?;
 
+	services
+		.users
+		.check_ldap_login(lowercased_user_id)
+		.await?;
+
 	// LDAP users are automatically created on first login attempt. This is a very
 	// common feature that can be seen on many services using a LDAP provider for
 	// their users (synapse, Nextcloud, Jellyfin, ...).
 	//
-	// LDAP users are crated with a dummy password but non empty because an empty
+	// LDAP users are created with a dummy password but non-empty because an empty
 	// password is reserved for deactivated accounts. The tuwunel password field
 	// will never be read to login a LDAP user so it's not an issue.
 	if !services.users.exists(lowercased_user_id).await {

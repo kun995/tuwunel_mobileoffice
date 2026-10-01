@@ -20,7 +20,11 @@ pub(super) async fn handle_login(
 	#[expect(deprecated)]
 	let Password { identifier, password, user, .. } = info;
 
-	let user_id = if let Some(uiaa::UserIdentifier::UserIdOrLocalpart(user_id)) = identifier {
+	let user_id = if let Some(uiaa::UserIdentifier::Matrix(uiaa::MatrixUserIdentifier {
+		user: user_id,
+		..
+	})) = identifier
+	{
 		UserId::parse_with_server_name(user_id, &services.config.server_name)
 	} else if let Some(user) = user {
 		UserId::parse_with_server_name(user, &services.config.server_name)

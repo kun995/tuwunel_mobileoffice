@@ -6,7 +6,7 @@ use axum_extra::{
 	TypedHeader,
 	headers::{Authorization, authorization::Bearer},
 };
-use ruma::{OwnedRoomId, RoomId, api::client::error::ErrorKind};
+use ruma::{OwnedRoomId, RoomId, api::error::ErrorKind};
 use serde::Serialize;
 use tuwunel_core::{Err, Error, Result, matrix::pdu::PduCount};
 
@@ -27,7 +27,7 @@ pub(crate) struct DeleteDirectConversationResponse {
 pub(crate) async fn delete_direct_conversation_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
-	Path(room_id): Path<Box<RoomId>>,
+	Path(room_id): Path<ruma::OwnedRoomId>,
 ) -> Result<Json<DeleteDirectConversationResponse>> {
 	let (sender_user, ..) = services
 		.users
@@ -35,7 +35,9 @@ pub(crate) async fn delete_direct_conversation_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData {
+					soft_logout: false,
+				}),
 				"Unknown access token.",
 			)
 		})?;
@@ -61,9 +63,7 @@ pub(crate) async fn delete_direct_conversation_route(
 		.await;
 
 	if !is_direct {
-		return Err!(Request(Forbidden(
-			"delete_conversation is only supported for direct rooms."
-		)));
+		return Err!(Request(Forbidden("delete_conversation is only supported for direct rooms.")));
 	}
 
 	let deleted_before = services
@@ -83,10 +83,19 @@ pub(crate) async fn delete_direct_conversation_route(
 		.delete_before(&sender_user, &room_id, deleted_before);
 	services
 		.pusher
-		.reset_notification_counts(&sender_user, &room_id);
+		.reset_room_notification_counts(&sender_user, &room_id)
+		.await;
 	services
 		.read_receipt
-		.private_read_set(&room_id, &sender_user, deleted_before);
+		.private_read_set(tuwunel_service::rooms::read_receipt::PrivateRead {
+			room_id: &room_id,
+			user_id: &sender_user,
+			count: deleted_before,
+			ts: ruma::MilliSecondsSinceUnixEpoch::now(),
+			thread: &ruma::events::receipt::ReceiptThread::Unthreaded,
+			announce: true,
+		})
+		.await;
 	drop(next_count);
 
 	let room_id_ref: &RoomId = &room_id;

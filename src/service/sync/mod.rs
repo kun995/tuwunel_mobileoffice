@@ -1,5 +1,8 @@
 mod watch;
 
+#[cfg(test)]
+mod tests;
+
 use std::{
 	collections::{BTreeMap, btree_map::Entry},
 	sync::Arc,
@@ -10,12 +13,15 @@ use ruma::{
 	DeviceId, OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId, UserId,
 	api::client::sync::sync_events::v5::{
 		ConnId as ConnectionId, ListId, Request, request,
-		request::{AccountData, E2EE, Receipts, ToDevice, Typing},
+		request::{AccountData, E2EE, Profiles, Receipts, ToDevice, Typing},
 	},
+	profile::ProfileFieldName,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
-use tuwunel_core::{Result, at, debug, err, implement, is_equal_to, utils::stream::TryIgnore};
+use tuwunel_core::{
+	Result, at, debug, err, implement, is_equal_to, smallvec::SmallVec, utils::stream::TryIgnore,
+};
 use tuwunel_database::{Cbor, Deserialized, Map};
 
 pub struct Service {
@@ -36,6 +42,7 @@ struct Data {
 	userroomid_deletedbefore: Arc<Map>,
 	pduid_pdu: Arc<Map>,
 	keychangeid_userid: Arc<Map>,
+	profilechangeid_userid: Arc<Map>,
 	roomuserdataid_accountdata: Arc<Map>,
 	roomusertype_roomuserdataid: Arc<Map>,
 	readreceiptid_readreceipt: Arc<Map>,
@@ -43,6 +50,10 @@ struct Data {
 	roomuserid_lastnotificationread: Arc<Map>,
 }
 
+/// What a sliding sync connection carries from one request to the next.
+///
+/// It is stored after every response, so a client resuming from a position
+/// finds the lists, extension settings and per-room progress it left there.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Connection {
 	pub globalsince: u64,
@@ -51,12 +62,47 @@ pub struct Connection {
 	pub extensions: request::Extensions,
 	pub subscriptions: Subscriptions,
 	pub rooms: Rooms,
+
+	/// Position of the response that last carried the syncing user's whole
+	/// profile in the MSC4262 profiles extension.
+	///
+	/// Zero until a response has carried it, and again whenever the extension is
+	/// switched off, so switching it back on sends the whole profile anew.
+	#[serde(default)]
+	pub own_profile_since: u64,
+
+	/// Whether the connection asked for a profile field it did not have before.
+	///
+	/// It rides the whole profile above, so the rooms replay their slice of the
+	/// change log until the client advances past the response carrying the
+	/// widened field set, and it is forgotten with everything else the extension
+	/// owes when the extension goes off.
+	#[serde(default)]
+	pub profiles_fields_widened: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+/// Delivery progress for one room on a Sliding Sync connection.
+///
+/// The cursor advances with complete ranges; configuration tracks room payloads.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Room {
 	pub roomsince: u64,
+	#[serde(default)]
+	pub config_hash: u64,
+	/// Fingerprints of the required-state selectors last delivered for this room.
+	#[serde(default)]
+	pub required_state: RequiredState,
 }
+
+/// Fingerprints of delivered required-state selectors.
+///
+/// The inline capacity covers common room-list and open-room selections.
+pub type RequiredState = SmallVec<[u64; 18]>;
+
+/// A delivered room configuration and its required-state coverage.
+///
+/// Both values advance together only after a room payload is assembled.
+pub type RoomConfig = (u64, RequiredState);
 
 type Connections = TokioMutex<BTreeMap<ConnectionKey, ConnectionVal>>;
 pub type ConnectionVal = Arc<TokioMutex<Connection>>;
@@ -65,6 +111,7 @@ pub type ConnectionKey = (OwnedUserId, Option<OwnedDeviceId>, Option<ConnectionI
 pub type Subscriptions = BTreeMap<OwnedRoomId, request::ListConfig>;
 pub type Lists = BTreeMap<ListId, request::List>;
 pub type Rooms = BTreeMap<OwnedRoomId, Room>;
+type RoomUpdate<'a> = (&'a RoomId, Option<RoomConfig>);
 
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
@@ -81,19 +128,21 @@ impl crate::Service for Service {
 				userroomid_deletedbefore: args.db["userroomid_deletedbefore"].clone(),
 				pduid_pdu: args.db["pduid_pdu"].clone(),
 				keychangeid_userid: args.db["keychangeid_userid"].clone(),
+				profilechangeid_userid: args.db["profilechangeid_userid"].clone(),
 				roomuserdataid_accountdata: args.db["roomuserdataid_accountdata"].clone(),
 				roomusertype_roomuserdataid: args.db["roomusertype_roomuserdataid"].clone(),
 				readreceiptid_readreceipt: args.db["readreceiptid_readreceipt"].clone(),
 				userid_lastonetimekeyupdate: args.db["userid_lastonetimekeyupdate"].clone(),
-				roomuserid_lastnotificationread: args.db["roomuserid_lastnotificationread"]
-					.clone(),
+				roomuserid_lastnotificationread: args.db["roomuserid_lastnotificationread"].clone(),
 			},
 			services: args.services.clone(),
 			connections: Default::default(),
 		}))
 	}
 
-	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
+	fn name(&self) -> &str {
+		crate::service::make_name(std::module_path!())
+	}
 }
 
 #[implement(Service)]
@@ -137,8 +186,8 @@ pub async fn load_or_init_connection(&self, key: &ConnectionKey) -> ConnectionVa
 	let mut cache = self.connections.lock().await;
 
 	match cache.entry(key.clone()) {
-		| Entry::Occupied(val) => val.get().clone(),
-		| Entry::Vacant(val) => {
+		Entry::Occupied(val) => val.get().clone(),
+		Entry::Vacant(val) => {
 			let conn = self
 				.db
 				.userdeviceconnid_conn
@@ -152,7 +201,7 @@ pub async fn load_or_init_connection(&self, key: &ConnectionKey) -> ConnectionVa
 				.unwrap_or_default();
 
 			val.insert(conn).clone()
-		},
+		}
 	}
 }
 
@@ -162,8 +211,8 @@ pub async fn load_connection(&self, key: &ConnectionKey) -> Result<ConnectionVal
 	let mut cache = self.connections.lock().await;
 
 	match cache.entry(key.clone()) {
-		| Entry::Occupied(val) => Ok(val.get().clone()),
-		| Entry::Vacant(val) => self
+		Entry::Occupied(val) => Ok(val.get().clone()),
+		Entry::Vacant(val) => self
 			.db
 			.userdeviceconnid_conn
 			.qry(key)
@@ -190,12 +239,7 @@ pub async fn get_loaded_connection(&self, key: &ConnectionKey) -> Result<Connect
 #[implement(Service)]
 #[tracing::instrument(level = "trace", skip(self))]
 pub async fn list_loaded_connections(&self) -> Vec<ConnectionKey> {
-	self.connections
-		.lock()
-		.await
-		.keys()
-		.cloned()
-		.collect()
+	self.connections.lock().await.keys().cloned().collect()
 }
 
 #[implement(Service)]
@@ -227,16 +271,17 @@ where
 	D: Into<OwnedDeviceId>,
 	C: Into<ConnectionId>,
 {
-	(user_id.into(), device_id.map(Into::into), conn_id.map(Into::into))
+	(
+		user_id.into(),
+		device_id.map(Into::into),
+		conn_id.map(Into::into),
+	)
 }
 
 #[implement(Connection)]
 #[tracing::instrument(level = "debug", skip(self, service))]
 pub fn store(&self, service: &Service, key: &ConnectionKey) {
-	service
-		.db
-		.userdeviceconnid_conn
-		.put(key, Cbor(self));
+	service.db.userdeviceconnid_conn.put(key, Cbor(self));
 
 	debug!(
 		since = %self.globalsince,
@@ -253,73 +298,184 @@ pub fn update_rooms_prologue(&mut self, retard_since: Option<u64>) {
 			&& room.roomsince > retard_since
 		{
 			room.roomsince = retard_since;
+			room.config_hash = 0;
+			room.required_state.clear();
 		}
 	});
 }
 
+/// Advance the per-room cursor for each complete bounded room range.
+///
+/// `roomsince` is the lower bound of every content query for its room. Only
+/// rooms whose complete range was safely assembled may advance. A failed room
+/// keeps its cursor and retries the same range after a later wake.
 #[implement(Connection)]
 #[tracing::instrument(level = "debug", skip_all)]
-pub fn update_rooms_epilogue<'a, Rooms>(&mut self, window: Rooms)
+pub fn update_rooms_epilogue<'a, Complete>(&mut self, complete: Complete)
 where
-	Rooms: Iterator<Item = &'a RoomId> + Send + 'a,
+	Complete: Iterator<Item = RoomUpdate<'a>> + Send + 'a,
 {
-	window.for_each(|room_id| {
+	let next_batch = self.next_batch;
+	complete.for_each(|(room_id, config)| {
 		let room = self.rooms.entry(room_id.into()).or_default();
 
-		room.roomsince = self.next_batch;
+		room.roomsince = next_batch;
+		if let Some((config_hash, required_state)) = config {
+			room.config_hash = config_hash;
+			room.required_state = required_state;
+		}
 	});
 }
 
+/// Records that this pass carried the syncing user's whole profile.
+///
+/// Called once the pass has assembled its extensions, so a pass that failed
+/// leaves the profile owed to the next one.
 #[implement(Connection)]
 #[tracing::instrument(level = "debug", skip_all)]
-pub fn update_cache(&mut self, request: &Request) {
-	Self::update_cache_lists(request, self);
-	Self::update_cache_subscriptions(request, self);
-	Self::update_cache_extensions(request, self);
+pub fn update_profiles_epilogue(&mut self) {
+	if self.own_profile_owed() {
+		self.own_profile_since = self.next_batch;
+	}
+}
+
+/// Whether a base is owed for a profile field the connection did not have
+/// before.
+///
+/// MSC4262 asks for the widened fields of every user in the room subset, which
+/// the room passes deliver by replaying their whole slice of the change log.
+#[implement(Connection)]
+#[inline]
+#[must_use]
+pub fn profiles_fields_owed(&self) -> bool {
+	self.profiles_fields_widened && self.own_profile_owed()
+}
+
+/// Whether the syncing user's whole profile is owed to the profiles extension.
+///
+/// It is owed while the extension is on and the client has not acknowledged a
+/// response carrying it: the connection is new, the extension was switched on
+/// after the connection began, or the client is replaying from before the
+/// response that carried it.
+#[implement(Connection)]
+#[inline]
+#[must_use]
+pub fn own_profile_owed(&self) -> bool {
+	self.extensions.profiles.enabled.unwrap_or(false)
+		&& (self.own_profile_since == 0 || self.own_profile_since > self.globalsince)
 }
 
 #[implement(Connection)]
-fn update_cache_lists(request: &Request, cached: &mut Self) {
-	for (list_id, request_list) in &request.lists {
+#[tracing::instrument(level = "debug", skip_all)]
+pub fn update_cache(&mut self, request: &Request) -> bool {
+	let lists_changed = Self::update_cache_lists(request, self);
+	let subscriptions_changed = Self::update_cache_subscriptions(request, self);
+
+	let fields_widened = Self::update_cache_extensions(request, self);
+
+	self.update_cache_profiles_owed(fields_widened);
+
+	lists_changed || subscriptions_changed
+}
+
+#[implement(Connection)]
+fn update_cache_lists(request: &Request, cached: &mut Self) -> bool {
+	request
+		.lists
+		.iter()
+		.fold(false, |changed, (list_id, request_list)| {
+			let list_changed = match cached.lists.get_mut(list_id) {
+				Some(cached_list) => Self::update_cache_list(request_list, cached_list),
+				None => {
+					cached.lists.insert(list_id.clone(), request_list.clone());
+
+					true
+				}
+			};
+
+			changed | list_changed
+		})
+}
+
+#[implement(Connection)]
+fn update_cache_list(request: &request::List, cached: &mut request::List) -> bool {
+	let ranges_changed = request.ranges != cached.ranges;
+	let timeline_limit_changed =
+		request.room_details.timeline_limit != cached.room_details.timeline_limit;
+
+	let required_state_changed = !request.room_details.required_state.is_empty()
+		&& request.room_details.required_state != cached.room_details.required_state;
+
+	let filters_changed = request.filters.as_ref().is_some_and(|request| {
 		cached
-			.lists
-			.entry(list_id.clone())
-			.and_modify(|cached_list| {
-				Self::update_cache_list(request_list, cached_list);
-			})
-			.or_insert_with(|| request_list.clone());
+			.filters
+			.as_ref()
+			.is_none_or(|cached| !list_filters_are_equal(request, cached))
+	});
+
+	let changed =
+		ranges_changed || timeline_limit_changed || required_state_changed || filters_changed;
+
+	if ranges_changed {
+		cached.ranges.clone_from(&request.ranges);
 	}
-}
 
-#[implement(Connection)]
-fn update_cache_list(request: &request::List, cached: &mut request::List) {
-	list_or_sticky(&request.room_details.required_state, &mut cached.room_details.required_state);
+	cached.room_details.timeline_limit = request.room_details.timeline_limit;
 
-	match (&request.filters, &mut cached.filters) {
-		| (None, None) => {},
-		| (None, Some(_cached)) => {},
-		| (Some(request), None) => cached.filters = Some(request.clone()),
-		| (Some(request), Some(cached)) => {
-			some_or_sticky(request.is_dm.as_ref(), &mut cached.is_dm);
-			some_or_sticky(request.is_encrypted.as_ref(), &mut cached.is_encrypted);
-			some_or_sticky(request.is_invite.as_ref(), &mut cached.is_invite);
-			list_or_sticky(&request.room_types, &mut cached.room_types);
-			list_or_sticky(&request.not_room_types, &mut cached.not_room_types);
-			list_or_sticky(&request.tags, &mut cached.not_tags);
-			list_or_sticky(&request.spaces, &mut cached.spaces);
-		},
+	if required_state_changed {
+		cached
+			.room_details
+			.required_state
+			.clone_from(&request.room_details.required_state);
 	}
+
+	if filters_changed {
+		cached.filters.clone_from(&request.filters);
+	}
+
+	changed
 }
 
 #[implement(Connection)]
-fn update_cache_subscriptions(request: &Request, cached: &mut Self) {
-	cached
-		.subscriptions
-		.extend(request.room_subscriptions.clone());
+fn update_cache_subscriptions(request: &Request, cached: &mut Self) -> bool {
+	let changed = !subscriptions_are_equal(&request.room_subscriptions, &cached.subscriptions);
+
+	if changed {
+		cached.subscriptions.clone_from(&request.room_subscriptions);
+	}
+
+	changed
 }
 
+fn subscriptions_are_equal(request: &Subscriptions, cached: &Subscriptions) -> bool {
+	request.len() == cached.len()
+		&& request.iter().zip(cached).all(|(request, cached)| {
+			request.0 == cached.0 && list_config_is_equal(request.1, cached.1)
+		})
+}
+
+fn list_config_is_equal(request: &request::ListConfig, cached: &request::ListConfig) -> bool {
+	request.timeline_limit == cached.timeline_limit
+		&& request.required_state == cached.required_state
+}
+
+fn list_filters_are_equal(request: &request::ListFilters, cached: &request::ListFilters) -> bool {
+	request.is_dm == cached.is_dm
+		&& request.is_encrypted == cached.is_encrypted
+		&& request.is_invite == cached.is_invite
+		&& request.room_types == cached.room_types
+		&& request.not_room_types == cached.not_room_types
+		&& request.tags == cached.tags
+		&& request.not_tags == cached.not_tags
+		&& request.spaces == cached.spaces
+}
+
+/// Merges the request's extension settings into the connection.
+///
+/// Returns whether the MSC4262 field filter named a field the connection did
+/// not have, which the profiles extension owes a base for.
 #[implement(Connection)]
-fn update_cache_extensions(request: &Request, cached: &mut Self) {
+fn update_cache_extensions(request: &Request, cached: &mut Self) -> bool {
 	let request = &request.extensions;
 	let cached = &mut cached.extensions;
 
@@ -328,6 +484,8 @@ fn update_cache_extensions(request: &Request, cached: &mut Self) {
 	Self::update_cache_typing(&request.typing, &mut cached.typing);
 	Self::update_cache_to_device(&request.to_device, &mut cached.to_device);
 	Self::update_cache_e2ee(&request.e2ee, &mut cached.e2ee);
+
+	Self::update_cache_profiles(&request.profiles, &mut cached.profiles)
 }
 
 #[implement(Connection)]
@@ -354,6 +512,38 @@ fn update_cache_typing(request: &Typing, cached: &mut Typing) {
 #[implement(Connection)]
 fn update_cache_to_device(request: &ToDevice, cached: &mut ToDevice) {
 	some_or_sticky(request.enabled.as_ref(), &mut cached.enabled);
+	cached.since.clone_from(&request.since);
+}
+
+/// Merges the profiles extension settings into the connection.
+///
+/// Returns whether the request widened the field filter, which is read before
+/// the merge overwrites the filter it compares against.
+#[implement(Connection)]
+fn update_cache_profiles(request: &Profiles, cached: &mut Profiles) -> bool {
+	some_or_sticky(request.enabled.as_ref(), &mut cached.enabled);
+	some_or_sticky(request.rooms.as_ref(), &mut cached.rooms);
+	some_or_sticky(request.lists.as_ref(), &mut cached.lists);
+
+	// Compare against the cached filter before the merge below overwrites it.
+	let widened = fields_widened(request.fields.as_deref(), cached.fields.as_deref());
+
+	some_or_sticky(request.fields.as_ref(), &mut cached.fields);
+
+	widened
+}
+
+/// Whether the request names a profile field the connection did not ask for.
+///
+/// An absent cached filter already covers every field, and an absent request
+/// keeps the cached one, so neither widens anything.
+fn fields_widened(
+	request: Option<&[ProfileFieldName]>,
+	cached: Option<&[ProfileFieldName]>,
+) -> bool {
+	request
+		.zip(cached)
+		.is_some_and(|(request, cached)| request.iter().any(|name| !cached.contains(name)))
 }
 
 #[implement(Connection)]
@@ -361,10 +551,14 @@ fn update_cache_e2ee(request: &E2EE, cached: &mut E2EE) {
 	some_or_sticky(request.enabled.as_ref(), &mut cached.enabled);
 }
 
-fn list_or_sticky<T: Clone>(target: &Vec<T>, cached: &mut Vec<T>) {
-	if !target.is_empty() {
-		cached.clone_from(target);
+#[implement(Connection)]
+fn update_cache_profiles_owed(&mut self, fields_widened: bool) {
+	if fields_widened || !self.extensions.profiles.enabled.unwrap_or(false) {
+		self.own_profile_since = 0;
 	}
+
+	self.profiles_fields_widened =
+		fields_widened || (self.profiles_fields_widened && self.own_profile_owed());
 }
 
 fn some_or_sticky<T: Clone>(target: Option<&T>, cached: &mut Option<T>) {

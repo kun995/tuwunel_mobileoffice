@@ -96,15 +96,15 @@ fn auth_server_checks(services: &Services, x_matrix: &XMatrix) -> Result {
 	}
 
 	let destination = services.globals.server_name();
-	if x_matrix.destination.as_deref() != Some(destination) {
-		return Err!(Request(Forbidden("Invalid destination.")));
+	let claimed = x_matrix.destination.as_deref();
+	if claimed.is_some_and(|claimed| claimed != destination) {
+		return Err!(Request(Unauthorized("Invalid destination.")));
 	}
 
 	let origin = &x_matrix.origin;
 	if services
 		.config
-		.forbidden_remote_server_names
-		.is_match(origin.host())
+		.is_forbidden_remote_server_name(origin)
 	{
 		return Err!(Request(Forbidden(debug_warn!(
 			"Federation requests from {origin} denied."

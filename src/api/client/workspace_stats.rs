@@ -8,7 +8,7 @@ use axum_extra::{
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures::{StreamExt, TryStreamExt, pin_mut, stream};
-use ruma::{OwnedRoomId, UserId, api::client::error::ErrorKind, events::TimelineEventType};
+use ruma::{OwnedRoomId, UserId, api::error::ErrorKind, events::TimelineEventType};
 use serde::Serialize;
 use tuwunel_core::{Err, Error, Result};
 use tuwunel_service::Services;
@@ -70,13 +70,13 @@ pub(crate) async fn workspace_stats_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
 	let sender_user_ref: &UserId = sender_user.as_ref();
-	if !services.users.is_admin(sender_user_ref).await {
+	if !services.admin.user_is_admin(sender_user_ref).await {
 		return Err!(Request(Forbidden(
 			"You do not have permission to view workspace statistics.",
 		)));
@@ -101,10 +101,7 @@ pub(crate) async fn workspace_stats_route(
 		.buffer_unordered(SCAN_CONCURRENCY)
 		.collect::<Vec<_>>()
 		.await;
-	let active_user_count = user_statuses
-		.iter()
-		.filter(|exists| **exists)
-		.count();
+	let active_user_count = user_statuses.iter().filter(|exists| **exists).count();
 
 	let mut room_ids = services
 		.workspace
@@ -121,26 +118,20 @@ pub(crate) async fn workspace_stats_route(
 		.await;
 
 	let room_count = room_stats.len();
-	let active_room_count = room_stats
-		.iter()
-		.filter(|room| room.active)
-		.count();
+	let active_room_count = room_stats.iter().filter(|room| room.active).count();
 	let stale_room_count = room_count.saturating_sub(active_room_count);
 	let rooms_with_messages = room_stats
 		.iter()
 		.filter(|room| room.message_count > 0)
 		.count();
-	let timeline_event_count = room_stats
-		.iter()
-		.fold(0usize, |total, room| total.saturating_add(room.timeline_event_count));
-	let message_count = room_stats
-		.iter()
-		.fold(0usize, |total, room| total.saturating_add(room.message_count));
+	let timeline_event_count = room_stats.iter().fold(0usize, |total, room| {
+		total.saturating_add(room.timeline_event_count)
+	});
+	let message_count = room_stats.iter().fold(0usize, |total, room| {
+		total.saturating_add(room.message_count)
+	});
 
-	let last_data_ts = room_stats
-		.iter()
-		.filter_map(|room| room.last_data_ts)
-		.max();
+	let last_data_ts = room_stats.iter().filter_map(|room| room.last_data_ts).max();
 	let last_message_ts = room_stats
 		.iter()
 		.filter_map(|room| room.last_message_ts)
@@ -148,8 +139,10 @@ pub(crate) async fn workspace_stats_route(
 	let scan_errors = room_stats
 		.into_iter()
 		.filter_map(|room| {
-			room.scan_error
-				.map(|error| WorkspaceStatsScanError { room_id: room.room_id, error })
+			room.scan_error.map(|error| WorkspaceStatsScanError {
+				room_id: room.room_id,
+				error,
+			})
 		})
 		.collect::<Vec<_>>();
 	let mut scan_errors = scan_errors;
@@ -191,9 +184,7 @@ async fn inspect_room(services: &Services, room_id: OwnedRoomId) -> RoomStats {
 	}
 
 	let room_id_for_scan = room_id.clone();
-	let pdus = services
-		.timeline
-		.pdus(None, &room_id_for_scan, None);
+	let pdus = services.timeline.pdus(None, &room_id_for_scan, None);
 	pin_mut!(pdus);
 
 	let mut timeline_event_count = 0usize;
@@ -204,19 +195,22 @@ async fn inspect_room(services: &Services, room_id: OwnedRoomId) -> RoomStats {
 
 	loop {
 		let (_, pdu) = match pdus.try_next().await {
-			| Ok(Some(item)) => item,
-			| Ok(None) => break,
-			| Err(error) => {
+			Ok(Some(item)) => item,
+			Ok(None) => break,
+			Err(error) => {
 				scan_error = Some(error.to_string());
 				break;
-			},
+			}
 		};
 
 		timeline_event_count = timeline_event_count.saturating_add(1);
 		let timestamp = u64::from(pdu.origin_server_ts);
 		update_max(&mut last_data_ts, timestamp);
 
-		if matches!(pdu.kind, TimelineEventType::RoomMessage | TimelineEventType::RoomEncrypted) {
+		if matches!(
+			pdu.kind,
+			TimelineEventType::RoomMessage | TimelineEventType::RoomEncrypted
+		) {
 			message_count = message_count.saturating_add(1);
 			update_max(&mut last_message_ts, timestamp);
 		}
@@ -253,7 +247,7 @@ mod tests {
 	fn formats_timestamp_as_utc_rfc3339_with_milliseconds() {
 		assert_eq!(
 			format_timestamp(1_783_940_520_123),
-			Some("2026-07-13T12:20:00.123Z".to_owned())
+			Some("2026-07-13T11:02:00.123Z".to_owned())
 		);
 	}
 

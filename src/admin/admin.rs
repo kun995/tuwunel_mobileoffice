@@ -1,9 +1,10 @@
-use clap::Parser;
+use async_trait::async_trait;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use tuwunel_core::Result;
 
 use crate::{
+	Context,
 	appservice::{self, AppserviceCommand},
-	context::Context,
 	debug::{self, DebugCommand},
 	federation::{self, FederationCommand},
 	media::{self, MediaCommand},
@@ -13,6 +14,25 @@ use crate::{
 	token::{self, TokenCommand},
 	user::{self, UserCommand},
 };
+
+/// Concrete root installed into [`tuwunel_service::admin::Service::command`].
+pub(crate) struct Root;
+
+#[async_trait]
+impl tuwunel_service::admin::Command for Root {
+	fn clap(&self) -> clap::Command { <AdminCommand as CommandFactory>::command() }
+
+	async fn dispatch(
+		&self,
+		matches: clap::ArgMatches,
+		context: &tuwunel_service::admin::Context<'_>,
+	) -> Result {
+		let command = <AdminCommand as FromArgMatches>::from_arg_matches(&matches)?;
+		let context = Context::new(context);
+
+		process(command, &context).await
+	}
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "tuwunel", version = tuwunel_core::version())]

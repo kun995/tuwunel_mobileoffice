@@ -7,7 +7,7 @@ use axum_extra::{
 	headers::{Authorization, authorization::Bearer},
 };
 use chrono::DateTime;
-use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, api::client::error::ErrorKind};
+use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, api::error::ErrorKind};
 use serde::{Deserialize, Serialize};
 use tuwunel_core::{Err, Error, Result, err, utils::millis_since_unix_epoch};
 use tuwunel_service::rooms::reminders::{
@@ -61,7 +61,7 @@ pub(crate) struct ReminderListResponse {
 pub(crate) async fn create_reminder_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
-	Path(room_id): Path<Box<RoomId>>,
+	Path(room_id): Path<ruma::OwnedRoomId>,
 	Json(body): Json<CreateReminderBody>,
 ) -> Result<Json<ReminderResponse>> {
 	let (sender_user, ..) = services
@@ -70,16 +70,12 @@ pub(crate) async fn create_reminder_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
-	if !services
-		.state_cache
-		.is_joined(&sender_user, &room_id)
-		.await
-	{
+	if !services.state_cache.is_joined(&sender_user, &room_id).await {
 		return Err!(Request(Forbidden("You are not a member of this room.")));
 	}
 
@@ -112,7 +108,7 @@ pub(crate) async fn create_reminder_route(
 pub(crate) async fn update_reminder_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
-	Path((room_id, reminder_id)): Path<(Box<RoomId>, String)>,
+	Path((room_id, reminder_id)): Path<(ruma::OwnedRoomId, String)>,
 	Json(body): Json<UpdateReminderBody>,
 ) -> Result<Json<ReminderResponse>> {
 	let (sender_user, ..) = services
@@ -121,16 +117,12 @@ pub(crate) async fn update_reminder_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
-	if !services
-		.state_cache
-		.is_joined(&sender_user, &room_id)
-		.await
-	{
+	if !services.state_cache.is_joined(&sender_user, &room_id).await {
 		return Err!(Request(Forbidden("You are not a member of this room.")));
 	}
 
@@ -177,7 +169,7 @@ pub(crate) async fn update_reminder_route(
 pub(crate) async fn list_reminders_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
-	Path(room_id): Path<Box<RoomId>>,
+	Path(room_id): Path<ruma::OwnedRoomId>,
 ) -> Result<Json<ReminderListResponse>> {
 	let (sender_user, ..) = services
 		.users
@@ -185,16 +177,12 @@ pub(crate) async fn list_reminders_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
-	if !services
-		.state_cache
-		.is_joined(&sender_user, &room_id)
-		.await
-	{
+	if !services.state_cache.is_joined(&sender_user, &room_id).await {
 		return Err!(Request(Forbidden("You are not a member of this room.")));
 	}
 
@@ -214,7 +202,7 @@ pub(crate) async fn list_reminders_route(
 pub(crate) async fn get_reminder_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
-	Path((room_id, reminder_id)): Path<(Box<RoomId>, String)>,
+	Path((room_id, reminder_id)): Path<(ruma::OwnedRoomId, String)>,
 ) -> Result<Json<ReminderResponse>> {
 	let (sender_user, ..) = services
 		.users
@@ -222,16 +210,12 @@ pub(crate) async fn get_reminder_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
-	if !services
-		.state_cache
-		.is_joined(&sender_user, &room_id)
-		.await
-	{
+	if !services.state_cache.is_joined(&sender_user, &room_id).await {
 		return Err!(Request(Forbidden("You are not a member of this room.")));
 	}
 
@@ -254,7 +238,7 @@ pub(crate) async fn get_reminder_route(
 pub(crate) async fn cancel_reminder_route(
 	State(services): State<crate::State>,
 	TypedHeader(Authorization(token)): TypedHeader<Authorization<Bearer>>,
-	Path((room_id, reminder_id)): Path<(Box<RoomId>, String)>,
+	Path((room_id, reminder_id)): Path<(ruma::OwnedRoomId, String)>,
 ) -> Result<Json<ReminderResponse>> {
 	let (sender_user, ..) = services
 		.users
@@ -262,16 +246,12 @@ pub(crate) async fn cancel_reminder_route(
 		.await
 		.map_err(|_| {
 			Error::BadRequest(
-				ErrorKind::UnknownToken { soft_logout: false },
+				ErrorKind::UnknownToken(ruma::api::error::UnknownTokenErrorData { soft_logout: false }),
 				"Unknown access token.",
 			)
 		})?;
 
-	if !services
-		.state_cache
-		.is_joined(&sender_user, &room_id)
-		.await
-	{
+	if !services.state_cache.is_joined(&sender_user, &room_id).await {
 		return Err!(Request(Forbidden("You are not a member of this room.")));
 	}
 
@@ -308,11 +288,15 @@ fn validate_title(title: &str) -> Result<String> {
 	}
 
 	if title.chars().count() > 100 {
-		return Err!(Request(InvalidParam("title must not exceed 100 characters.")));
+		return Err!(Request(InvalidParam(
+			"title must not exceed 100 characters."
+		)));
 	}
 
 	if title.chars().any(char::is_control) {
-		return Err!(Request(InvalidParam("title must not contain control characters.")));
+		return Err!(Request(InvalidParam(
+			"title must not contain control characters."
+		)));
 	}
 
 	Ok(title.to_owned())
@@ -325,7 +309,9 @@ fn validate_repeat(repeat: &ReminderRepeat) -> Result {
 		}
 
 		if days.iter().any(|day| !(1..=7).contains(day)) {
-			return Err!(Request(InvalidParam("repeat.days values must be from 1 to 7.")));
+			return Err!(Request(InvalidParam(
+				"repeat.days values must be from 1 to 7."
+			)));
 		}
 	}
 

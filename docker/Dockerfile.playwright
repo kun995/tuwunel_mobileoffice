@@ -1,0 +1,211 @@
+# syntax = docker/dockerfile:1.11-labs
+
+# Tuwunel server under test. Modeled after complement-testee
+# (docker/Dockerfile.complement). Inherits from `install` via
+# `--build-context input=target:install`. Bakes in a playwright.toml that
+# disables federation, opens registration, and removes rate limits so the
+# suite can sprint.
+FROM input AS playwright-testee
+EXPOSE 8008
+RUN mkdir -p /database
+COPY <<EOF /playwright/playwright.toml
+    [global]
+    address = "0.0.0.0"
+    port = 8008
+    server_name = "localhost"
+    database_path = "/database"
+    db_pool_max_workers = 64
+    argon2_m_cost = 64
+    argon2_t_cost = 1
+    allow_registration = true
+    yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse = true
+    allow_guest_registration = false
+    allow_federation = false
+    allow_public_room_directory_without_auth = true
+    registration_shared_secret = "playwright-shared-secret"
+    new_user_displayname_suffix = ""
+    rc_messages_per_second = 10000
+    rc_message_burst_count = 10000
+    log = "warn,tuwunel=info"
+    log_colors = false
+    log_thread_ids = false
+    log_span_events = "NONE"
+    media_startup_check = false
+    rocksdb_parallelism_threads = 2
+    startup_netburst = false
+    admin_room_notices = false
+    create_admin_room = false
+    trusted_servers = []
+    ip_range_denylist = []
+    url_preview_domain_explicit_allowlist = ["example.org", "fallback.example.org"]
+EOF
+ENV TUWUNEL_CONFIG="/playwright/playwright.toml"
+ENTRYPOINT tuwunel -Oserver_name=\""$SERVER_NAME\""
+
+
+# Playwright runtime image with element-web pre-built. The official Microsoft
+# Playwright image already ships pinned Chromium / Firefox / WebKit and their
+# system deps. Pin its version via ARG.
+FROM mcr.microsoft.com/playwright:v1.61.0-noble AS playwright-base
+ARG element_web_ref="develop"
+
+# corepack's bundled signing keys in this image are stale relative to current
+# pnpm releases; install pnpm directly via npm to sidestep that mismatch.
+# `serve` is pre-installed so playwright.config.ts's webServer (which runs
+# `npx serve -p 8080 -L ./webapp` in CI mode) starts instantly instead of
+# spending most of its 30s startup window fetching the package.
+RUN npm install -g pnpm serve
+
+WORKDIR /usr/src
+ADD https://github.com/element-hq/element-web.git#${element_web_ref} element-web
+
+WORKDIR /usr/src/element-web
+
+# element-web pins pnpm via devEngines.packageManager with onFail "error"; the
+# npm-installed pnpm above floats to latest and would hard-fail the version
+# check, including in the child pnpm a postinstall script spawns (which a CLI
+# --pm-on-fail flag cannot reach). Relax the gate to a warning at the source so
+# every pnpm process proceeds; devEngines is not part of the frozen lockfile.
+RUN node -e "const fs=require('fs'),p=require('./package.json');if(p.devEngines?.packageManager)p.devEngines.packageManager.onFail='warn';fs.writeFileSync('package.json',JSON.stringify(p,null,2))"
+
+RUN --mount=type=cache,target=/root/.local/share/pnpm,sharing=locked \
+    pnpm install --frozen-lockfile
+
+# Tuwunel HomeserverContainer. Out-of-lined to docker/lib/playwright.tuwunel.ts in
+# the workspace so it gets TS tooling and proper diffs; pulled in from the
+# source stage. Mirrors the shape of element-web's
+# apps/web/playwright/testcontainers/synapse.ts.
+COPY --link --from=source /usr/src/tuwunel/docker/lib/playwright.tuwunel.ts \
+     /usr/src/element-web/apps/web/playwright/testcontainers/tuwunel.ts
+
+# Apply overlay patches to upstream element-web. Idempotent: grep-guards
+# protect re-runs from the buildkit cache.
+COPY <<'EOF' /playwright/patch.sh
+#!/bin/bash
+set -euxo pipefail
+cd /usr/src/element-web
+
+SERVICES=apps/web/playwright/services.ts
+CONFIG=apps/web/playwright.config.ts
+CONFIG_JSON=packages/playwright-common/src/utils/config_json.ts
+PLUGIN=apps/web/playwright/plugins/homeserver/index.ts
+
+# 1. services.ts: import + switch arm.
+if ! grep -q '"tuwunel"' "$SERVICES"; then
+    sed -i '/import { DendriteContainer, PineconeContainer } from "\.\/testcontainers\/dendrite";/a\
+import { TuwunelContainer } from "./testcontainers/tuwunel";' "$SERVICES"
+
+    sed -i '/case "pinecone":/i\
+                case "tuwunel":\
+                    container = new TuwunelContainer();\
+                    break;' "$SERVICES"
+fi
+
+# 2. plugins/homeserver/index.ts: extend HomeserverType union.
+if [ -f "$PLUGIN" ] && ! grep -q '"tuwunel"' "$PLUGIN"; then
+    sed -i 's/"synapse" | "dendrite" | "pinecone"/"synapse" | "dendrite" | "pinecone" | "tuwunel"/' "$PLUGIN"
+fi
+
+# 3. playwright.config.ts: register a Tuwunel project entry after Pinecone.
+if ! grep -q 'homeserverType: "tuwunel"' "$CONFIG"; then
+    sed -i '/homeserverType: "pinecone"/,/ignoreSnapshots: true,/ {
+        /ignoreSnapshots: true,/a\
+        },\
+        {\
+            name: "Tuwunel",\
+            use: {\
+                ...chromeProject,\
+                homeserverType: "tuwunel",\
+            },\
+            ignoreSnapshots: true,
+    }' "$CONFIG"
+fi
+
+# 4. playwright.config.ts: drive the CI webServer port from $SERVE_PORT so
+#    concurrent shards on the shared host network each own a private static
+#    server instead of contending for one :8080. $BASE_URL (set alongside)
+#    already steers baseURL and the health check.
+if ! grep -q 'SERVE_PORT' "$CONFIG"; then
+    sed -i 's#serve -p 8080 -L ./webapp#serve -p ${SERVE_PORT:-8080} -L ./webapp#' "$CONFIG"
+fi
+
+# 5. config_json.ts: the per-test config route hardcodes :8080, but each shard
+#    binds its own $SERVE_PORT, so on shards 2..N the route never matches and
+#    the browser falls through to the image's static matrix.org config.json;
+#    every UI-login spec then times out on the homeserver picker. Widen the
+#    port to a wildcard so the injected testee config reaches every shard.
+if ! grep -qF 'http://localhost:*/config.json' "$CONFIG_JSON"; then
+    sed -i 's#http://localhost:8080/config\.json\*#http://localhost:*/config.json*#' "$CONFIG_JSON"
+fi
+
+# 6. Confirm overlays applied (grep, not playwright test --list, since the
+#    playwright-common package's lib/ is not built yet).
+grep -q 'TuwunelContainer' "$SERVICES"
+grep -q 'name: "Tuwunel"' "$CONFIG"
+grep -q 'SERVE_PORT' "$CONFIG"
+grep -qF 'http://localhost:*/config.json' "$CONFIG_JSON"
+EOF
+RUN chmod +x /playwright/patch.sh && /playwright/patch.sh
+
+# Pre-build:
+#   - apps/web/webapp/ via `pnpm build` (nx build → webpack production).
+#     Served at :8080 by `npx serve` when the tester runs (CI mode of
+#     playwright.config.ts).
+#   - packages/playwright-common/lib/ via nx build:playwright on the
+#     playwright-common workspace. Required by element-web-test.ts at
+#     runtime.
+# CI_PACKAGE=true mirrors the Build step of element-web's own e2e workflow
+# (.github/workflows/build-and-test.yaml): it turns off minification, and
+# with it the babel-plugin-jsx-remove-data-test-id pass that strips every
+# JSX data-testid from the bundle. Without it each getByTestId locator in
+# the suite waits out its full test timeout against an attribute that no
+# longer exists. The nx cache mount id is salted with the flag: nx does not
+# hash CI_PACKAGE into its inputs, so the old mount would keep serving the
+# stripped webapp from cache.
+# Skip the eager `playwright test --list` validation: it fires the
+# webServer config (nx start → webpack-dev-server) which we do not want
+# at build time. Real validation happens when the tester runs.
+WORKDIR /usr/src/element-web/apps/web
+RUN --mount=type=cache,target=/root/.local/share/pnpm,sharing=locked \
+    --mount=type=cache,id=element-web-nx-ci-package,target=/usr/src/element-web/.nx,sharing=locked \
+    CI_PACKAGE=true pnpm build && \
+    pnpm exec nx build:playwright @element-hq/element-web-playwright-common
+
+# `npx serve -L ./webapp` (the CI webServer command in playwright.config.ts)
+# health-checks `${baseURL}/config.json` before tests run. element-web's own
+# CI copies element.io/develop/config.json into the served root; mirror that.
+RUN cp element.io/develop/config.json webapp/config.json
+
+
+# Test runner. Inherits playwright-base via --build-context input=target:....
+FROM input AS playwright-tester
+ARG playwright_run=".*"
+ARG playwright_skip=""
+ARG playwright_shard="1/1"
+ARG playwright_count="1"
+ARG playwright_workers="1"
+ARG playwright_retries="1"
+
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV CI=true
+ENV playwright_run=$playwright_run
+ENV playwright_skip=$playwright_skip
+ENV playwright_shard=$playwright_shard
+ENV playwright_count=$playwright_count
+ENV playwright_workers=$playwright_workers
+ENV playwright_retries=$playwright_retries
+
+# tester spawns testee as a sibling via the host docker daemon. Runtime
+# caller (bake.sh / `docker run`) supplies
+# `--volume /var/run/docker.sock:/var/run/docker.sock`.
+
+WORKDIR /usr/src/element-web/apps/web
+RUN mkdir -p /playwright/out
+
+# Two-pass entrypoint. Out-of-lined to docker/lib/playwright-run.sh in the
+# workspace (the playwright.tuwunel.ts pattern above) and pulled in from the
+# source stage; the runtime caller bind-mounts the known-failures acceptlist
+# it splits on (docker/playwright.sh).
+COPY --link --chmod=755 --from=source /usr/src/tuwunel/docker/lib/playwright-run.sh \
+     /playwright/run.sh
+ENTRYPOINT ["/playwright/run.sh"]

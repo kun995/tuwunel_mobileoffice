@@ -1,5 +1,5 @@
 use std::{
-	sync::Arc,
+	net::IpAddr,
 	time::{Duration, SystemTime},
 };
 
@@ -10,14 +10,19 @@ use ruma::{
 };
 use serde_json::json;
 use tuwunel_core::{
-	Err, Result, implement,
+	Err, Result, at, implement, trace,
 	utils::{
-		self, ReadyExt,
+		BoolExt, ReadyExt, random_string,
 		stream::{IterStream, TryIgnore},
-		time::{duration_since_epoch, timepoint_from_epoch, timepoint_from_now},
+		string::to_small_string,
+		time::{
+			duration_since_epoch, timepoint_from_epoch, timepoint_from_now, timepoint_has_passed,
+		},
 	},
 };
-use tuwunel_database::{Deserialized, Ignore, Interfix, Json, Map};
+use tuwunel_database::{Cbor, Deserialized, Ignore, Interfix, Json, Txn};
+
+use super::DeviceListChange;
 
 /// generated device ID length
 const DEVICE_ID_LENGTH: usize = 10;
@@ -26,6 +31,9 @@ const DEVICE_ID_LENGTH: usize = 10;
 pub const TOKEN_LENGTH: usize = 32;
 
 /// Adds a new device to a user.
+///
+/// A device ID coinciding with one of the user's cross-signing key IDs is
+/// refused, since both share the device key row space.
 #[implement(super::Service)]
 #[tracing::instrument(level = "info", skip(self, access_token))]
 pub async fn create_device(
@@ -35,11 +43,9 @@ pub async fn create_device(
 	(access_token, expires_in): (Option<&str>, Option<Duration>),
 	refresh_token: Option<&str>,
 	initial_device_display_name: Option<&str>,
-	client_ip: Option<String>,
+	client_ip: Option<IpAddr>,
 ) -> Result<OwnedDeviceId> {
-	let device_id = device_id
-		.map(ToOwned::to_owned)
-		.unwrap_or_else(|| OwnedDeviceId::from(utils::random_string(DEVICE_ID_LENGTH)));
+	let device_id = resolve_device_id(device_id);
 
 	if !self.exists(user_id).await {
 		return Err!(Request(InvalidParam(error!(
@@ -47,17 +53,21 @@ pub async fn create_device(
 		))));
 	}
 
+	if self
+		.is_cross_signing_key_id(user_id, device_id.as_str())
+		.await?
+	{
+		return Err!(Request(Forbidden("Device ID matches a cross-signing key ID.")));
+	}
+
 	let notify = true;
-	self.put_device_metadata(
-		user_id,
-		notify,
-		&Device {
-			device_id: device_id.clone(),
-			display_name: initial_device_display_name.map(Into::into),
-			last_seen_ip: client_ip.map(Into::into),
-			last_seen_ts: Some(MilliSecondsSinceUnixEpoch::now()),
-		},
-	);
+	self.put_device_metadata(user_id, notify, &Device {
+		device_id: device_id.clone(),
+		display_name: initial_device_display_name.map(Into::into),
+		last_seen_ts: Some(MilliSecondsSinceUnixEpoch::now()),
+		last_seen_ip: client_ip.map(to_small_string),
+	})
+	.await;
 
 	if let Some(access_token) = access_token {
 		self.set_access_token(user_id, &device_id, access_token, expires_in, refresh_token)
@@ -67,7 +77,18 @@ pub async fn create_device(
 	Ok(device_id)
 }
 
+fn resolve_device_id(device_id: Option<&DeviceId>) -> OwnedDeviceId {
+	// Treat an empty device_id ("") as unspecified.
+	device_id
+		.filter(|device_id| !device_id.as_str().is_empty())
+		.map(ToOwned::to_owned)
+		.unwrap_or_else(|| OwnedDeviceId::from(random_string(DEVICE_ID_LENGTH)))
+}
+
 /// Removes a device from a user.
+///
+/// Everything keyed by the device goes with it, its identity keys included,
+/// so a later session under the same ID starts with none.
 #[implement(super::Service)]
 #[tracing::instrument(level = "info", skip(self))]
 pub async fn remove_device(&self, user_id: &UserId, device_id: &DeviceId) {
@@ -75,12 +96,9 @@ pub async fn remove_device(&self, user_id: &UserId, device_id: &DeviceId) {
 	self.remove_tokens(user_id, device_id).await;
 
 	// Remove todevice events
-	let prefix = (user_id, device_id, Interfix);
 	self.db
 		.todeviceid_events
-		.keys_prefix_raw(&prefix)
-		.ignore_err()
-		.ready_for_each(|key| self.db.todeviceid_events.remove(key))
+		.del_prefix(&(user_id, device_id, Interfix))
 		.await;
 
 	// Remove pushers
@@ -103,13 +121,31 @@ pub async fn remove_device(&self, user_id: &UserId, device_id: &DeviceId) {
 		.await
 		.ok();
 
-	// TODO: Remove onetimekeys
+	self.remove_one_time_keys(user_id, device_id)
+		.await;
+
+	// MSC2732: drop fallback keys for this device.
+	self.db
+		.userdeviceidalgorithm_fallback
+		.del_prefix(&(user_id, device_id, Interfix))
+		.await;
+
+	// MSC3890: drop this device's local notification settings.
+	let event_type = format!("org.matrix.msc3890.local_notification_settings.{device_id}").into();
+	self.services
+		.account_data
+		.delete(None, user_id, event_type)
+		.await
+		.ok();
 
 	let userdeviceid = (user_id, device_id);
-	self.db.userdeviceid_metadata.del(userdeviceid);
 
-	self.mark_device_key_update(user_id).await;
-	increment(&self.db.userid_devicelistversion, user_id.as_bytes());
+	self.db.keyid_key.del(userdeviceid);
+	self.db.userdeviceid_metadata.del(userdeviceid);
+	self.db.oidcdevice_userdeviceid.del(userdeviceid);
+
+	self.mark_device_key_update(user_id, DeviceListChange::Deleted(device_id))
+		.await;
 }
 
 /// Returns an iterator over all device ids of this user.
@@ -183,11 +219,6 @@ pub async fn set_access_token(
 			.await?;
 	}
 
-	// Remove old token.
-	self.remove_access_token(user_id, device_id)
-		.await
-		.ok();
-
 	let expires_at = expires_in
 		.map(timepoint_from_now)
 		.transpose()?
@@ -196,47 +227,103 @@ pub async fn set_access_token(
 		.map(Duration::as_secs);
 
 	let userdeviceid = (user_id, device_id);
-	let value = (user_id, device_id, expires_at);
-	self.db
-		.token_userdeviceid
-		.raw_put(access_token, value);
-	self.db
-		.userdeviceid_token
-		.put_raw(userdeviceid, access_token);
 
-	Ok(())
-}
-
-/// Revoke the access token without deleting the device. Take care to not leave
-/// dangling devices if using this method.
-#[implement(super::Service)]
-pub async fn remove_access_token(&self, user_id: &UserId, device_id: &DeviceId) -> Result {
-	let userdeviceid = (user_id, device_id);
-	let access_token = self
+	// Fold the prior pointer token into the index for pre-index upgrades.
+	let previous = self
 		.db
 		.userdeviceid_token
 		.qry(&userdeviceid)
-		.await?;
+		.await
+		.deserialized::<String>()
+		.ok();
 
-	self.db.userdeviceid_token.del(userdeviceid);
-	self.db.token_userdeviceid.remove(&access_token);
+	let mut txn = self.services.db.txn();
+
+	if let Some(previous) = previous.as_deref() {
+		let key = (user_id, device_id, previous);
+
+		txn.put_raw(&self.db.userdeviceidtoken_index, key, []);
+	}
+
+	let key = (user_id, device_id, access_token);
+	let value = (user_id, device_id, expires_at);
+
+	txn.raw_put(&self.db.token_userdeviceid, access_token, value);
+	txn.put_raw(&self.db.userdeviceidtoken_index, key, []);
+	txn.put_raw(&self.db.userdeviceid_token, userdeviceid, access_token);
+
+	txn.execute();
 
 	Ok(())
 }
 
+/// Revoke every access token of one device, without deleting the device. Take
+/// care to not leave dangling devices if using this method.
 #[implement(super::Service)]
-pub async fn get_access_token(&self, user_id: &UserId, device_id: &DeviceId) -> Result<String> {
-	let key = (user_id, device_id);
+pub async fn remove_access_token(&self, user_id: &UserId, device_id: &DeviceId) -> Result {
+	let prefix = (user_id, device_id, Interfix);
 	self.db
+		.userdeviceidtoken_index
+		.keys_prefix(&prefix)
+		.ignore_err()
+		.ready_for_each(|(_, _, token): (Ignore, Ignore, &str)| {
+			self.db.token_userdeviceid.remove(token);
+			self.db
+				.userdeviceidtoken_index
+				.del((user_id, device_id, token));
+		})
+		.await;
+
+	// Cover any pre-index token still recorded only in the legacy pointer.
+	let token = self
+		.db
 		.userdeviceid_token
-		.qry(&key)
+		.qry(&(user_id, device_id))
 		.await
-		.deserialized()
+		.deserialized::<String>()
+		.ok();
+
+	let mut txn = self.services.db.txn();
+
+	if let Some(token) = token.as_deref() {
+		txn.del_raw(&self.db.token_userdeviceid, token);
+	}
+
+	txn.del(&self.db.userdeviceid_token, (user_id, device_id));
+
+	txn.execute();
+
+	Ok(())
+}
+
+/// Revoke a single access token by value, leaving the device and any other
+/// tokens it holds intact.
+#[implement(super::Service)]
+pub async fn remove_access_token_value(&self, access_token: &str) {
+	let owner = self
+		.db
+		.token_userdeviceid
+		.get(access_token)
+		.await
+		.deserialized::<(OwnedUserId, OwnedDeviceId, Option<u64>)>()
+		.ok();
+
+	let mut txn = self.services.db.txn();
+
+	if let Some((user_id, device_id, _)) = owner {
+		let user_device_token = (&*user_id, &*device_id, access_token);
+
+		txn.del(&self.db.userdeviceidtoken_index, user_device_token);
+	}
+
+	txn.del_raw(&self.db.token_userdeviceid, access_token);
+
+	txn.execute();
 }
 
 #[implement(super::Service)]
 pub fn generate_access_token(&self, expires: bool) -> (String, Option<Duration>) {
-	let access_token = utils::random_string(TOKEN_LENGTH);
+	let access_token = random_string(TOKEN_LENGTH);
 	let expires_in = expires
 		.then_some(self.services.server.config.access_token_ttl)
 		.map(Duration::from_secs);
@@ -255,20 +342,94 @@ pub async fn set_refresh_token(
 ) -> Result {
 	debug_assert!(refresh_token.starts_with("refresh_"), "refresh_token missing prefix");
 
-	// Remove old token
+	let config = &self.services.server.config;
+	let ttl = config.refresh_token_ttl;
+	let idle_only = config.refresh_token_idle_only;
+
+	// Absolute mode carries the prior deadline forward instead of sliding it.
+	let prior_expires_at: Option<SystemTime> = (ttl != 0 && !idle_only)
+		.then_async(|| self.find_refresh_token_expires_at(user_id, device_id))
+		.await
+		.flatten();
+
+	// Capture the outgoing token before removal so it can be retained for one
+	// generation, making a later replay detectable.
+	let spent: Option<String> = self
+		.db
+		.userdeviceid_refresh
+		.qry(&(user_id, device_id))
+		.await
+		.deserialized()
+		.ok();
+
+	// Also drops the prior spent entry.
 	self.remove_refresh_token(user_id, device_id)
 		.await
 		.ok();
 
+	let expires_at = match (ttl, prior_expires_at) {
+		| (0, _) => None,
+		| (_, Some(prior)) => Some(prior),
+		| (ttl, None) => Some(timepoint_from_now(Duration::from_secs(ttl))?),
+	};
+
+	let expires_at_secs = expires_at
+		.map(duration_since_epoch)
+		.as_ref()
+		.map(Duration::as_secs);
+
 	let userdeviceid = (user_id, device_id);
-	self.db
-		.token_userdeviceid
-		.raw_put(refresh_token, userdeviceid);
-	self.db
-		.userdeviceid_refresh
-		.put_raw(userdeviceid, refresh_token);
+	let value = (user_id, device_id, expires_at_secs);
+	let mut txn = self.services.db.txn();
+
+	txn.raw_put(&self.db.token_userdeviceid, refresh_token, value);
+	txn.put_raw(&self.db.userdeviceid_refresh, userdeviceid, refresh_token);
+
+	// Retain the outgoing token as the device's spent token, pointing at its
+	// successor so a double-submit can be distinguished from a replay.
+	if let Some(spent) = spent {
+		let spent_at = duration_since_epoch(SystemTime::now()).as_secs();
+		let value = (user_id, device_id, refresh_token, spent_at);
+
+		txn.raw_put(&self.db.spentrefresh_userdeviceid, &*spent, value);
+		txn.put_raw(&self.db.userdeviceid_spentrefresh, userdeviceid, &*spent);
+	}
+
+	txn.execute();
 
 	Ok(())
+}
+
+/// Look up the expiry stored alongside the current refresh token for this
+/// device, if one is recorded. Pre-rotation entries carry no expiry and
+/// return `None`.
+#[implement(super::Service)]
+async fn find_refresh_token_expires_at(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+) -> Option<SystemTime> {
+	let userdeviceid = (user_id, device_id);
+	let old_token: String = self
+		.db
+		.userdeviceid_refresh
+		.qry(&userdeviceid)
+		.await
+		.deserialized()
+		.ok()?;
+
+	let (_, _, expires_at_secs): (Ignore, Ignore, Option<u64>) = self
+		.db
+		.token_userdeviceid
+		.get(&old_token)
+		.await
+		.deserialized()
+		.ok()?;
+
+	expires_at_secs
+		.map(Duration::from_secs)
+		.map(timepoint_from_epoch)?
+		.ok()
 }
 
 /// Revoke the refresh token without deleting the device. Take care to not leave
@@ -280,28 +441,134 @@ pub async fn remove_refresh_token(&self, user_id: &UserId, device_id: &DeviceId)
 		.db
 		.userdeviceid_refresh
 		.qry(&userdeviceid)
-		.await?;
+		.await;
 
-	self.db.userdeviceid_refresh.del(userdeviceid);
-	self.db.token_userdeviceid.remove(&refresh_token);
+	let mut txn = self.services.db.txn();
+
+	if let Ok(refresh_token) = refresh_token {
+		txn.del_raw(&self.db.token_userdeviceid, &refresh_token);
+	}
+
+	txn.del(&self.db.userdeviceid_refresh, userdeviceid);
+
+	self.forget_spent_refresh_token(user_id, device_id, &mut txn)
+		.await;
+
+	txn.execute();
 
 	Ok(())
 }
 
+/// Drop the spent (previous-generation) refresh token retained for reuse
+/// detection, if any.
 #[implement(super::Service)]
-pub async fn get_refresh_token(&self, user_id: &UserId, device_id: &DeviceId) -> Result<String> {
-	let key = (user_id, device_id);
-	self.db
+async fn forget_spent_refresh_token(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+	txn: &mut Txn,
+) {
+	let userdeviceid = (user_id, device_id);
+
+	if let Ok(spent) = self
+		.db
+		.userdeviceid_spentrefresh
+		.qry(&userdeviceid)
+		.await
+	{
+		txn.del_raw(&self.db.spentrefresh_userdeviceid, &spent);
+	}
+
+	txn.del(&self.db.userdeviceid_spentrefresh, userdeviceid);
+}
+
+/// Classification of a refresh token presented for rotation at a token
+/// endpoint.
+pub enum RefreshToken {
+	/// The device's current refresh token; rotate it.
+	Current {
+		user_id: OwnedUserId,
+		device_id: OwnedDeviceId,
+		expires_at: Option<SystemTime>,
+	},
+
+	/// A spent (already-rotated) token retained for one generation. `grace` is
+	/// set when its successor is still current and it was spent within the
+	/// configured window, marking a benign double-submit rather than a replay;
+	/// `current` is the successor for which to re-issue an access token.
+	Replayed {
+		user_id: OwnedUserId,
+		device_id: OwnedDeviceId,
+		current: String,
+		grace: bool,
+	},
+
+	/// Not a recognised refresh token.
+	Unknown,
+}
+
+/// Classify a presented refresh token for the token-endpoint rotation path.
+#[implement(super::Service)]
+pub async fn classify_refresh_token(&self, presented: &str) -> RefreshToken {
+	// The current refresh token resolves and matches the device's active
+	// pointer (an access token resolves but will not match).
+	if let Ok((user_id, device_id, expires_at)) = self.find_from_token(presented).await {
+		let current: Option<String> = self
+			.db
+			.userdeviceid_refresh
+			.qry(&(&user_id, &device_id))
+			.await
+			.deserialized()
+			.ok();
+
+		if current.as_deref() == Some(presented) {
+			return RefreshToken::Current { user_id, device_id, expires_at };
+		}
+	}
+
+	// Otherwise it may be the one retained spent token: a benign double-submit
+	// inside the grace window, or a replay to be treated as a compromise.
+	let Ok((user_id, device_id, successor, spent_at)) = self
+		.db
+		.spentrefresh_userdeviceid
+		.get(presented)
+		.await
+		.deserialized::<(OwnedUserId, OwnedDeviceId, String, u64)>()
+	else {
+		return RefreshToken::Unknown;
+	};
+
+	let current: Option<String> = self
+		.db
 		.userdeviceid_refresh
-		.qry(&key)
+		.qry(&(&user_id, &device_id))
 		.await
 		.deserialized()
+		.ok();
+
+	let grace_window = self
+		.services
+		.server
+		.config
+		.refresh_token_reuse_grace;
+	let elapsed = duration_since_epoch(SystemTime::now())
+		.as_secs()
+		.saturating_sub(spent_at);
+
+	let grace = grace_window != 0
+		&& elapsed <= grace_window
+		&& current.as_deref() == Some(successor.as_str());
+
+	RefreshToken::Replayed {
+		user_id,
+		device_id,
+		current: successor,
+		grace,
+	}
 }
 
 #[must_use]
-pub fn generate_refresh_token() -> String {
-	format!("refresh_{}", utils::random_string(TOKEN_LENGTH))
-}
+pub fn generate_refresh_token() -> String { format!("refresh_{}", random_string(TOKEN_LENGTH)) }
 
 #[implement(super::Service)]
 pub fn add_to_device_event(
@@ -311,7 +578,7 @@ pub fn add_to_device_event(
 	target_device_id: &DeviceId,
 	event_type: &str,
 	content: &serde_json::Value,
-) {
+) -> u64 {
 	let count = self.services.globals.next_count();
 
 	let key = (target_user_id, target_device_id, *count);
@@ -323,6 +590,17 @@ pub fn add_to_device_event(
 			"content": content,
 		})),
 	);
+
+	trace!(
+		%target_user_id,
+		%target_device_id,
+		count = *count,
+		%event_type,
+		%sender,
+		"to_device write",
+	);
+
+	*count
 }
 
 #[implement(super::Service)]
@@ -378,30 +656,42 @@ pub async fn update_device_last_seen(
 	&self,
 	user_id: &UserId,
 	device_id: &DeviceId,
-	last_seen: Option<MilliSecondsSinceUnixEpoch>,
+	last_seen_ip: Option<IpAddr>,
+	last_seen_ts: Option<MilliSecondsSinceUnixEpoch>,
 ) -> Result {
 	let mut device = self
 		.get_device_metadata(user_id, device_id)
 		.await?;
 
+	if let Some(last_seen_ip) = last_seen_ip.map(to_small_string) {
+		device.last_seen_ip.replace(last_seen_ip);
+	}
+
 	device
 		.last_seen_ts
-		.replace(last_seen.unwrap_or_else(MilliSecondsSinceUnixEpoch::now));
+		.replace(last_seen_ts.unwrap_or_else(MilliSecondsSinceUnixEpoch::now));
 
-	self.put_device_metadata(user_id, false, &device);
+	self.put_device_metadata(user_id, false, &device)
+		.await;
 
 	Ok(())
 }
 
+/// Persists device metadata and optionally announces the changed device.
+///
+/// Silent updates leave the device-list version and notification rows unchanged.
 #[implement(super::Service)]
-pub fn put_device_metadata(&self, user_id: &UserId, notify: bool, device: &Device) {
+#[tracing::instrument(level = "trace", skip(self, device))]
+pub async fn put_device_metadata(&self, user_id: &UserId, notify: bool, device: &Device) {
 	let key = (user_id, &device.device_id);
 	self.db
 		.userdeviceid_metadata
 		.put(key, Json(device));
 
 	if notify {
-		increment(&self.db.userid_devicelistversion, user_id.as_bytes());
+		self.mark_device_key_update(user_id, DeviceListChange::Device(&device.device_id))
+			.boxed() // Size firewall for device creation and rename callers.
+			.await;
 	}
 }
 
@@ -431,6 +721,76 @@ pub async fn device_exists(&self, user_id: &UserId, device_id: &DeviceId) -> boo
 }
 
 #[implement(super::Service)]
+pub async fn is_oidc_device(&self, user_id: &UserId, device_id: &DeviceId) -> bool {
+	self.db
+		.oidcdevice_userdeviceid
+		.contains(&(user_id, device_id))
+		.await
+}
+
+/// Returns the IdP that originally authenticated this device, if known.
+/// Returns `None` for devices predating the idp_id field or non-OIDC devices.
+#[implement(super::Service)]
+pub async fn get_oidc_device_idp(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+) -> Option<String> {
+	self.db
+		.oidcdevice_userdeviceid
+		.qry(&(user_id, device_id))
+		.await
+		.deserialized::<Json<String>>()
+		.ok()
+		.map(|Json(idp)| idp)
+		.filter(|idp| !idp.is_empty())
+}
+
+#[implement(super::Service)]
+pub fn mark_oidc_device(&self, user_id: &UserId, device_id: &DeviceId, idp_id: &str) {
+	self.db
+		.oidcdevice_userdeviceid
+		.put((user_id, device_id), Json(idp_id));
+}
+
+/// Allow cross-signing key replacement without UIAA for the next 10 minutes.
+/// Returns the expiry timestamp in milliseconds.
+#[expect(clippy::must_use_candidate)]
+#[implement(super::Service)]
+pub fn allow_cross_signing_replacement(&self, user_id: &UserId) -> SystemTime {
+	let duration = Duration::from_mins(10);
+	let expires = timepoint_from_now(duration).expect("failed to create timepoint from now");
+
+	self.db
+		.oidccskeybypass_userid
+		.raw_put(user_id, Cbor(expires));
+
+	expires
+}
+
+/// Check if the user is allowed to replace cross-signing keys without UIAA.
+#[implement(super::Service)]
+pub async fn can_replace_cross_signing_keys(&self, user_id: &UserId) -> bool {
+	let Ok(expires): Result<SystemTime, _> = self
+		.db
+		.oidccskeybypass_userid
+		.get(user_id)
+		.await
+		.deserialized::<Cbor<_>>()
+		.map(at!(0))
+	else {
+		return false;
+	};
+
+	if !timepoint_has_passed(expires) {
+		return true;
+	}
+
+	self.db.oidccskeybypass_userid.remove(user_id);
+	false
+}
+
+#[implement(super::Service)]
 pub async fn get_devicelist_version(&self, user_id: &UserId) -> Result<u64> {
 	self.db
 		.userid_devicelistversion
@@ -452,9 +812,28 @@ pub fn all_devices_metadata<'a>(
 		.map(|(_, val): (Ignore, Device)| val)
 }
 
-//TODO: this is an ABA
-fn increment(db: &Arc<Map>, key: &[u8]) {
-	let old = db.get_blocking(key);
-	let new = utils::increment(old.ok().as_deref());
-	db.insert(key, new);
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn absent_device_id_is_generated() {
+		let device_id = resolve_device_id(None);
+
+		assert_eq!(device_id.as_str().len(), DEVICE_ID_LENGTH);
+	}
+
+	#[test]
+	fn empty_device_id_is_generated() {
+		let device_id = resolve_device_id(Some("".into()));
+
+		assert_eq!(device_id.as_str().len(), DEVICE_ID_LENGTH);
+	}
+
+	#[test]
+	fn provided_device_id_is_preserved() {
+		let device_id = resolve_device_id(Some("HELLOWORLD".into()));
+
+		assert_eq!(device_id.as_str(), "HELLOWORLD");
+	}
 }

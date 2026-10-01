@@ -1,13 +1,20 @@
-use std::{fmt::Debug, mem};
+use std::{fmt::Debug, mem::swap};
 
 use bytes::BytesMut;
-use ipaddress::IPAddress;
+use http::Response as HttpResponse;
+use reqwest::{Error as ReqwestError, Response};
 use ruma::api::{
-	IncomingResponse, MatrixVersion, OutgoingRequest, SendAccessToken, SupportedVersions,
+	IncomingResponse, OutgoingRequest, OutgoingRequestExt, auth_scheme::AuthScheme,
+	path_builder::PathBuilder,
 };
 use serde_json::Value as JsonValue;
-use tuwunel_core::{Err, Result, debug, err, implement, trace, utils::string_from_bytes, warn};
+use tuwunel_core::{
+	Err, Result, debug_warn, err, error::error_chain, implement, trace, utils::string_from_bytes,
+	warn,
+};
+use url::Url;
 
+use crate::client::read_response_capped;
 const CALL_KIND_FIELD: &str = "call_kind";
 const WORKSPACE_ID_FIELD: &str = "workspaceId";
 const IS_DIRECT_CHAT_FIELD: &str = "is_direct_chat";
@@ -39,11 +46,7 @@ fn add_push_gateway_extensions(
 	let event_type = notification
 		.get("type")
 		.and_then(JsonValue::as_str)
-		.or_else(|| {
-			notification
-				.get("event_type")
-				.and_then(JsonValue::as_str)
-		});
+		.or_else(|| notification.get("event_type").and_then(JsonValue::as_str));
 
 	let mut changed = false;
 
@@ -61,8 +64,10 @@ fn add_push_gateway_extensions(
 		.map(str::trim)
 		.filter(|workspace_id| !workspace_id.is_empty())
 	{
-		notification
-			.insert(WORKSPACE_ID_FIELD.to_owned(), JsonValue::String(workspace_id.to_owned()));
+		notification.insert(
+			WORKSPACE_ID_FIELD.to_owned(),
+			JsonValue::String(workspace_id.to_owned()),
+		);
 		changed = true;
 	}
 
@@ -96,10 +101,7 @@ fn add_push_gateway_extensions(
 		changed = true;
 	}
 
-	if let Some(image_mxc_uri) = image_mxc_uri
-		.map(str::trim)
-		.filter(|uri| !uri.is_empty())
-	{
+	if let Some(image_mxc_uri) = image_mxc_uri.map(str::trim).filter(|uri| !uri.is_empty()) {
 		notification.insert(
 			IMAGE_MXC_URI_FIELD.to_owned(),
 			JsonValue::String(image_mxc_uri.to_owned()),
@@ -107,10 +109,7 @@ fn add_push_gateway_extensions(
 		changed = true;
 	}
 
-	if let Some(image_url) = image_url
-		.map(str::trim)
-		.filter(|url| !url.is_empty())
-	{
+	if let Some(image_url) = image_url.map(str::trim).filter(|url| !url.is_empty()) {
 		notification.insert(
 			IMAGE_URL_FIELD.to_owned(),
 			JsonValue::String(image_url.to_owned()),
@@ -138,18 +137,40 @@ pub(super) async fn send_request<T>(
 ) -> Result<T::IncomingResponse>
 where
 	T: OutgoingRequest + Debug + Send,
+	for<'a> T::Authentication: AuthScheme<Input<'a> = ()>,
+	for<'a> T::PathBuilder: PathBuilder<Input<'a> = ()>,
 {
-	const VERSIONS: [MatrixVersion; 1] = [MatrixVersion::V1_0];
-	let supported = SupportedVersions {
-		versions: VERSIONS.into(),
-		features: Default::default(),
+	let dest = if dest.contains(['?', '#']) {
+		let parsed = Url::parse(dest).ok();
+
+		warn!(
+			gateway_host = parsed
+				.as_ref()
+				.and_then(|url| url.host_str())
+				.unwrap_or("<invalid>"),
+			has_query = dest.contains('?'),
+			has_fragment = dest.contains('#'),
+			"Push gateway URL carries a query string or fragment, which is not supported; the \
+			 notification path is appended after it",
+		);
+
+		dest
+	} else {
+		let push_path = self
+			.services
+			.config
+			.notification_push_path
+			.trim_end_matches('/');
+
+		let dest = dest.trim_end_matches('/');
+
+		dest.strip_suffix(push_path).unwrap_or(dest)
 	};
 
-	let dest = dest.replace(&self.services.config.notification_push_path, "");
 	trace!("Push gateway destination: {dest}");
 
 	let mut http_request = request
-		.try_into_http_request::<BytesMut>(&dest, SendAccessToken::IfRequired(""), &supported)
+		.try_into_http_request::<BytesMut>(dest, (), ())
 		.map_err(|e| {
 			err!(BadServerResponse(warn!(
 				"Failed to find destination {dest} for push gateway: {e}"
@@ -170,98 +191,83 @@ where
 
 	let reqwest_request = reqwest::Request::try_from(http_request)?;
 
-	// Capture request info for error logging before consuming the request
-	let req_method = reqwest_request.method().clone();
-	let req_url = reqwest_request.url().clone();
-	let req_headers = reqwest_request.headers().clone();
-	let req_body_str = reqwest_request
-		.body()
-		.and_then(|b| b.as_bytes())
-		.map(|b| String::from_utf8_lossy(b).into_owned())
-		.unwrap_or_default();
-
-	debug!("Push gateway request URL: {} {}", req_method, req_url);
-	debug!("Push gateway request headers: {:#?}", req_headers);
-	debug!("Push gateway request body: {}", redact_push_gateway_request_body(&req_body_str));
-
-	if let Some(url_host) = req_url.host_str() {
-		trace!("Checking request URL for IP");
-		if let Ok(ip) = IPAddress::parse(url_host)
-			&& !self.services.client.valid_cidr_range(&ip)
-		{
-			return Err!(BadServerResponse("Not allowed to send requests to this IP"));
-		}
-	}
-
-	let response = self
+	if self
 		.services
 		.client
-		.pusher
-		.execute(reqwest_request)
-		.await;
-
-	match response {
-		| Ok(mut response) => {
-			// reqwest::Response -> http::Response conversion
-
-			trace!("Checking response destination's IP");
-			if let Some(remote_addr) = response.remote_addr()
-				&& let Ok(ip) = IPAddress::parse(remote_addr.ip().to_string())
-				&& !self.services.client.valid_cidr_range(&ip)
-			{
-				return Err!(BadServerResponse("Not allowed to send requests to this IP"));
-			}
-
-			let status = response.status();
-			let mut http_response_builder = http::Response::builder()
-				.status(status)
-				.version(response.version());
-
-			mem::swap(
-				response.headers_mut(),
-				http_response_builder
-					.headers_mut()
-					.expect("http::response::Builder is usable"),
-			);
-
-			let body = response.bytes().await?; // TODO: handle timeout
-
-			if !status.is_success() {
-				warn!(
-					"Push gateway {dest} returned unsuccessful HTTP response: {status} | body: {}",
-					string_from_bytes(&body).unwrap_or_else(|_| String::from("<non-utf8 body>"))
-				);
-				warn!(
-					"Push gateway request details: method={req_method} url={req_url} | request body: {}",
-					redact_push_gateway_request_body(&req_body_str)
-				);
-				return Err!(BadServerResponse(
-					"Push gateway {dest} returned unsuccessful HTTP response: {status}"
-				));
-			}
-
-			debug!(
-				"Push gateway {dest} returned successful HTTP response: {status} | request body: {}",
-				redact_push_gateway_request_body(&req_body_str)
-			);
-
-			let response = T::IncomingResponse::try_from_http_response(
-				http_response_builder
-					.body(body)
-					.expect("reqwest body is valid http body"),
-			);
-
-			response.map_err(|e| {
-				err!(BadServerResponse(warn!(
-					"Push gateway {dest} returned invalid response: {e}"
-				)))
-			})
-		},
-		| Err(e) => {
-			warn!("Could not send request to pusher {dest}: {e}");
-			Err(e.into())
-		},
+		.proxy
+		.resolver_alias(reqwest_request.url())
+	{
+		return Err!(BadServerResponse(
+			"Not allowed to request a locally resolved proxy endpoint"
+		));
 	}
+
+	trace!("Checking request URL for IP");
+	if !self
+		.services
+		.client
+		.valid_cidr_range_url(reqwest_request.url())
+	{
+		return Err!(BadServerResponse("Not allowed to send requests to this IP"));
+	}
+
+	match self.services.client.pusher.execute(reqwest_request).await {
+		Err(error) => handler_err(dest, error),
+		Ok(response) => self.handle_ok::<T>(dest, response).await,
+	}
+}
+
+#[implement(super::Service)]
+async fn handle_ok<T>(&self, dest: &str, mut response: Response) -> Result<T::IncomingResponse>
+where
+	T: OutgoingRequest,
+{
+	trace!("Checking response destination's IP");
+	if let Some(remote_addr) = response.remote_addr()
+		&& !self.services.client.valid_cidr_range_ip(remote_addr.ip())
+		&& !self.services.client.proxied(response.url())
+	{
+		return Err!(BadServerResponse("Not allowed to send requests to this IP"));
+	}
+
+	let status = response.status();
+	let mut http_response_builder = HttpResponse::builder()
+		.status(status)
+		.version(response.version());
+
+	swap(
+		response.headers_mut(),
+		http_response_builder
+			.headers_mut()
+			.expect("http::response::Builder is usable"),
+	);
+
+	let limit = self.services.config.max_response_size;
+	let body = read_response_capped(response, limit).await?;
+
+	if !status.is_success() {
+		debug_warn!(body = ?string_from_bytes(&body), "Push gateway response");
+		return Err!(BadServerResponse(warn!(
+			"Push gateway {dest} returned unsuccessful HTTP response: {status}"
+		)));
+	}
+
+	let response = T::IncomingResponse::try_from_http_response(
+		http_response_builder
+			.body(body)
+			.expect("reqwest body is valid http body"),
+	);
+
+	response.map_err(|e| {
+		err!(BadServerResponse(warn!(
+			"Push gateway {dest} returned invalid response: {e}"
+		)))
+	})
+}
+
+fn handler_err<R>(dest: &str, error: ReqwestError) -> Result<R> {
+	warn!(%dest, chain = %error_chain(&error), "Could not send request to pusher");
+	Err(error.into())
 }
 
 fn redact_push_gateway_request_body(body: &str) -> String {
@@ -368,18 +374,22 @@ mod tests {
 		add_push_gateway_extensions(&mut body, None, None, None, None, None, None);
 
 		let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("valid json");
-		assert!(
-			value["notification"]
-				.get(CALL_KIND_FIELD)
-				.is_none()
-		);
+		assert!(value["notification"].get(CALL_KIND_FIELD).is_none());
 	}
 
 	#[test]
 	fn adds_workspace_id_when_present() {
 		let mut body = BytesMut::from(r#"{"notification":{"type":"m.room.message"}}"#);
 
-		add_push_gateway_extensions(&mut body, Some(" workspace-1 "), None, None, None, None, None);
+		add_push_gateway_extensions(
+			&mut body,
+			Some(" workspace-1 "),
+			None,
+			None,
+			None,
+			None,
+			None,
+		);
 
 		let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("valid json");
 		assert_eq!(
@@ -395,11 +405,7 @@ mod tests {
 		add_push_gateway_extensions(&mut body, Some("   "), None, None, None, None, None);
 
 		let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("valid json");
-		assert!(
-			value["notification"]
-				.get(WORKSPACE_ID_FIELD)
-				.is_none()
-		);
+		assert!(value["notification"].get(WORKSPACE_ID_FIELD).is_none());
 	}
 
 	#[test]
@@ -452,7 +458,9 @@ mod tests {
 		);
 		assert_eq!(
 			value["notification"][IMAGE_URL_FIELD],
-			serde_json::Value::String("https://matrix.example/preview.png?expires=10&sig=secret".to_owned())
+			serde_json::Value::String(
+				"https://matrix.example/preview.png?expires=10&sig=secret".to_owned()
+			)
 		);
 	}
 

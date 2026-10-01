@@ -1,17 +1,24 @@
-use std::{convert::AsRef, fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc};
 
-use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future::Either};
+use futures::{Stream, StreamExt};
 use rocksdb::Direction;
 use serde::{Deserialize, Serialize};
-use tokio::task;
 use tuwunel_core::{Result, implement};
 
-use super::stream_from::is_cached;
+use super::seek::seek_stream;
 use crate::{
 	keyval::{Key, result_deserialize_key, serialize_key},
 	stream,
 };
 
+/// Streams deserialized keys forward from a serialized lower bound.
+///
+/// The scan begins at the first key not less than the encoded bound. Any
+/// borrowed key must not be retained across another poll.
+///
+/// # Panics
+///
+/// Panics if the lower bound cannot be serialized.
 #[implement(super::Map)]
 pub fn keys_from<'a, K, P>(
 	self: &'a Arc<Self>,
@@ -25,6 +32,14 @@ where
 		.map(result_deserialize_key::<K>)
 }
 
+/// Streams raw keys forward from a serialized lower bound.
+///
+/// The scan begins at the first key not less than the encoded bound. Yielded
+/// keys borrow cursor storage and must not be retained across another poll.
+///
+/// # Panics
+///
+/// Panics if the lower bound cannot be serialized.
 #[implement(super::Map)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub fn keys_from_raw<P>(
@@ -38,6 +53,10 @@ where
 	self.raw_keys_from(&key)
 }
 
+/// Streams deserialized keys forward from a raw lower bound.
+///
+/// The supplied bytes are used directly as the seek position. Any borrowed key
+/// must not be retained across another poll.
 #[implement(super::Map)]
 pub fn keys_raw_from<'a, K, P>(
 	self: &'a Arc<Self>,
@@ -51,6 +70,10 @@ where
 		.map(result_deserialize_key::<K>)
 }
 
+/// Streams raw keys forward from a raw lower bound.
+///
+/// The supplied bytes are used directly as the seek position. Yielded keys
+/// borrow cursor storage and must not be retained across another poll.
 #[implement(super::Map)]
 #[tracing::instrument(skip(self, from), fields(%self), level = "trace")]
 pub fn raw_keys_from<P>(
@@ -60,34 +83,5 @@ pub fn raw_keys_from<P>(
 where
 	P: AsRef<[u8]> + ?Sized + Debug,
 {
-	use crate::pool::Seek;
-
-	let opts = super::iter_options_default(&self.engine);
-	let state = stream::State::new(self, opts);
-	if is_cached(self, from) {
-		let state = state.init_fwd(from.as_ref().into());
-		return Either::Left(
-			task::consume_budget()
-				.map(move |()| stream::Keys::<'_>::from(state))
-				.into_stream()
-				.flatten(),
-		);
-	}
-
-	let seek = Seek {
-		map: self.clone(),
-		dir: Direction::Forward,
-		key: Some(from.as_ref().into()),
-		state: crate::pool::into_send_seek(state),
-		res: None,
-	};
-
-	Either::Right(
-		self.engine
-			.pool
-			.execute_iter(seek)
-			.ok_into::<stream::Keys<'_>>()
-			.into_stream()
-			.try_flatten(),
-	)
+	seek_stream::<stream::Keys<'_>, _>(self, Direction::Forward, Some(from.as_ref()))
 }

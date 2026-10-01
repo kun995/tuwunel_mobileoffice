@@ -1,0 +1,677 @@
+---
+source: src/main/tests/media_federation.rs
+assertion_line: 127
+description: Federation thumbnail baseline
+---
+fed     still_1x1.png         16x16   scale anim=absent -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png         16x16   scale anim=absent -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png         16x16   scale anim=false  -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png         16x16   scale anim=false  -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png         16x16   scale anim=true   -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png         16x16   scale anim=true   -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png         32x32   scale anim=absent -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png         32x32   scale anim=absent -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png         32x32   scale anim=false  -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png         32x32   scale anim=false  -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png         32x32   scale anim=true   -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png         32x32   scale anim=true   -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png         96x96   scale anim=absent -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png         96x96   scale anim=absent -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png         96x96   scale anim=false  -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png         96x96   scale anim=false  -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png         96x96   scale anim=true   -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png         96x96   scale anim=true   -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png        320x240  scale anim=absent -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png        320x240  scale anim=absent -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png        320x240  scale anim=false  -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png        320x240  scale anim=false  -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png        320x240  scale anim=true   -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png        320x240  scale anim=true   -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png        640x480  scale anim=absent -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png        640x480  scale anim=absent -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png        640x480  scale anim=false  -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png        640x480  scale anim=false  -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png        640x480  scale anim=true   -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png        640x480  scale anim=true   -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png        800x600  scale anim=absent -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png        800x600  scale anim=absent -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png        800x600  scale anim=false  -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png        800x600  scale anim=false  -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png        800x600  scale anim=true   -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png        800x600  scale anim=true   -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png       1024x768  scale anim=absent -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png       1024x768  scale anim=absent -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png       1024x768  scale anim=false  -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png       1024x768  scale anim=false  -> 200 image/png                Png 1x1 f1             inline
+fed     still_1x1.png       1024x768  scale anim=true   -> 200 image/png                Png 1x1 f1             inline
+v1      still_1x1.png       1024x768  scale anim=true   -> 200 image/png                Png 1x1 f1             inline
+fed     still_100x100.png     16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.png     16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.png     16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.png     16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.png     16x16   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.png     16x16   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.png     32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.png     32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.png     32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.png     32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.png     32x32   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.png     32x32   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.png     96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      still_100x100.png     96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     still_100x100.png     96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      still_100x100.png     96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     still_100x100.png     96x96   scale anim=true   -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      still_100x100.png     96x96   scale anim=true   -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     still_100x100.png    320x240  scale anim=absent -> 200 image/png                Png 100x100 f1         inline
+v1      still_100x100.png    320x240  scale anim=absent -> 200 image/png                Png 100x100 f1         inline
+fed     still_100x100.png    320x240  scale anim=false  -> 200 image/png                Png 100x100 f1         inline
+v1      still_100x100.png    320x240  scale anim=false  -> 200 image/png                Png 100x100 f1         inline
+fed     still_100x100.png    320x240  scale anim=true   -> 200 image/png                Png 100x100 f1         inline
+v1      still_100x100.png    320x240  scale anim=true   -> 200 image/png                Png 100x100 f1         inline
+fed     still_100x100.png    640x480  scale anim=absent -> 200 image/png                Png 100x100 f1         inline
+v1      still_100x100.png    640x480  scale anim=absent -> 200 image/png                Png 100x100 f1         inline
+fed     still_100x100.png    640x480  scale anim=false  -> 200 image/png                Png 100x100 f1         inline
+v1      still_100x100.png    640x480  scale anim=false  -> 200 image/png                Png 100x100 f1         inline
+fed     still_100x100.png    640x480  scale anim=true   -> 200 image/png                Png 100x100 f1         inline
+v1      still_100x100.png    640x480  scale anim=true   -> 200 image/png                Png 100x100 f1         inline
+fed     still_100x100.png    800x600  scale anim=absent -> 200 image/png                Png 100x100 f1         inline
+v1      still_100x100.png    800x600  scale anim=absent -> 200 image/png                Png 100x100 f1         inline
+fed     still_100x100.png    800x600  scale anim=false  -> 200 image/png                Png 100x100 f1         inline
+v1      still_100x100.png    800x600  scale anim=false  -> 200 image/png                Png 100x100 f1         inline
+fed     still_100x100.png    800x600  scale anim=true   -> 200 image/png                Png 100x100 f1         inline
+v1      still_100x100.png    800x600  scale anim=true   -> 200 image/png                Png 100x100 f1         inline
+fed     still_100x100.png   1024x768  scale anim=absent -> 200 image/png                Png 100x100 f1         inline
+v1      still_100x100.png   1024x768  scale anim=absent -> 200 image/png                Png 100x100 f1         inline
+fed     still_100x100.png   1024x768  scale anim=false  -> 200 image/png                Png 100x100 f1         inline
+v1      still_100x100.png   1024x768  scale anim=false  -> 200 image/png                Png 100x100 f1         inline
+fed     still_100x100.png   1024x768  scale anim=true   -> 200 image/png                Png 100x100 f1         inline
+v1      still_100x100.png   1024x768  scale anim=true   -> 200 image/png                Png 100x100 f1         inline
+fed     still_1000x800.png    16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_1000x800.png    16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_1000x800.png    16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_1000x800.png    16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_1000x800.png    16x16   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_1000x800.png    16x16   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_1000x800.png    32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_1000x800.png    32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_1000x800.png    32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_1000x800.png    32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_1000x800.png    32x32   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_1000x800.png    32x32   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_1000x800.png    96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      still_1000x800.png    96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     still_1000x800.png    96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      still_1000x800.png    96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     still_1000x800.png    96x96   scale anim=true   -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      still_1000x800.png    96x96   scale anim=true   -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     still_1000x800.png   320x240  scale anim=absent -> 200 image/png                Png 320x256 f1         inline; filename=thumbnail.png
+v1      still_1000x800.png   320x240  scale anim=absent -> 200 image/png                Png 320x256 f1         inline; filename=thumbnail.png
+fed     still_1000x800.png   320x240  scale anim=false  -> 200 image/png                Png 320x256 f1         inline; filename=thumbnail.png
+v1      still_1000x800.png   320x240  scale anim=false  -> 200 image/png                Png 320x256 f1         inline; filename=thumbnail.png
+fed     still_1000x800.png   320x240  scale anim=true   -> 200 image/png                Png 320x256 f1         inline; filename=thumbnail.png
+v1      still_1000x800.png   320x240  scale anim=true   -> 200 image/png                Png 320x256 f1         inline; filename=thumbnail.png
+fed     still_1000x800.png   640x480  scale anim=absent -> 200 image/png                Png 640x512 f1         inline; filename=thumbnail.png
+v1      still_1000x800.png   640x480  scale anim=absent -> 200 image/png                Png 640x512 f1         inline; filename=thumbnail.png
+fed     still_1000x800.png   640x480  scale anim=false  -> 200 image/png                Png 640x512 f1         inline; filename=thumbnail.png
+v1      still_1000x800.png   640x480  scale anim=false  -> 200 image/png                Png 640x512 f1         inline; filename=thumbnail.png
+fed     still_1000x800.png   640x480  scale anim=true   -> 200 image/png                Png 640x512 f1         inline; filename=thumbnail.png
+v1      still_1000x800.png   640x480  scale anim=true   -> 200 image/png                Png 640x512 f1         inline; filename=thumbnail.png
+fed     still_1000x800.png   800x600  scale anim=absent -> 200 image/png                Png 800x640 f1         inline; filename=thumbnail.png
+v1      still_1000x800.png   800x600  scale anim=absent -> 200 image/png                Png 800x640 f1         inline; filename=thumbnail.png
+fed     still_1000x800.png   800x600  scale anim=false  -> 200 image/png                Png 800x640 f1         inline; filename=thumbnail.png
+v1      still_1000x800.png   800x600  scale anim=false  -> 200 image/png                Png 800x640 f1         inline; filename=thumbnail.png
+fed     still_1000x800.png   800x600  scale anim=true   -> 200 image/png                Png 800x640 f1         inline; filename=thumbnail.png
+v1      still_1000x800.png   800x600  scale anim=true   -> 200 image/png                Png 800x640 f1         inline; filename=thumbnail.png
+fed     still_1000x800.png  1024x768  scale anim=absent -> 200 image/png                Png 1000x800 f1        inline
+v1      still_1000x800.png  1024x768  scale anim=absent -> 200 image/png                Png 1000x800 f1        inline
+fed     still_1000x800.png  1024x768  scale anim=false  -> 200 image/png                Png 1000x800 f1        inline
+v1      still_1000x800.png  1024x768  scale anim=false  -> 200 image/png                Png 1000x800 f1        inline
+fed     still_1000x800.png  1024x768  scale anim=true   -> 200 image/png                Png 1000x800 f1        inline
+v1      still_1000x800.png  1024x768  scale anim=true   -> 200 image/png                Png 1000x800 f1        inline
+fed     still_100x100.jpg     16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.jpg     16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.jpg     16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.jpg     16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.jpg     16x16   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.jpg     16x16   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.jpg     32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.jpg     32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.jpg     32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.jpg     32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.jpg     32x32   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.jpg     32x32   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.jpg     96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      still_100x100.jpg     96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     still_100x100.jpg     96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      still_100x100.jpg     96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     still_100x100.jpg     96x96   scale anim=true   -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      still_100x100.jpg     96x96   scale anim=true   -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     still_100x100.jpg    320x240  scale anim=absent -> 200 image/jpeg               Jpeg 100x100 f1        inline
+v1      still_100x100.jpg    320x240  scale anim=absent -> 200 image/jpeg               Jpeg 100x100 f1        inline
+fed     still_100x100.jpg    320x240  scale anim=false  -> 200 image/jpeg               Jpeg 100x100 f1        inline
+v1      still_100x100.jpg    320x240  scale anim=false  -> 200 image/jpeg               Jpeg 100x100 f1        inline
+fed     still_100x100.jpg    320x240  scale anim=true   -> 200 image/jpeg               Jpeg 100x100 f1        inline
+v1      still_100x100.jpg    320x240  scale anim=true   -> 200 image/jpeg               Jpeg 100x100 f1        inline
+fed     still_100x100.jpg    640x480  scale anim=absent -> 200 image/jpeg               Jpeg 100x100 f1        inline
+v1      still_100x100.jpg    640x480  scale anim=absent -> 200 image/jpeg               Jpeg 100x100 f1        inline
+fed     still_100x100.jpg    640x480  scale anim=false  -> 200 image/jpeg               Jpeg 100x100 f1        inline
+v1      still_100x100.jpg    640x480  scale anim=false  -> 200 image/jpeg               Jpeg 100x100 f1        inline
+fed     still_100x100.jpg    640x480  scale anim=true   -> 200 image/jpeg               Jpeg 100x100 f1        inline
+v1      still_100x100.jpg    640x480  scale anim=true   -> 200 image/jpeg               Jpeg 100x100 f1        inline
+fed     still_100x100.jpg    800x600  scale anim=absent -> 200 image/jpeg               Jpeg 100x100 f1        inline
+v1      still_100x100.jpg    800x600  scale anim=absent -> 200 image/jpeg               Jpeg 100x100 f1        inline
+fed     still_100x100.jpg    800x600  scale anim=false  -> 200 image/jpeg               Jpeg 100x100 f1        inline
+v1      still_100x100.jpg    800x600  scale anim=false  -> 200 image/jpeg               Jpeg 100x100 f1        inline
+fed     still_100x100.jpg    800x600  scale anim=true   -> 200 image/jpeg               Jpeg 100x100 f1        inline
+v1      still_100x100.jpg    800x600  scale anim=true   -> 200 image/jpeg               Jpeg 100x100 f1        inline
+fed     still_100x100.jpg   1024x768  scale anim=absent -> 200 image/jpeg               Jpeg 100x100 f1        inline
+v1      still_100x100.jpg   1024x768  scale anim=absent -> 200 image/jpeg               Jpeg 100x100 f1        inline
+fed     still_100x100.jpg   1024x768  scale anim=false  -> 200 image/jpeg               Jpeg 100x100 f1        inline
+v1      still_100x100.jpg   1024x768  scale anim=false  -> 200 image/jpeg               Jpeg 100x100 f1        inline
+fed     still_100x100.jpg   1024x768  scale anim=true   -> 200 image/jpeg               Jpeg 100x100 f1        inline
+v1      still_100x100.jpg   1024x768  scale anim=true   -> 200 image/jpeg               Jpeg 100x100 f1        inline
+fed     still_100x100.webp    16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.webp    16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.webp    16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.webp    16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.webp    16x16   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.webp    16x16   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.webp    32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.webp    32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.webp    32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.webp    32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.webp    32x32   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_100x100.webp    32x32   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_100x100.webp    96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      still_100x100.webp    96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     still_100x100.webp    96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      still_100x100.webp    96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     still_100x100.webp    96x96   scale anim=true   -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      still_100x100.webp    96x96   scale anim=true   -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     still_100x100.webp   320x240  scale anim=absent -> 200 image/webp               WebP 100x100 f1        inline
+v1      still_100x100.webp   320x240  scale anim=absent -> 200 image/webp               WebP 100x100 f1        inline
+fed     still_100x100.webp   320x240  scale anim=false  -> 200 image/webp               WebP 100x100 f1        inline
+v1      still_100x100.webp   320x240  scale anim=false  -> 200 image/webp               WebP 100x100 f1        inline
+fed     still_100x100.webp   320x240  scale anim=true   -> 200 image/webp               WebP 100x100 f1        inline
+v1      still_100x100.webp   320x240  scale anim=true   -> 200 image/webp               WebP 100x100 f1        inline
+fed     still_100x100.webp   640x480  scale anim=absent -> 200 image/webp               WebP 100x100 f1        inline
+v1      still_100x100.webp   640x480  scale anim=absent -> 200 image/webp               WebP 100x100 f1        inline
+fed     still_100x100.webp   640x480  scale anim=false  -> 200 image/webp               WebP 100x100 f1        inline
+v1      still_100x100.webp   640x480  scale anim=false  -> 200 image/webp               WebP 100x100 f1        inline
+fed     still_100x100.webp   640x480  scale anim=true   -> 200 image/webp               WebP 100x100 f1        inline
+v1      still_100x100.webp   640x480  scale anim=true   -> 200 image/webp               WebP 100x100 f1        inline
+fed     still_100x100.webp   800x600  scale anim=absent -> 200 image/webp               WebP 100x100 f1        inline
+v1      still_100x100.webp   800x600  scale anim=absent -> 200 image/webp               WebP 100x100 f1        inline
+fed     still_100x100.webp   800x600  scale anim=false  -> 200 image/webp               WebP 100x100 f1        inline
+v1      still_100x100.webp   800x600  scale anim=false  -> 200 image/webp               WebP 100x100 f1        inline
+fed     still_100x100.webp   800x600  scale anim=true   -> 200 image/webp               WebP 100x100 f1        inline
+v1      still_100x100.webp   800x600  scale anim=true   -> 200 image/webp               WebP 100x100 f1        inline
+fed     still_100x100.webp  1024x768  scale anim=absent -> 200 image/webp               WebP 100x100 f1        inline
+v1      still_100x100.webp  1024x768  scale anim=absent -> 200 image/webp               WebP 100x100 f1        inline
+fed     still_100x100.webp  1024x768  scale anim=false  -> 200 image/webp               WebP 100x100 f1        inline
+v1      still_100x100.webp  1024x768  scale anim=false  -> 200 image/webp               WebP 100x100 f1        inline
+fed     still_100x100.webp  1024x768  scale anim=true   -> 200 image/webp               WebP 100x100 f1        inline
+v1      still_100x100.webp  1024x768  scale anim=true   -> 200 image/webp               WebP 100x100 f1        inline
+fed     still_1000x800.webp   16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_1000x800.webp   16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_1000x800.webp   16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_1000x800.webp   16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_1000x800.webp   16x16   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_1000x800.webp   16x16   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_1000x800.webp   32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_1000x800.webp   32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_1000x800.webp   32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_1000x800.webp   32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_1000x800.webp   32x32   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      still_1000x800.webp   32x32   scale anim=true   -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     still_1000x800.webp   96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      still_1000x800.webp   96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     still_1000x800.webp   96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      still_1000x800.webp   96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     still_1000x800.webp   96x96   scale anim=true   -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      still_1000x800.webp   96x96   scale anim=true   -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     still_1000x800.webp  320x240  scale anim=absent -> 200 image/png                Png 320x256 f1         inline; filename=thumbnail.png
+v1      still_1000x800.webp  320x240  scale anim=absent -> 200 image/png                Png 320x256 f1         inline; filename=thumbnail.png
+fed     still_1000x800.webp  320x240  scale anim=false  -> 200 image/png                Png 320x256 f1         inline; filename=thumbnail.png
+v1      still_1000x800.webp  320x240  scale anim=false  -> 200 image/png                Png 320x256 f1         inline; filename=thumbnail.png
+fed     still_1000x800.webp  320x240  scale anim=true   -> 200 image/png                Png 320x256 f1         inline; filename=thumbnail.png
+v1      still_1000x800.webp  320x240  scale anim=true   -> 200 image/png                Png 320x256 f1         inline; filename=thumbnail.png
+fed     still_1000x800.webp  640x480  scale anim=absent -> 200 image/png                Png 640x512 f1         inline; filename=thumbnail.png
+v1      still_1000x800.webp  640x480  scale anim=absent -> 200 image/png                Png 640x512 f1         inline; filename=thumbnail.png
+fed     still_1000x800.webp  640x480  scale anim=false  -> 200 image/png                Png 640x512 f1         inline; filename=thumbnail.png
+v1      still_1000x800.webp  640x480  scale anim=false  -> 200 image/png                Png 640x512 f1         inline; filename=thumbnail.png
+fed     still_1000x800.webp  640x480  scale anim=true   -> 200 image/png                Png 640x512 f1         inline; filename=thumbnail.png
+v1      still_1000x800.webp  640x480  scale anim=true   -> 200 image/png                Png 640x512 f1         inline; filename=thumbnail.png
+fed     still_1000x800.webp  800x600  scale anim=absent -> 200 image/png                Png 800x640 f1         inline; filename=thumbnail.png
+v1      still_1000x800.webp  800x600  scale anim=absent -> 200 image/png                Png 800x640 f1         inline; filename=thumbnail.png
+fed     still_1000x800.webp  800x600  scale anim=false  -> 200 image/png                Png 800x640 f1         inline; filename=thumbnail.png
+v1      still_1000x800.webp  800x600  scale anim=false  -> 200 image/png                Png 800x640 f1         inline; filename=thumbnail.png
+fed     still_1000x800.webp  800x600  scale anim=true   -> 200 image/png                Png 800x640 f1         inline; filename=thumbnail.png
+v1      still_1000x800.webp  800x600  scale anim=true   -> 200 image/png                Png 800x640 f1         inline; filename=thumbnail.png
+fed     still_1000x800.webp 1024x768  scale anim=absent -> 200 image/webp               WebP 1000x800 f1       inline
+v1      still_1000x800.webp 1024x768  scale anim=absent -> 200 image/webp               WebP 1000x800 f1       inline
+fed     still_1000x800.webp 1024x768  scale anim=false  -> 200 image/webp               WebP 1000x800 f1       inline
+v1      still_1000x800.webp 1024x768  scale anim=false  -> 200 image/webp               WebP 1000x800 f1       inline
+fed     still_1000x800.webp 1024x768  scale anim=true   -> 200 image/webp               WebP 1000x800 f1       inline
+v1      still_1000x800.webp 1024x768  scale anim=true   -> 200 image/webp               WebP 1000x800 f1       inline
+fed     still_1x1.gif         16x16   scale anim=absent -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif         16x16   scale anim=absent -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif         16x16   scale anim=false  -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif         16x16   scale anim=false  -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif         16x16   scale anim=true   -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif         16x16   scale anim=true   -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif         32x32   scale anim=absent -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif         32x32   scale anim=absent -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif         32x32   scale anim=false  -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif         32x32   scale anim=false  -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif         32x32   scale anim=true   -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif         32x32   scale anim=true   -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif         96x96   scale anim=absent -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif         96x96   scale anim=absent -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif         96x96   scale anim=false  -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif         96x96   scale anim=false  -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif         96x96   scale anim=true   -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif         96x96   scale anim=true   -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif        320x240  scale anim=absent -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif        320x240  scale anim=absent -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif        320x240  scale anim=false  -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif        320x240  scale anim=false  -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif        320x240  scale anim=true   -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif        320x240  scale anim=true   -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif        640x480  scale anim=absent -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif        640x480  scale anim=absent -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif        640x480  scale anim=false  -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif        640x480  scale anim=false  -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif        640x480  scale anim=true   -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif        640x480  scale anim=true   -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif        800x600  scale anim=absent -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif        800x600  scale anim=absent -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif        800x600  scale anim=false  -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif        800x600  scale anim=false  -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif        800x600  scale anim=true   -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif        800x600  scale anim=true   -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif       1024x768  scale anim=absent -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif       1024x768  scale anim=absent -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif       1024x768  scale anim=false  -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif       1024x768  scale anim=false  -> 200 image/gif                Gif 1x1 f1             inline
+fed     still_1x1.gif       1024x768  scale anim=true   -> 200 image/gif                Gif 1x1 f1             inline
+v1      still_1x1.gif       1024x768  scale anim=true   -> 200 image/gif                Gif 1x1 f1             inline
+fed     anim_100x100.gif      16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_100x100.gif      16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_100x100.gif      16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_100x100.gif      16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_100x100.gif      16x16   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+v1      anim_100x100.gif      16x16   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+fed     anim_100x100.gif      32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_100x100.gif      32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_100x100.gif      32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_100x100.gif      32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_100x100.gif      32x32   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+v1      anim_100x100.gif      32x32   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+fed     anim_100x100.gif      96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      anim_100x100.gif      96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     anim_100x100.gif      96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      anim_100x100.gif      96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     anim_100x100.gif      96x96   scale anim=true   -> 200 image/gif                Gif 96x96 f3           inline; filename=thumbnail.gif
+v1      anim_100x100.gif      96x96   scale anim=true   -> 200 image/gif                Gif 96x96 f3           inline; filename=thumbnail.gif
+fed     anim_100x100.gif     320x240  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.gif     320x240  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.gif     320x240  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.gif     320x240  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.gif     320x240  scale anim=true   -> 200 image/gif                Gif 100x100 f3         inline
+v1      anim_100x100.gif     320x240  scale anim=true   -> 200 image/gif                Gif 100x100 f3         inline
+fed     anim_100x100.gif     640x480  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.gif     640x480  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.gif     640x480  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.gif     640x480  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.gif     640x480  scale anim=true   -> 200 image/gif                Gif 100x100 f3         inline
+v1      anim_100x100.gif     640x480  scale anim=true   -> 200 image/gif                Gif 100x100 f3         inline
+fed     anim_100x100.gif     800x600  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.gif     800x600  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.gif     800x600  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.gif     800x600  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.gif     800x600  scale anim=true   -> 200 image/gif                Gif 100x100 f3         inline
+v1      anim_100x100.gif     800x600  scale anim=true   -> 200 image/gif                Gif 100x100 f3         inline
+fed     anim_100x100.gif    1024x768  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.gif    1024x768  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.gif    1024x768  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.gif    1024x768  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.gif    1024x768  scale anim=true   -> 200 image/gif                Gif 100x100 f3         inline
+v1      anim_100x100.gif    1024x768  scale anim=true   -> 200 image/gif                Gif 100x100 f3         inline
+fed     anim_1000x800.gif     16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_1000x800.gif     16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_1000x800.gif     16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_1000x800.gif     16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_1000x800.gif     16x16   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+v1      anim_1000x800.gif     16x16   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+fed     anim_1000x800.gif     32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_1000x800.gif     32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_1000x800.gif     32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_1000x800.gif     32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_1000x800.gif     32x32   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+v1      anim_1000x800.gif     32x32   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+fed     anim_1000x800.gif     96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      anim_1000x800.gif     96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     anim_1000x800.gif     96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      anim_1000x800.gif     96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     anim_1000x800.gif     96x96   scale anim=true   -> 200 image/gif                Gif 96x96 f3           inline; filename=thumbnail.gif
+v1      anim_1000x800.gif     96x96   scale anim=true   -> 200 image/gif                Gif 96x96 f3           inline; filename=thumbnail.gif
+fed     anim_1000x800.gif    320x240  scale anim=absent -> 200 image/png                Png 320x256 f1         inline; filename=thumbnail.png
+v1      anim_1000x800.gif    320x240  scale anim=absent -> 200 image/png                Png 320x256 f1         inline; filename=thumbnail.png
+fed     anim_1000x800.gif    320x240  scale anim=false  -> 200 image/png                Png 320x256 f1         inline; filename=thumbnail.png
+v1      anim_1000x800.gif    320x240  scale anim=false  -> 200 image/png                Png 320x256 f1         inline; filename=thumbnail.png
+fed     anim_1000x800.gif    320x240  scale anim=true   -> 200 image/gif                Gif 320x256 f3         inline; filename=thumbnail.gif
+v1      anim_1000x800.gif    320x240  scale anim=true   -> 200 image/gif                Gif 320x256 f3         inline; filename=thumbnail.gif
+fed     anim_1000x800.gif    640x480  scale anim=absent -> 200 image/png                Png 640x512 f1         inline; filename=thumbnail.png
+v1      anim_1000x800.gif    640x480  scale anim=absent -> 200 image/png                Png 640x512 f1         inline; filename=thumbnail.png
+fed     anim_1000x800.gif    640x480  scale anim=false  -> 200 image/png                Png 640x512 f1         inline; filename=thumbnail.png
+v1      anim_1000x800.gif    640x480  scale anim=false  -> 200 image/png                Png 640x512 f1         inline; filename=thumbnail.png
+fed     anim_1000x800.gif    640x480  scale anim=true   -> 200 image/gif                Gif 640x512 f3         inline; filename=thumbnail.gif
+v1      anim_1000x800.gif    640x480  scale anim=true   -> 200 image/gif                Gif 640x512 f3         inline; filename=thumbnail.gif
+fed     anim_1000x800.gif    800x600  scale anim=absent -> 200 image/png                Png 800x640 f1         inline; filename=thumbnail.png
+v1      anim_1000x800.gif    800x600  scale anim=absent -> 200 image/png                Png 800x640 f1         inline; filename=thumbnail.png
+fed     anim_1000x800.gif    800x600  scale anim=false  -> 200 image/png                Png 800x640 f1         inline; filename=thumbnail.png
+v1      anim_1000x800.gif    800x600  scale anim=false  -> 200 image/png                Png 800x640 f1         inline; filename=thumbnail.png
+fed     anim_1000x800.gif    800x600  scale anim=true   -> 200 image/gif                Gif 800x640 f3         inline; filename=thumbnail.gif
+v1      anim_1000x800.gif    800x600  scale anim=true   -> 200 image/gif                Gif 800x640 f3         inline; filename=thumbnail.gif
+fed     anim_1000x800.gif   1024x768  scale anim=absent -> 200 image/png                Png 1000x800 f1        inline; filename=thumbnail.png
+v1      anim_1000x800.gif   1024x768  scale anim=absent -> 200 image/png                Png 1000x800 f1        inline; filename=thumbnail.png
+fed     anim_1000x800.gif   1024x768  scale anim=false  -> 200 image/png                Png 1000x800 f1        inline; filename=thumbnail.png
+v1      anim_1000x800.gif   1024x768  scale anim=false  -> 200 image/png                Png 1000x800 f1        inline; filename=thumbnail.png
+fed     anim_1000x800.gif   1024x768  scale anim=true   -> 200 image/gif                Gif 1000x800 f3        inline
+v1      anim_1000x800.gif   1024x768  scale anim=true   -> 200 image/gif                Gif 1000x800 f3        inline
+fed     anim_1200x900.gif     16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_1200x900.gif     16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_1200x900.gif     16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_1200x900.gif     16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_1200x900.gif     16x16   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+v1      anim_1200x900.gif     16x16   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+fed     anim_1200x900.gif     32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_1200x900.gif     32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_1200x900.gif     32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_1200x900.gif     32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_1200x900.gif     32x32   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+v1      anim_1200x900.gif     32x32   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+fed     anim_1200x900.gif     96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      anim_1200x900.gif     96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     anim_1200x900.gif     96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      anim_1200x900.gif     96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     anim_1200x900.gif     96x96   scale anim=true   -> 200 image/gif                Gif 96x96 f3           inline; filename=thumbnail.gif
+v1      anim_1200x900.gif     96x96   scale anim=true   -> 200 image/gif                Gif 96x96 f3           inline; filename=thumbnail.gif
+fed     anim_1200x900.gif    320x240  scale anim=absent -> 200 image/png                Png 320x240 f1         inline; filename=thumbnail.png
+v1      anim_1200x900.gif    320x240  scale anim=absent -> 200 image/png                Png 320x240 f1         inline; filename=thumbnail.png
+fed     anim_1200x900.gif    320x240  scale anim=false  -> 200 image/png                Png 320x240 f1         inline; filename=thumbnail.png
+v1      anim_1200x900.gif    320x240  scale anim=false  -> 200 image/png                Png 320x240 f1         inline; filename=thumbnail.png
+fed     anim_1200x900.gif    320x240  scale anim=true   -> 200 image/gif                Gif 320x240 f3         inline; filename=thumbnail.gif
+v1      anim_1200x900.gif    320x240  scale anim=true   -> 200 image/gif                Gif 320x240 f3         inline; filename=thumbnail.gif
+fed     anim_1200x900.gif    640x480  scale anim=absent -> 200 image/png                Png 640x480 f1         inline; filename=thumbnail.png
+v1      anim_1200x900.gif    640x480  scale anim=absent -> 200 image/png                Png 640x480 f1         inline; filename=thumbnail.png
+fed     anim_1200x900.gif    640x480  scale anim=false  -> 200 image/png                Png 640x480 f1         inline; filename=thumbnail.png
+v1      anim_1200x900.gif    640x480  scale anim=false  -> 200 image/png                Png 640x480 f1         inline; filename=thumbnail.png
+fed     anim_1200x900.gif    640x480  scale anim=true   -> 200 image/gif                Gif 640x480 f3         inline; filename=thumbnail.gif
+v1      anim_1200x900.gif    640x480  scale anim=true   -> 200 image/gif                Gif 640x480 f3         inline; filename=thumbnail.gif
+fed     anim_1200x900.gif    800x600  scale anim=absent -> 200 image/png                Png 800x600 f1         inline; filename=thumbnail.png
+v1      anim_1200x900.gif    800x600  scale anim=absent -> 200 image/png                Png 800x600 f1         inline; filename=thumbnail.png
+fed     anim_1200x900.gif    800x600  scale anim=false  -> 200 image/png                Png 800x600 f1         inline; filename=thumbnail.png
+v1      anim_1200x900.gif    800x600  scale anim=false  -> 200 image/png                Png 800x600 f1         inline; filename=thumbnail.png
+fed     anim_1200x900.gif    800x600  scale anim=true   -> 200 image/gif                Gif 800x600 f3         inline; filename=thumbnail.gif
+v1      anim_1200x900.gif    800x600  scale anim=true   -> 200 image/gif                Gif 800x600 f3         inline; filename=thumbnail.gif
+fed     anim_1200x900.gif   1024x768  scale anim=absent -> 200 image/png                Png 1200x900 f1        inline; filename=thumbnail.png
+v1      anim_1200x900.gif   1024x768  scale anim=absent -> 200 image/png                Png 1200x900 f1        inline; filename=thumbnail.png
+fed     anim_1200x900.gif   1024x768  scale anim=false  -> 200 image/png                Png 1200x900 f1        inline; filename=thumbnail.png
+v1      anim_1200x900.gif   1024x768  scale anim=false  -> 200 image/png                Png 1200x900 f1        inline; filename=thumbnail.png
+fed     anim_1200x900.gif   1024x768  scale anim=true   -> 200 image/gif                Gif 1200x900 f3        inline
+v1      anim_1200x900.gif   1024x768  scale anim=true   -> 200 image/gif                Gif 1200x900 f3        inline
+fed     anim_100x100.webp     16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_100x100.webp     16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_100x100.webp     16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_100x100.webp     16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_100x100.webp     16x16   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+v1      anim_100x100.webp     16x16   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+fed     anim_100x100.webp     32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_100x100.webp     32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_100x100.webp     32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_100x100.webp     32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_100x100.webp     32x32   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+v1      anim_100x100.webp     32x32   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+fed     anim_100x100.webp     96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      anim_100x100.webp     96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     anim_100x100.webp     96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      anim_100x100.webp     96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     anim_100x100.webp     96x96   scale anim=true   -> 200 image/gif                Gif 96x96 f3           inline; filename=thumbnail.gif
+v1      anim_100x100.webp     96x96   scale anim=true   -> 200 image/gif                Gif 96x96 f3           inline; filename=thumbnail.gif
+fed     anim_100x100.webp    320x240  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.webp    320x240  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.webp    320x240  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.webp    320x240  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.webp    320x240  scale anim=true   -> 200 image/webp               WebP 100x100 f3        inline
+v1      anim_100x100.webp    320x240  scale anim=true   -> 200 image/webp               WebP 100x100 f3        inline
+fed     anim_100x100.webp    640x480  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.webp    640x480  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.webp    640x480  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.webp    640x480  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.webp    640x480  scale anim=true   -> 200 image/webp               WebP 100x100 f3        inline
+v1      anim_100x100.webp    640x480  scale anim=true   -> 200 image/webp               WebP 100x100 f3        inline
+fed     anim_100x100.webp    800x600  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.webp    800x600  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.webp    800x600  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.webp    800x600  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.webp    800x600  scale anim=true   -> 200 image/webp               WebP 100x100 f3        inline
+v1      anim_100x100.webp    800x600  scale anim=true   -> 200 image/webp               WebP 100x100 f3        inline
+fed     anim_100x100.webp   1024x768  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.webp   1024x768  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.webp   1024x768  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.webp   1024x768  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.webp   1024x768  scale anim=true   -> 200 image/webp               WebP 100x100 f3        inline
+v1      anim_100x100.webp   1024x768  scale anim=true   -> 200 image/webp               WebP 100x100 f3        inline
+fed     anim_100x100.apng     16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_100x100.apng     16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_100x100.apng     16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_100x100.apng     16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_100x100.apng     16x16   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+v1      anim_100x100.apng     16x16   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+fed     anim_100x100.apng     32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_100x100.apng     32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_100x100.apng     32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_100x100.apng     32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_100x100.apng     32x32   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+v1      anim_100x100.apng     32x32   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+fed     anim_100x100.apng     96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      anim_100x100.apng     96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     anim_100x100.apng     96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      anim_100x100.apng     96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     anim_100x100.apng     96x96   scale anim=true   -> 200 image/gif                Gif 96x96 f3           inline; filename=thumbnail.gif
+v1      anim_100x100.apng     96x96   scale anim=true   -> 200 image/gif                Gif 96x96 f3           inline; filename=thumbnail.gif
+fed     anim_100x100.apng    320x240  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.apng    320x240  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.apng    320x240  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.apng    320x240  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.apng    320x240  scale anim=true   -> 200 image/apng               Png 100x100 f3         inline
+v1      anim_100x100.apng    320x240  scale anim=true   -> 200 image/apng               Png 100x100 f3         inline
+fed     anim_100x100.apng    640x480  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.apng    640x480  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.apng    640x480  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.apng    640x480  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.apng    640x480  scale anim=true   -> 200 image/apng               Png 100x100 f3         inline
+v1      anim_100x100.apng    640x480  scale anim=true   -> 200 image/apng               Png 100x100 f3         inline
+fed     anim_100x100.apng    800x600  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.apng    800x600  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.apng    800x600  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.apng    800x600  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.apng    800x600  scale anim=true   -> 200 image/apng               Png 100x100 f3         inline
+v1      anim_100x100.apng    800x600  scale anim=true   -> 200 image/apng               Png 100x100 f3         inline
+fed     anim_100x100.apng   1024x768  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.apng   1024x768  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.apng   1024x768  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_100x100.apng   1024x768  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_100x100.apng   1024x768  scale anim=true   -> 200 image/apng               Png 100x100 f3         inline
+v1      anim_100x100.apng   1024x768  scale anim=true   -> 200 image/apng               Png 100x100 f3         inline
+fed     anim_as_png.gif       16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_as_png.gif       16x16   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_as_png.gif       16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_as_png.gif       16x16   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_as_png.gif       16x16   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+v1      anim_as_png.gif       16x16   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+fed     anim_as_png.gif       32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_as_png.gif       32x32   scale anim=absent -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_as_png.gif       32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+v1      anim_as_png.gif       32x32   scale anim=false  -> 200 image/png                Png 32x32 f1           inline; filename=thumbnail.png
+fed     anim_as_png.gif       32x32   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+v1      anim_as_png.gif       32x32   scale anim=true   -> 200 image/gif                Gif 32x32 f3           inline; filename=thumbnail.gif
+fed     anim_as_png.gif       96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      anim_as_png.gif       96x96   scale anim=absent -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     anim_as_png.gif       96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+v1      anim_as_png.gif       96x96   scale anim=false  -> 200 image/png                Png 96x96 f1           inline; filename=thumbnail.png
+fed     anim_as_png.gif       96x96   scale anim=true   -> 200 image/gif                Gif 96x96 f3           inline; filename=thumbnail.gif
+v1      anim_as_png.gif       96x96   scale anim=true   -> 200 image/gif                Gif 96x96 f3           inline; filename=thumbnail.gif
+fed     anim_as_png.gif      320x240  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_as_png.gif      320x240  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_as_png.gif      320x240  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_as_png.gif      320x240  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_as_png.gif      320x240  scale anim=true   -> 200 image/gif                Gif 100x100 f3         inline
+v1      anim_as_png.gif      320x240  scale anim=true   -> 200 image/gif                Gif 100x100 f3         inline
+fed     anim_as_png.gif      640x480  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_as_png.gif      640x480  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_as_png.gif      640x480  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_as_png.gif      640x480  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_as_png.gif      640x480  scale anim=true   -> 200 image/gif                Gif 100x100 f3         inline
+v1      anim_as_png.gif      640x480  scale anim=true   -> 200 image/gif                Gif 100x100 f3         inline
+fed     anim_as_png.gif      800x600  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_as_png.gif      800x600  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_as_png.gif      800x600  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_as_png.gif      800x600  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_as_png.gif      800x600  scale anim=true   -> 200 image/gif                Gif 100x100 f3         inline
+v1      anim_as_png.gif      800x600  scale anim=true   -> 200 image/gif                Gif 100x100 f3         inline
+fed     anim_as_png.gif     1024x768  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_as_png.gif     1024x768  scale anim=absent -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_as_png.gif     1024x768  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+v1      anim_as_png.gif     1024x768  scale anim=false  -> 200 image/png                Png 100x100 f1         inline; filename=thumbnail.png
+fed     anim_as_png.gif     1024x768  scale anim=true   -> 200 image/gif                Gif 100x100 f3         inline
+v1      anim_as_png.gif     1024x768  scale anim=true   -> 200 image/gif                Gif 100x100 f3         inline
+fed     notimage.txt          16x16   scale anim=absent -> 200 text/plain               not-an-image           inline
+v1      notimage.txt          16x16   scale anim=absent -> 200 text/plain               not-an-image           inline
+fed     notimage.txt          16x16   scale anim=false  -> 200 text/plain               not-an-image           inline
+v1      notimage.txt          16x16   scale anim=false  -> 200 text/plain               not-an-image           inline
+fed     notimage.txt          16x16   scale anim=true   -> 200 text/plain               not-an-image           inline
+v1      notimage.txt          16x16   scale anim=true   -> 200 text/plain               not-an-image           inline
+fed     notimage.txt          32x32   scale anim=absent -> 200 text/plain               not-an-image           inline
+v1      notimage.txt          32x32   scale anim=absent -> 200 text/plain               not-an-image           inline
+fed     notimage.txt          32x32   scale anim=false  -> 200 text/plain               not-an-image           inline
+v1      notimage.txt          32x32   scale anim=false  -> 200 text/plain               not-an-image           inline
+fed     notimage.txt          32x32   scale anim=true   -> 200 text/plain               not-an-image           inline
+v1      notimage.txt          32x32   scale anim=true   -> 200 text/plain               not-an-image           inline
+fed     notimage.txt          96x96   scale anim=absent -> 200 text/plain               not-an-image           inline
+v1      notimage.txt          96x96   scale anim=absent -> 200 text/plain               not-an-image           inline
+fed     notimage.txt          96x96   scale anim=false  -> 200 text/plain               not-an-image           inline
+v1      notimage.txt          96x96   scale anim=false  -> 200 text/plain               not-an-image           inline
+fed     notimage.txt          96x96   scale anim=true   -> 200 text/plain               not-an-image           inline
+v1      notimage.txt          96x96   scale anim=true   -> 200 text/plain               not-an-image           inline
+fed     notimage.txt         320x240  scale anim=absent -> 200 text/plain               not-an-image           inline
+v1      notimage.txt         320x240  scale anim=absent -> 200 text/plain               not-an-image           inline
+fed     notimage.txt         320x240  scale anim=false  -> 200 text/plain               not-an-image           inline
+v1      notimage.txt         320x240  scale anim=false  -> 200 text/plain               not-an-image           inline
+fed     notimage.txt         320x240  scale anim=true   -> 200 text/plain               not-an-image           inline
+v1      notimage.txt         320x240  scale anim=true   -> 200 text/plain               not-an-image           inline
+fed     notimage.txt         640x480  scale anim=absent -> 200 text/plain               not-an-image           inline
+v1      notimage.txt         640x480  scale anim=absent -> 200 text/plain               not-an-image           inline
+fed     notimage.txt         640x480  scale anim=false  -> 200 text/plain               not-an-image           inline
+v1      notimage.txt         640x480  scale anim=false  -> 200 text/plain               not-an-image           inline
+fed     notimage.txt         640x480  scale anim=true   -> 200 text/plain               not-an-image           inline
+v1      notimage.txt         640x480  scale anim=true   -> 200 text/plain               not-an-image           inline
+fed     notimage.txt         800x600  scale anim=absent -> 200 text/plain               not-an-image           inline
+v1      notimage.txt         800x600  scale anim=absent -> 200 text/plain               not-an-image           inline
+fed     notimage.txt         800x600  scale anim=false  -> 200 text/plain               not-an-image           inline
+v1      notimage.txt         800x600  scale anim=false  -> 200 text/plain               not-an-image           inline
+fed     notimage.txt         800x600  scale anim=true   -> 200 text/plain               not-an-image           inline
+v1      notimage.txt         800x600  scale anim=true   -> 200 text/plain               not-an-image           inline
+fed     notimage.txt        1024x768  scale anim=absent -> 200 text/plain               not-an-image           inline
+v1      notimage.txt        1024x768  scale anim=absent -> 200 text/plain               not-an-image           inline
+fed     notimage.txt        1024x768  scale anim=false  -> 200 text/plain               not-an-image           inline
+v1      notimage.txt        1024x768  scale anim=false  -> 200 text/plain               not-an-image           inline
+fed     notimage.txt        1024x768  scale anim=true   -> 200 text/plain               not-an-image           inline
+v1      notimage.txt        1024x768  scale anim=true   -> 200 text/plain               not-an-image           inline
+fed     truncated.png         16x16   scale anim=absent -> 200 image/png                Png undecodable        inline
+v1      truncated.png         16x16   scale anim=absent -> 200 image/png                Png undecodable        inline
+fed     truncated.png         16x16   scale anim=false  -> 200 image/png                Png undecodable        inline
+v1      truncated.png         16x16   scale anim=false  -> 200 image/png                Png undecodable        inline
+fed     truncated.png         16x16   scale anim=true   -> 200 image/png                Png undecodable        inline
+v1      truncated.png         16x16   scale anim=true   -> 200 image/png                Png undecodable        inline
+fed     truncated.png         32x32   scale anim=absent -> 200 image/png                Png undecodable        inline
+v1      truncated.png         32x32   scale anim=absent -> 200 image/png                Png undecodable        inline
+fed     truncated.png         32x32   scale anim=false  -> 200 image/png                Png undecodable        inline
+v1      truncated.png         32x32   scale anim=false  -> 200 image/png                Png undecodable        inline
+fed     truncated.png         32x32   scale anim=true   -> 200 image/png                Png undecodable        inline
+v1      truncated.png         32x32   scale anim=true   -> 200 image/png                Png undecodable        inline
+fed     truncated.png         96x96   scale anim=absent -> 200 image/png                Png undecodable        inline
+v1      truncated.png         96x96   scale anim=absent -> 200 image/png                Png undecodable        inline
+fed     truncated.png         96x96   scale anim=false  -> 200 image/png                Png undecodable        inline
+v1      truncated.png         96x96   scale anim=false  -> 200 image/png                Png undecodable        inline
+fed     truncated.png         96x96   scale anim=true   -> 200 image/png                Png undecodable        inline
+v1      truncated.png         96x96   scale anim=true   -> 200 image/png                Png undecodable        inline
+fed     truncated.png        320x240  scale anim=absent -> 200 image/png                Png undecodable        inline
+v1      truncated.png        320x240  scale anim=absent -> 200 image/png                Png undecodable        inline
+fed     truncated.png        320x240  scale anim=false  -> 200 image/png                Png undecodable        inline
+v1      truncated.png        320x240  scale anim=false  -> 200 image/png                Png undecodable        inline
+fed     truncated.png        320x240  scale anim=true   -> 200 image/png                Png undecodable        inline
+v1      truncated.png        320x240  scale anim=true   -> 200 image/png                Png undecodable        inline
+fed     truncated.png        640x480  scale anim=absent -> 200 image/png                Png undecodable        inline
+v1      truncated.png        640x480  scale anim=absent -> 200 image/png                Png undecodable        inline
+fed     truncated.png        640x480  scale anim=false  -> 200 image/png                Png undecodable        inline
+v1      truncated.png        640x480  scale anim=false  -> 200 image/png                Png undecodable        inline
+fed     truncated.png        640x480  scale anim=true   -> 200 image/png                Png undecodable        inline
+v1      truncated.png        640x480  scale anim=true   -> 200 image/png                Png undecodable        inline
+fed     truncated.png        800x600  scale anim=absent -> 200 image/png                Png undecodable        inline
+v1      truncated.png        800x600  scale anim=absent -> 200 image/png                Png undecodable        inline
+fed     truncated.png        800x600  scale anim=false  -> 200 image/png                Png undecodable        inline
+v1      truncated.png        800x600  scale anim=false  -> 200 image/png                Png undecodable        inline
+fed     truncated.png        800x600  scale anim=true   -> 200 image/png                Png undecodable        inline
+v1      truncated.png        800x600  scale anim=true   -> 200 image/png                Png undecodable        inline
+fed     truncated.png       1024x768  scale anim=absent -> 200 image/png                Png undecodable        inline
+v1      truncated.png       1024x768  scale anim=absent -> 200 image/png                Png undecodable        inline
+fed     truncated.png       1024x768  scale anim=false  -> 200 image/png                Png undecodable        inline
+v1      truncated.png       1024x768  scale anim=false  -> 200 image/png                Png undecodable        inline
+fed     truncated.png       1024x768  scale anim=true   -> 200 image/png                Png undecodable        inline
+v1      truncated.png       1024x768  scale anim=true   -> 200 image/png                Png undecodable        inline
+fed     truncated.gif         16x16   scale anim=absent -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif         16x16   scale anim=absent -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif         16x16   scale anim=false  -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif         16x16   scale anim=false  -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif         16x16   scale anim=true   -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif         16x16   scale anim=true   -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif         32x32   scale anim=absent -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif         32x32   scale anim=absent -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif         32x32   scale anim=false  -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif         32x32   scale anim=false  -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif         32x32   scale anim=true   -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif         32x32   scale anim=true   -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif         96x96   scale anim=absent -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif         96x96   scale anim=absent -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif         96x96   scale anim=false  -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif         96x96   scale anim=false  -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif         96x96   scale anim=true   -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif         96x96   scale anim=true   -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif        320x240  scale anim=absent -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif        320x240  scale anim=absent -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif        320x240  scale anim=false  -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif        320x240  scale anim=false  -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif        320x240  scale anim=true   -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif        320x240  scale anim=true   -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif        640x480  scale anim=absent -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif        640x480  scale anim=absent -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif        640x480  scale anim=false  -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif        640x480  scale anim=false  -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif        640x480  scale anim=true   -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif        640x480  scale anim=true   -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif        800x600  scale anim=absent -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif        800x600  scale anim=absent -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif        800x600  scale anim=false  -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif        800x600  scale anim=false  -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif        800x600  scale anim=true   -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif        800x600  scale anim=true   -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif       1024x768  scale anim=absent -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif       1024x768  scale anim=absent -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif       1024x768  scale anim=false  -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif       1024x768  scale anim=false  -> 200 image/gif                Gif 100x100 frames-undecodable inline
+fed     truncated.gif       1024x768  scale anim=true   -> 200 image/gif                Gif 100x100 frames-undecodable inline
+v1      truncated.gif       1024x768  scale anim=true   -> 200 image/gif                Gif 100x100 frames-undecodable inline

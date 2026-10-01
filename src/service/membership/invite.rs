@@ -1,18 +1,27 @@
-use std::collections::BTreeMap;
-
-use futures::FutureExt;
+use futures::{FutureExt, future::join};
 use ruma::{
 	OwnedServerName, RoomId, UserId,
-	api::federation::membership::create_invite,
+	api::{
+		error::ErrorKind,
+		federation::membership::{RawStrippedState, create_invite},
+	},
 	events::{
 		StateEventContent,
-		room::member::{MembershipState, RoomMemberEventContent},
+		invite_permission_config::InvitePermission,
+		room::{
+			join_rules::JoinRule,
+			member::{MembershipState, RoomMemberEventContent},
+		},
 	},
 };
 use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
 use tuwunel_core::{
-	Err, Result, at, err, implement, matrix::event::gen_event_id_canonical_json, pdu::PduBuilder,
+	Err, Result, at, err, implement,
+	matrix::event::gen_event_id_canonical_json,
+	pdu::PduBuilder,
 	utils,
+	utils::future::{ReadyBoolExt, and4},
 };
 
 use super::{AUTO_INVITE_BATCH_WINDOW, INITIAL_ROOM_CREATION_FIELD, InviteBatchState, Service};
@@ -26,11 +35,17 @@ fn invite_unsigned(
 	let mut unsigned = BTreeMap::new();
 
 	if let Some(batch_id) = batch_id.filter(|value| !value.is_empty()) {
-		unsigned.insert(INVITE_BATCH_ID_FIELD.to_owned(), JsonValue::String(batch_id.to_owned()));
+		unsigned.insert(
+			INVITE_BATCH_ID_FIELD.to_owned(),
+			JsonValue::String(batch_id.to_owned()),
+		);
 	}
 
 	if initial_room_creation {
-		unsigned.insert(INITIAL_ROOM_CREATION_FIELD.to_owned(), JsonValue::Bool(true));
+		unsigned.insert(
+			INITIAL_ROOM_CREATION_FIELD.to_owned(),
+			JsonValue::Bool(true),
+		);
 	}
 
 	(!unsigned.is_empty()).then_some(unsigned)
@@ -58,7 +73,10 @@ mod tests {
 	#[test]
 	fn includes_initial_room_creation_marker_without_batch_id() {
 		let unsigned = invite_unsigned(None, true).expect("has unsigned data");
-		assert_eq!(unsigned.get(INITIAL_ROOM_CREATION_FIELD), Some(&JsonValue::Bool(true)));
+		assert_eq!(
+			unsigned.get(INITIAL_ROOM_CREATION_FIELD),
+			Some(&JsonValue::Bool(true))
+		);
 	}
 }
 
@@ -77,8 +95,16 @@ pub async fn invite(
 	is_direct: bool,
 	batch_id: Option<&str>,
 ) -> Result {
-	self.invite_inner(sender_user, user_id, room_id, reason, is_direct, batch_id, false)
-		.await
+	self.invite_inner(
+		sender_user,
+		user_id,
+		room_id,
+		reason,
+		is_direct,
+		batch_id,
+		false,
+	)
+	.await
 }
 
 /// Invites a user while a room is being created. The invite remains a normal
@@ -94,8 +120,16 @@ pub async fn invite_for_room_creation(
 	is_direct: bool,
 	batch_id: Option<&str>,
 ) -> Result {
-	self.invite_inner(sender_user, user_id, room_id, reason, is_direct, batch_id, true)
-		.await
+	self.invite_inner(
+		sender_user,
+		user_id,
+		room_id,
+		reason,
+		is_direct,
+		batch_id,
+		true,
+	)
+	.await
 }
 
 #[implement(Service)]
@@ -142,6 +176,54 @@ async fn invite_inner(
 	Ok(())
 }
 
+/// Reports whether a user must be invited before joining a room.
+///
+/// True when this server is in the room, the user is neither joined nor
+/// invited, and the join rule would refuse the user uninvited: a public rule
+/// admits anyone, and a restricted rule admits members of the rooms it
+/// allows. When this server is not in the room its view of the join rule may
+/// be stale or absent, so the remote join is left to decide.
+#[implement(Service)]
+pub async fn join_needs_invite(&self, room_id: &RoomId, user_id: &UserId) -> bool {
+	let server_in_room = self
+		.services
+		.state_cache
+		.server_in_room(self.services.globals.server_name(), room_id);
+
+	let joined = self.services.state_cache.is_joined(user_id, room_id);
+
+	let invited = self.services.state_cache.is_invited(user_id, room_id);
+
+	let admitted = self
+		.services
+		.state_accessor
+		.get_join_rules(room_id)
+		.then(async |rule| self.admits_uninvited(&rule, user_id).await);
+
+	// and4 polls in order, so a point read refusing at once spares the join-rule reads.
+	and4(
+		server_in_room,
+		joined.is_false(),
+		invited.is_false(),
+		admitted.is_false(),
+	)
+	.await
+}
+
+#[implement(Service)]
+async fn admits_uninvited(&self, rule: &JoinRule, user_id: &UserId) -> bool {
+	match rule {
+		JoinRule::Public => true,
+		JoinRule::Restricted(_) | JoinRule::KnockRestricted(_) => {
+			self.services
+				.state_cache
+				.is_joined_any(user_id, rule.allowed_room_ids())
+				.await
+		}
+		_ => false,
+	}
+}
+
 #[implement(Service)]
 async fn resolve_invite_batch_id(
 	&self,
@@ -186,84 +268,101 @@ async fn remote_invite(
 	batch_id: Option<&str>,
 	initial_room_creation: bool,
 ) -> Result {
-	let (pdu, pdu_json, invite_room_state) = {
+	let (pdu, pdu_json, invite_room_state, room_version_id) = {
 		let state_lock = self.services.state.mutex.lock(room_id).await;
 
-		let content = RoomMemberEventContent {
-			displayname: self
-				.services
-				.users
-				.displayname(user_id)
-				.await
-				.ok(),
-			avatar_url: self.services.users.avatar_url(user_id).await.ok(),
-			is_direct: Some(is_direct),
-			reason: reason.cloned(),
-			..RoomMemberEventContent::new(MembershipState::Invite)
-		};
-
-		let (pdu, pdu_json) = self
+		let content = self
 			.services
-			.timeline
-			.create_hash_and_sign_event(
-				PduBuilder {
-					event_type: content.event_type().into(),
-					state_key: Some(user_id.to_string().into()),
-					content: serde_json::value::to_raw_value(&content).expect(
-						"Invite membership content must serialize to RawValue"
-					),
-					unsigned: invite_unsigned(batch_id, initial_room_creation),
-					..Default::default()
+			.profile
+			.fill_content(
+				user_id,
+				RoomMemberEventContent {
+					is_direct,
+					reason: reason.cloned(),
+					..RoomMemberEventContent::new(MembershipState::Invite)
 				},
-				sender_user,
-				room_id,
-				&state_lock,
 			)
-			.await?;
+			.await;
 
-		let invite_room_state = self.services.state.summary_stripped(&pdu).await;
+		let event = self.services.timeline.create_hash_and_sign_event(
+			PduBuilder {
+				unsigned: invite_unsigned(batch_id, initial_room_creation),
+				..PduBuilder::state(user_id.to_string(), &content)
+			},
+			sender_user,
+			room_id,
+			&state_lock,
+		);
+
+		let room_version_id = self.services.state.get_room_version(room_id);
+		let (event, room_version_id) = join(event, room_version_id).await;
+		let (pdu, pdu_json) = event?;
+		let room_version_id = room_version_id?;
+
+		let invite_room_state = self
+			.services
+			.state
+			.summary_pdus(&pdu, &pdu_json, &room_version_id)
+			.await;
 
 		drop(state_lock);
 
-		(pdu, pdu_json, invite_room_state)
+		(pdu, pdu_json, invite_room_state, room_version_id)
 	};
 
-	let room_version_id = self
+	let event = self
 		.services
-		.state
-		.get_room_version(room_id)
-		.await?;
+		.federation
+		.format_pdu_into(pdu_json.clone(), Some(&room_version_id));
+
+	let via = self
+		.services
+		.state_cache
+		.servers_route_via(room_id)
+		.map(Result::ok);
+
+	let (event, via) = join(event, via).await;
 
 	let response = self
 		.services
 		.federation
-		.execute(user_id.server_name(), create_invite::v2::Request {
-			room_id: room_id.to_owned(),
-			event_id: (*pdu.event_id).to_owned(),
-			room_version: room_version_id.clone(),
-			event: self
-				.services
-				.federation
-				.format_pdu_into(pdu_json.clone(), Some(&room_version_id))
-				.await,
-			invite_room_state: invite_room_state
-				.into_iter()
-				.map(Into::into)
-				.collect(),
-			via: self
-				.services
-				.state_cache
-				.servers_route_via(room_id)
-				.await
-				.ok(),
-		})
-		.await?;
+		.execute(
+			user_id.server_name(),
+			create_invite::v2::Request {
+				room_id: room_id.to_owned(),
+				event_id: (*pdu.event_id).to_owned(),
+				room_version: room_version_id.clone(),
+				event,
+				invite_room_state: invite_room_state
+					.into_iter()
+					.map(RawStrippedState::Pdu)
+					.collect(),
+				via,
+			},
+		)
+		.await
+		.map_err(|e| match e.kind() {
+			ErrorKind::IncompatibleRoomVersion { .. } | ErrorKind::UnsupportedRoomVersion => {
+				err!(Request(UnsupportedRoomVersion(
+					"Server {} does not support room version {room_version_id}.",
+					user_id.server_name(),
+				)))
+			}
+			// MSC4311: the remote rejected our well-formed invite over create-event
+			// validation; the client cannot make it succeed, so surface a 5xx.
+			ErrorKind::MissingParam => err!(BadServerResponse(
+				"Remote server could not validate the invite's create event."
+			)),
+			_ => e,
+		})?;
 
 	// We do not add the event_id field to the pdu here because of signature and
 	// hashes checks
 	let (event_id, value) = gen_event_id_canonical_json(&response.event, &room_version_id)
 		.map_err(|e| {
-			err!(Request(BadJson(warn!("Could not convert event to canonical JSON: {e}"))))
+			err!(Request(BadJson(warn!(
+				"Could not convert event to canonical JSON: {e}"
+			))))
 		})?;
 
 	if pdu.event_id != event_id {
@@ -280,7 +379,9 @@ async fn remote_invite(
 			.ok_or_else(|| err!(Request(BadJson("Event missing origin field."))))?,
 	)?)
 	.map_err(|e| {
-		err!(Request(BadJson(warn!("Origin field in event is not a valid server name: {e}"))))
+		err!(Request(BadJson(warn!(
+			"Origin field in event is not a valid server name: {e}"
+		))))
 	})?;
 
 	let pdu_id = self
@@ -290,7 +391,9 @@ async fn remote_invite(
 		.await?
 		.map(at!(0))
 		.ok_or_else(|| {
-			err!(Request(InvalidParam("Could not accept incoming PDU as timeline event.")))
+			err!(Request(InvalidParam(
+				"Could not accept incoming PDU as timeline event."
+			)))
 		})?;
 
 	self.services
@@ -313,12 +416,21 @@ async fn local_invite(
 	batch_id: Option<&str>,
 	initial_room_creation: bool,
 ) -> Result {
-	if !self
+	let blocked = self
 		.services
-		.state_cache
-		.is_joined(sender_user, room_id)
-		.await
-	{
+		.users
+		.invite_permission(sender_user, user_id)
+		.map(|permission| permission.eq(&InvitePermission::Block));
+
+	let joined = self.services.state_cache.is_joined(sender_user, room_id);
+
+	let (blocked, joined) = join(blocked, joined).await;
+
+	if blocked {
+		return Err!(Request(InviteBlocked("{user_id} has blocked this invite.")));
+	}
+
+	if !joined {
 		return Err!(Request(Forbidden(
 			"You must be joined in the room you are trying to invite from."
 		)));
@@ -326,19 +438,18 @@ async fn local_invite(
 
 	let state_lock = self.services.state.mutex.lock(room_id).await;
 
-	let content = RoomMemberEventContent {
-		displayname: self
-			.services
-			.users
-			.displayname(user_id)
-			.await
-			.ok(),
-		avatar_url: self.services.users.avatar_url(user_id).await.ok(),
-		blurhash: self.services.users.blurhash(user_id).await.ok(),
-		is_direct: Some(is_direct),
-		reason: reason.cloned(),
-		..RoomMemberEventContent::new(MembershipState::Invite)
-	};
+	let content = self
+		.services
+		.profile
+		.fill_content(
+			user_id,
+			RoomMemberEventContent {
+				is_direct,
+				reason: reason.cloned(),
+				..RoomMemberEventContent::new(MembershipState::Invite)
+			},
+		)
+		.await;
 
 	self.services
 		.timeline
@@ -347,7 +458,8 @@ async fn local_invite(
 				event_type: content.event_type().into(),
 				state_key: Some(user_id.to_string().into()),
 				content: serde_json::value::to_raw_value(&content)
-					.expect("Invite membership content must serialize to RawValue"),
+					.expect("Invite membership content must serialize to RawValue")
+					.into(),
 				unsigned: invite_unsigned(batch_id, initial_room_creation),
 				..Default::default()
 			},
@@ -361,46 +473,7 @@ async fn local_invite(
 	// Holding it here would cause a deadlock.
 	drop(state_lock);
 
-	// Auto-join if configured.
-	// We already dropped state_lock above — acquire a fresh one for join().
-	if self.services.server.config.auto_accept_invites {
-		use tuwunel_core::info;
-
-		info!(
-			"Auto-accept invites enabled: automatically joining {user_id} to room {room_id} \
-			 (invited by {sender_user})"
-		);
-
-		let join_lock = self.services.state.mutex.lock(room_id).await;
-		match self
-			.join(
-				user_id, // the invited user becomes the joiner
-				room_id,
-				None,       // orig_room_id
-				None,       // reason
-				&[],        // servers — local user, no federation needed
-				false,      // is_appservice
-				&join_lock,
-			)
-			.boxed()
-			.await
-		{
-			Ok(()) => {
-				info!(
-					"Successfully auto-joined {user_id} to room {room_id} after invite from \
-					 {sender_user}"
-				);
-			},
-			Err(e) => {
-				use tuwunel_core::warn;
-				warn!(
-					"Failed to auto-join {user_id} to room {room_id} after invite: {e}. \
-					 User will need to manually accept the invite."
-				);
-				// Invite was created successfully — don't propagate error
-			},
-		}
-	}
+	self.auto_accept(room_id, user_id, sender_user, is_direct);
 
 	Ok(())
 }

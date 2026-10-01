@@ -1,16 +1,35 @@
+mod profiles;
+#[cfg(test)]
+mod tests;
 mod v3;
 mod v5;
 
-use futures::{FutureExt, StreamExt, pin_mut};
-use ruma::{RoomId, UserId};
-use tuwunel_core::{
-	Error, PduCount, Result,
-	matrix::pdu::PduEvent,
-	utils::stream::{BroadbandExt, ReadyExt},
+use futures::{StreamExt, pin_mut};
+use ruma::{
+	OwnedUserId, RoomId, UserId,
+	events::{
+		AnyStrippedStateEvent,
+		TimelineEventType::{RoomCreate, RoomMember},
+	},
+	serde::Raw,
 };
-use tuwunel_service::Services;
+use tuwunel_core::{
+	Error, PduCount, Result, debug_warn, is_equal_to,
+	matrix::{Event, pdu::PduEvent},
+	utils::{ReadyExt, result::LogErr, stream::BroadbandExt},
+};
+use tuwunel_service::{Services, users::InviteFilter};
 
-pub(crate) use self::{v3::sync_events_route, v5::sync_events_v5_route};
+pub(crate) use self::{
+	v3::{calculate_heroes, sync_events_route},
+	v5::sync_events_v5_route,
+};
+
+#[derive(Clone, Copy)]
+enum TimelineErrors {
+	Ignore,
+	Propagate,
+}
 
 async fn load_timeline(
 	services: &Services,
@@ -20,46 +39,118 @@ async fn load_timeline(
 	next_batch: Option<PduCount>,
 	limit: usize,
 ) -> Result<(Vec<(PduCount, PduEvent)>, bool, PduCount), Error> {
+	load_timeline_with_errors(
+		services,
+		sender_user,
+		room_id,
+		roomsincecount,
+		next_batch,
+		limit,
+		TimelineErrors::Ignore,
+	)
+	.await
+}
+
+async fn load_timeline_fallible(
+	services: &Services,
+	sender_user: &UserId,
+	room_id: &RoomId,
+	roomsincecount: PduCount,
+	next_batch: Option<PduCount>,
+	limit: usize,
+) -> Result<(Vec<(PduCount, PduEvent)>, bool, PduCount), Error> {
+	load_timeline_with_errors(
+		services,
+		sender_user,
+		room_id,
+		roomsincecount,
+		next_batch,
+		limit,
+		TimelineErrors::Propagate,
+	)
+	.await
+}
+
+async fn load_timeline_with_errors(
+	services: &Services,
+	sender_user: &UserId,
+	room_id: &RoomId,
+	roomsincecount: PduCount,
+	next_batch: Option<PduCount>,
+	limit: usize,
+	errors: TimelineErrors,
+) -> Result<(Vec<(PduCount, PduEvent)>, bool, PduCount), Error> {
 	let roomsincecount = services
 		.deleted_rooms
 		.deleted_before(sender_user, room_id)
 		.await
 		.map(PduCount::Normal)
-		.map_or(roomsincecount, |deleted_before| roomsincecount.max(deleted_before));
-
-	let last_timeline_count = services
+		.map_or(roomsincecount, |before| roomsincecount.max(before));
+	let until = next_batch.map(|count| count.saturating_add(1));
+	let pdus = services
 		.timeline
-		.last_timeline_count(Some(sender_user), room_id, next_batch)
-		.await?;
+		.pdus_rev(Some(sender_user), room_id, until);
 
-	if last_timeline_count <= roomsincecount {
-		return Ok((Vec::new(), false, last_timeline_count));
+	// Take the last events for the timeline.
+	pin_mut!(pdus);
+	let mut timeline_pdus = Vec::new();
+	let mut last_timeline_count = PduCount::max();
+	let mut first = true;
+	let mut limited = false;
+
+	while let Some(pdu) = pdus.next().await {
+		let (pducount, pdu) = match pdu {
+			Ok(pdu) => pdu,
+			Err(error) if first || matches!(errors, TimelineErrors::Propagate) => {
+				return Err(error);
+			}
+			Err(_) => continue,
+		};
+
+		if first {
+			first = false;
+			last_timeline_count = matches!(pducount, PduCount::Normal(_))
+				.then_some(pducount)
+				.unwrap_or_else(PduCount::max);
+		}
+
+		if pducount <= roomsincecount {
+			break;
+		}
+
+		if services
+			.deleted_events
+			.is_deleted(sender_user, pdu.event_id())
+			.await
+		{
+			continue;
+		}
+		if timeline_pdus.len() == limit {
+			limited = true;
+			break;
+		}
+
+		timeline_pdus.push((pducount, pdu));
 	}
 
-	let non_timeline_pdus = services
-		.timeline
-		.pdus_rev(Some(sender_user), room_id, None)
-		.ready_filter_map(Result::ok)
-		.ready_skip_while(|&(pducount, _)| pducount > next_batch.unwrap_or_else(PduCount::max))
-		.ready_take_while(|&(pducount, _)| pducount > roomsincecount);
-
-	// Take the last events for the timeline
-	pin_mut!(non_timeline_pdus);
-	let timeline_pdus: Vec<_> = non_timeline_pdus
-		.by_ref()
-		.take(limit)
-		.collect()
-		.map(|mut pdus: Vec<_>| {
-			pdus.reverse();
-			pdus
-		})
-		.await;
-
-	// They /sync response doesn't always return all messages, so we say the output
-	// is limited unless there are events in non_timeline_pdus
-	let limited = non_timeline_pdus.next().await.is_some();
+	timeline_pdus.reverse();
 
 	Ok((timeline_pdus, limited, last_timeline_count))
+}
+
+/// Returns the backward pagination token for a timeline slice.
+///
+/// A slice beginning at room creation has nothing before it, so its window's
+/// end lets a members query describe the room as received.
+/// Backward pagination from that token re-reads the slice once before ending.
+fn timeline_prev_batch(
+	timeline_pdus: &[(PduCount, PduEvent)],
+	window_end: PduCount,
+) -> Option<PduCount> {
+	timeline_pdus.first().map(|(count, pdu)| match pdu.kind() {
+		RoomCreate => window_end,
+		_ => *count,
+	})
 }
 
 async fn share_encrypted_room(
@@ -80,4 +171,105 @@ async fn share_encrypted_room(
 				.await
 		})
 		.await
+}
+
+/// MSC4155: whether a stored invite may be served to the invitee.
+///
+/// The verdict is the recipient's own, judged against the sender of the
+/// stripped invite membership event. Unreadable invite state takes the same
+/// verdict as the sender-less case below, since neither can name a sender.
+async fn invite_permitted_room(
+	services: &Services,
+	user_id: &UserId,
+	room_id: &RoomId,
+	filter: &InviteFilter,
+) -> bool {
+	filter.is_permissive()
+		|| services
+			.state_cache
+			.invite_state(user_id, room_id)
+			.await
+			.map_or_else(
+				|error| {
+					debug_warn!(%user_id, %room_id, ?error, "invite state is unreadable; skipping the sender rules");
+					filter.permits(None)
+				},
+				|invite_state| invite_permitted(user_id, room_id, filter, &invite_state),
+			)
+}
+
+/// [`invite_permitted_room`] for a room whose stripped state is in hand.
+///
+/// Callers walking stored invites already hold the state and take this form,
+/// which spares them the load the room-keyed form pays per room. `room_id`
+/// names the affected row in the sender-less diagnostic and does not enter the
+/// verdict. That diagnostic stays at debug on a release build deliberately,
+/// since the condition repeats for every sync an affected user makes.
+fn invite_permitted(
+	user_id: &UserId,
+	room_id: &RoomId,
+	filter: &InviteFilter,
+	invite_state: &[Raw<AnyStrippedStateEvent>],
+) -> bool {
+	// Load-bearing: keeps a permissive user off the sender derivation below.
+	if filter.is_permissive() {
+		return true;
+	}
+
+	let sender = invite_sender(user_id, invite_state);
+
+	if sender.is_none() {
+		debug_warn!(%user_id, %room_id, "invite state names no sender; skipping the sender rules");
+	}
+
+	filter.permits(sender.as_deref())
+}
+
+/// The sender of the stripped membership event inviting `user_id`.
+///
+/// The last matching entry wins. An invite this server recorded after the
+/// federation route began sanitising stripped state holds one entry for this
+/// cell, our own copy of the signed membership PDU, whose sender the origin
+/// check authenticated. An invite stored before that still carries whatever
+/// the inviting server sent ahead of our copy, and the array has no ordering
+/// semantics in the spec, so reading the last entry is what keeps those
+/// answering with the authenticated sender too.
+fn invite_sender(
+	user_id: &UserId,
+	invite_state: &[Raw<AnyStrippedStateEvent>],
+) -> Option<OwnedUserId> {
+	invite_state
+		.iter()
+		.rev()
+		.filter(|event| {
+			event
+				.get_field::<&str>("state_key")
+				.is_ok_and(|state_key| state_key.is_some_and(is_equal_to!(user_id.as_str())))
+		})
+		.filter_map(|event| event.deserialize().ok())
+		.find_map(|event| match event {
+			AnyStrippedStateEvent::RoomMember(member) if member.state_key == user_id => {
+				Some(member.sender)
+			}
+			_ => None,
+		})
+}
+
+/// State sections strip the stored `prev_content`/`prev_sender` pair
+/// (Synapse injects the pair on timeline fetches only). The requester's own
+/// membership and events duplicated from the returned timeline (MSC4222,
+/// full_state) keep it: clients read membership transitions from those
+/// copies.
+fn strip_prev_state(
+	mut pdu: PduEvent,
+	sender_user: &UserId,
+	in_timeline: impl Fn(&PduEvent) -> bool,
+) -> PduEvent {
+	let own_membership = *pdu.kind() == RoomMember && pdu.state_key() == Some(sender_user.as_str());
+
+	if !own_membership && !in_timeline(&pdu) {
+		pdu.remove_prev_state().log_err().ok();
+	}
+
+	pdu
 }

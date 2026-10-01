@@ -1,4 +1,4 @@
-# tuwunel for Docker
+# Tuwunel for Docker
 
 ## Docker
 
@@ -9,16 +9,19 @@ from a registry.
 
 OCI images for tuwunel are available in the registries listed below.
 
-| Registry        | Image                                                           | Size                          | Notes                  |
-| --------------- | --------------------------------------------------------------- | ----------------------------- | ---------------------- |
-| GitHub Registry | [ghcr.io/matrix-construct/tuwunel:latest][gh] | ![Image Size][shield-latest]  | Stable latest tagged image.          |
-| Docker Hub      | [docker.io/jevolk/tuwunel:latest][dh]             | ![Image Size][shield-latest]  | Stable latest tagged image.          |
-| GitHub Registry | [ghcr.io/matrix-construct/tuwunel:main][gh]   | ![Image Size][shield-main]    | Stable main branch.   |
-| Docker Hub      | [docker.io/jevolk/tuwunel:main][dh]               | ![Image Size][shield-main]    | Stable main branch.   |
+| Registry        | Image                                            | Size                            | Notes                                                                  |
+| --------------- | ------------------------------------------------ | ------------------------------- | ---------------------------------------------------------------------- |
+| GitHub Registry | [ghcr.io/matrix-construct/tuwunel:latest][gh]    | ![Image Size][shield-latest]    | Most recent tagged release. Recommended for automated updates (~monthly). |
+| Docker Hub      | [docker.io/jevolk/tuwunel:latest][dh]            | ![Image Size][shield-latest]    | Most recent tagged release. Recommended for automated updates (~monthly). |
+| GitHub Registry | [ghcr.io/matrix-construct/tuwunel:preview][gh]   | ![Image Size][shield-preview]   | Selected higher-confidence updates between releases (~weekly).         |
+| Docker Hub      | [docker.io/jevolk/tuwunel:preview][dh]           | ![Image Size][shield-preview]   | Selected higher-confidence updates between releases (~weekly).         |
+| GitHub Registry | [ghcr.io/matrix-construct/tuwunel:main][gh]      | ![Image Size][shield-main]      | Every reviewed merge to the main branch (~daily).                      |
+| Docker Hub      | [docker.io/jevolk/tuwunel:main][dh]              | ![Image Size][shield-main]      | Every reviewed merge to the main branch (~daily).                      |
 
 [dh]: https://hub.docker.com/r/jevolk/tuwunel
 [gh]: https://github.com/matrix-construct/tuwunel/pkgs/container/tuwunel
 [shield-latest]: https://img.shields.io/docker/image-size/jevolk/tuwunel/latest
+[shield-preview]: https://img.shields.io/docker/image-size/jevolk/tuwunel/preview
 [shield-main]: https://img.shields.io/docker/image-size/jevolk/tuwunel/main
 
 ### Run
@@ -26,12 +29,17 @@ OCI images for tuwunel are available in the registries listed below.
 When you have the image you can simply run it with
 
 ```bash
-docker run -d -p 8448:6167 \
+docker run -d -p 8448:8008 \
     -v db:/var/lib/tuwunel/ \
     -e TUWUNEL_SERVER_NAME="your.server.name" \
     -e TUWUNEL_ALLOW_REGISTRATION=false \
+    --stop-timeout 1800 \
     --name tuwunel $LINK
 ```
+
+The `--stop-timeout` is what lets an upgrade finish its database migration
+instead of being killed part way through; see [Stopping during a
+migration](#stopping-during-a-migration).
 
 or you can use [docker compose](#docker-compose).
 
@@ -46,12 +54,94 @@ If you just want to test tuwunel for a short time, you can use the `--rm`
 flag, which will clean up everything related to your container after you stop
 it.
 
+### Health check
+
+The image ships a `HEALTHCHECK` which runs `tuwunel --health-check`: it reads
+the same configuration as the server, connects to each configured listener,
+and requests `/_tuwunel/server_version`. Container platforms report the result
+as the container's health status. The probe reads the configuration from the
+environment and any config file named by `TUWUNEL_CONFIG`; arguments passed on
+the container command line are not visible to it, so when configuring via
+command-line arguments override the health check accordingly. The probe
+targets the configured listeners, so sockets passed in by a process manager
+(systemd socket activation) are not covered. The same flag also works outside
+containers, e.g. as a Kubernetes exec probe.
+
+### Stopping during a migration
+
+The first boot after an upgrade can run a one-time database migration, and the
+listener does not open until it finishes. On a large database that can take many
+minutes.
+
+**A container runtime will not wait that long by default.** `docker stop` and
+`podman stop` send `SIGTERM`, then `SIGKILL` ten seconds later; Kubernetes
+allows thirty. A kill part way through a migration leaves the database half
+migrated, and no admin command repairs that. Raise the grace period so the
+server is allowed to reach a safe point:
+
+| Runtime | Setting | Default |
+|---|---|---|
+| `docker run` | `--stop-timeout 1800` | 10s |
+| Compose | `stop_grace_period: 30m` | 10s |
+| Podman quadlet | `PodmanArgs=--stop-timeout=1800`, plus `TimeoutStopSec=1830` | 10s |
+| Kubernetes | `terminationGracePeriodSeconds: 1800` | 30s |
+
+There is no way to carry this in the image, so it has to be set where the
+container is run. The compose files shipped in this directory already set it,
+and so does the quadlet unit.
+
+Under a quadlet both deadlines have to be set. The generator writes no
+`TimeoutStopSec=` of its own, so systemd's ninety second default ends the
+container before podman's timeout is reached, and `StopTimeout=` only became a
+`[Container]` key in podman 5.0, where an unknown key makes the generator emit
+no unit at all, so the value reaches podman as a passthrough argument instead.
+
+Tuwunel leaves the migration at the next safe point when it is asked to stop,
+and the steps that already finished are recorded, so the remainder run on the
+next start. That only helps if the runtime waits long enough for the current
+step to end, which is what the settings above buy.
+
+While a migration runs the server logs a line every fifteen seconds naming the
+step, how far into it the server is, and how long it has been going, so
+`docker logs -f` shows work in progress rather than silence:
+
+```
+Database migration in progress progress=fix_short_injectivity: event short ids / reverse rows, 1204833 done, 12.55 minutes
+```
+
+A step reports a position without a total when it cannot count its remaining
+work without a second pass over the data. A position that keeps climbing is the
+signal that the migration is progressing.
+
+### Health during a migration
+
+The health probe answers whether the server is serving, and a migrating one is
+not, so it fails until the listener opens. That is why the image sets a health
+start period of thirty minutes: a container inside its start period reports
+`starting` rather than `unhealthy`, and failures there do not count against the
+retry budget.
+
+```
+Up 12 minutes (health: starting)
+```
+
+An `unhealthy` container is what invites the `docker restart` that kills a
+migration mid-write, so the wide window exists to keep that reading off the
+screen while the server is doing exactly what it should. A container that
+reports healthy once leaves the start period behind, and a migration that
+fails ends the process rather than lingering unhealthy.
+
+Nothing waiting on health is misled by this. A Compose service gated on
+`depends_on: condition: service_healthy` waits through `starting` and runs only
+once the listener answers, which is the behaviour you want and the reason the
+probe is not simply made to report healthy while migrating.
+
 ### Docker-compose
 
 If the `docker run` command is not for you or your setup, you can also use one
 of the provided `docker-compose` files.
 
-Depending on your proxy setup, you can use one of the following files;
+Depending on your proxy setup, you can use one of the following files:
 
 - If you already have a `traefik` instance set up, use
 [`docker-compose.for-traefik.yml`](docker-compose.for-traefik.yml)
@@ -135,7 +225,7 @@ those two files.
 
 ## Voice communication
 
-See the [TURN](../turn.md) page.
+See the [TURN](../calls/turn.md) page.
 
 [nix-buildlayeredimage]: https://ryantm.github.io/nixpkgs/builders/images/dockertools/#ssec-pkgs-dockerTools-buildLayeredImage
 [oci-image-def]: https://github.com/jevolk/tuwunel/blob/main/nix/pkgs/oci-image/default.nix

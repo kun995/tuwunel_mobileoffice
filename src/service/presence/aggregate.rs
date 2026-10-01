@@ -17,6 +17,16 @@ pub(crate) enum DeviceKey {
 	UnknownLocal,
 }
 
+/// Kinds of updates to the per-device `status_msg`.
+///
+/// `Unchanged` preserves what the device already has.
+/// `Set` writes through, including `None` and `Some("")` to clear it.
+#[derive(Debug, Clone)]
+pub(crate) enum StatusMsg {
+	Set(Option<String>),
+	Unchanged,
+}
+
 #[derive(Debug, Clone)]
 struct DevicePresence {
 	state: PresenceState,
@@ -56,7 +66,7 @@ impl PresenceAggregator {
 		state: &PresenceState,
 		currently_active: Option<bool>,
 		last_active_ago: Option<UInt>,
-		status_msg: Option<String>,
+		status_msg: StatusMsg,
 		now_ms: u64,
 	) {
 		let mut guard = self.inner.write().await;
@@ -67,6 +77,11 @@ impl PresenceAggregator {
 			| Some(ago) => now_ms.saturating_sub(ago.into()),
 		};
 
+		let initial_status = match &status_msg {
+			| StatusMsg::Set(msg) => msg.clone(),
+			| StatusMsg::Unchanged => None,
+		};
+
 		let entry = devices
 			.entry(device_key)
 			.or_insert_with(|| DevicePresence {
@@ -74,15 +89,15 @@ impl PresenceAggregator {
 				currently_active: currently_active.unwrap_or(false),
 				last_active_ts,
 				last_update_ts: now_ms,
-				status_msg: status_msg.clone(),
+				status_msg: initial_status,
 			});
 
 		entry.state = state.clone();
 		entry.currently_active = currently_active.unwrap_or(false);
 		entry.last_active_ts = last_active_ts;
 		entry.last_update_ts = now_ms;
-		if status_msg.is_some() {
-			entry.status_msg = status_msg;
+		if let StatusMsg::Set(msg) = status_msg {
+			entry.status_msg = msg;
 		}
 	}
 
@@ -249,7 +264,7 @@ mod tests {
 				&PresenceState::Unavailable,
 				Some(false),
 				Some(uint!(50)),
-				Some("away".to_owned()),
+				StatusMsg::Set(Some("away".into())),
 				now,
 			)
 			.await;
@@ -261,7 +276,7 @@ mod tests {
 				&PresenceState::Online,
 				Some(true),
 				Some(uint!(10)),
-				Some("online".to_owned()),
+				StatusMsg::Set(Some("online".into())),
 				now + 10,
 			)
 			.await;
@@ -289,7 +304,7 @@ mod tests {
 				&PresenceState::Online,
 				Some(true),
 				Some(uint!(500)),
-				None,
+				StatusMsg::Unchanged,
 				now,
 			)
 			.await;
@@ -299,6 +314,115 @@ mod tests {
 			.await;
 
 		assert_eq!(aggregated.state, PresenceState::Unavailable);
+	}
+
+	#[tokio::test]
+	async fn explicit_set_clears_status_msg() {
+		let aggregator = PresenceAggregator::new();
+		let user = user_id!("@alice:example.com");
+		let device = DeviceKey::Device(device_id!("DEVICE_A").to_owned());
+		let now = 1_000_u64;
+
+		aggregator
+			.update(
+				user,
+				device.clone(),
+				&PresenceState::Online,
+				Some(true),
+				Some(uint!(0)),
+				StatusMsg::Set(Some("busy".to_owned())),
+				now,
+			)
+			.await;
+
+		let aggregated = aggregator.aggregate(user, now, 100, 300).await;
+		assert_eq!(aggregated.status_msg.as_deref(), Some("busy"));
+
+		aggregator
+			.update(
+				user,
+				device.clone(),
+				&PresenceState::Online,
+				Some(true),
+				Some(uint!(0)),
+				StatusMsg::Set(Some(String::new())),
+				now + 1,
+			)
+			.await;
+
+		let aggregated = aggregator
+			.aggregate(user, now + 1, 100, 300)
+			.await;
+
+		assert!(aggregated.status_msg.is_none());
+
+		aggregator
+			.update(
+				user,
+				device.clone(),
+				&PresenceState::Online,
+				Some(true),
+				Some(uint!(0)),
+				StatusMsg::Set(Some("back".to_owned())),
+				now + 2,
+			)
+			.await;
+
+		aggregator
+			.update(
+				user,
+				device,
+				&PresenceState::Online,
+				Some(true),
+				Some(uint!(0)),
+				StatusMsg::Set(None),
+				now + 3,
+			)
+			.await;
+
+		let aggregated = aggregator
+			.aggregate(user, now + 3, 100, 300)
+			.await;
+
+		assert!(aggregated.status_msg.is_none());
+	}
+
+	#[tokio::test]
+	async fn unchanged_preserves_status_msg() {
+		let aggregator = PresenceAggregator::new();
+		let user = user_id!("@alice:example.com");
+		let device = DeviceKey::Device(device_id!("DEVICE_A").to_owned());
+		let now = 1_000_u64;
+
+		aggregator
+			.update(
+				user,
+				device.clone(),
+				&PresenceState::Online,
+				Some(true),
+				Some(uint!(0)),
+				StatusMsg::Set(Some("away".to_owned())),
+				now,
+			)
+			.await;
+
+		aggregator
+			.update(
+				user,
+				device,
+				&PresenceState::Online,
+				Some(true),
+				Some(uint!(0)),
+				StatusMsg::Unchanged,
+				now + 1,
+			)
+			.await;
+
+		let aggregated = aggregator
+			.aggregate(user, now + 1, 100, 300)
+			.await;
+
+		assert_eq!(aggregated.status_msg.as_deref(), Some("away"));
 	}
 
 	#[tokio::test]
@@ -313,7 +437,7 @@ mod tests {
 				&PresenceState::Online,
 				Some(true),
 				Some(uint!(10)),
-				None,
+				StatusMsg::Unchanged,
 				0,
 			)
 			.await;

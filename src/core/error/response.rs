@@ -1,11 +1,12 @@
 use bytes::BytesMut;
 use http::StatusCode;
 use http_body_util::Full;
-use ruma::api::{
-	OutgoingResponse,
-	client::{
-		error::{ErrorBody, ErrorKind},
-		uiaa::UiaaResponse,
+use ruma::{
+	ServerName,
+	api::{
+		OutgoingResponse,
+		client::uiaa::UiaaResponse,
+		error::{Error as RumaError, ErrorBody, ErrorKind, StandardErrorBody},
 	},
 };
 
@@ -36,13 +37,55 @@ impl From<Error> for UiaaResponse {
 			return Self::AuthResponse(uiaainfo);
 		}
 
-		let body = ErrorBody::Standard {
-			kind: error.kind(),
-			message: error.message(),
+		let status = match &error {
+			| Error::Federation(origin, remote) if !is_relayable(ruma_error_kind(remote)) =>
+				return withheld_remote_error(origin),
+
+			// A remote's 401 reads to a client as its own session failing.
+			| Error::Federation(..) if error.status_code() == StatusCode::UNAUTHORIZED =>
+				StatusCode::BAD_REQUEST,
+
+			| _ => error.status_code(),
 		};
 
-		Self::MatrixError(ruma::api::client::error::Error::new(error.status_code(), body))
+		_ = status
+			.is_server_error()
+			.then(|| error!(?error, "request failed"));
+
+		matrix_response(status, error.kind(), error.sanitized_message())
 	}
+}
+
+/// Whether a remote server's error may be repeated to a local client.
+///
+/// A remote answers only for the resource it was asked about, so a kind
+/// describing the caller's own session or this server's state is withheld: the
+/// client has no way to tell the two apart and would act on it as ours.
+fn is_relayable(kind: &ErrorKind) -> bool {
+	use ErrorKind::*;
+
+	matches!(
+		kind,
+		Forbidden
+			| NotFound
+			| UnsupportedRoomVersion
+			| IncompatibleRoomVersion(..)
+			| InviteBlocked
+			| UnableToAuthorizeJoin
+			| UnableToGrantJoin
+	)
+}
+
+fn withheld_remote_error(origin: &ServerName) -> UiaaResponse {
+	let message = format!("Request to {origin} failed.");
+
+	matrix_response(StatusCode::BAD_GATEWAY, ErrorKind::Unknown, message)
+}
+
+fn matrix_response(status: StatusCode, kind: ErrorKind, message: String) -> UiaaResponse {
+	let body = ErrorBody::Standard(StandardErrorBody { kind, message });
+
+	UiaaResponse::MatrixError(RumaError::new(status, body))
 }
 
 pub(super) fn status_code(kind: &ErrorKind, hint: StatusCode) -> StatusCode {
@@ -57,43 +100,53 @@ pub(super) fn bad_request_code(kind: &ErrorKind) -> StatusCode {
 	use ErrorKind::*;
 
 	match kind {
+		// 504
+		| NotYetUploaded | ConnectionTimeout => StatusCode::GATEWAY_TIMEOUT,
+
+		// 502
+		| BadStatus(..) | ConnectionFailed => StatusCode::BAD_GATEWAY,
+
 		// 429
 		| LimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
 
 		// 413
 		| TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
 
-		// 405
-		| Unrecognized => StatusCode::METHOD_NOT_ALLOWED,
+		// 409
+		| CannotOverwriteMedia => StatusCode::CONFLICT,
 
 		// 404
-		| NotFound | NotImplemented | FeatureDisabled => StatusCode::NOT_FOUND,
+		| NotFound | NotImplemented | FeatureDisabled | Unrecognized => StatusCode::NOT_FOUND,
 
 		// 403
 		| GuestAccessForbidden
 		| ThreepidAuthFailed
 		| UserDeactivated
+		| UserSuspended
 		| ThreepidDenied
+		| InviteBlocked
+		| CannotLeaveServerNoticeRoom
 		| WrongRoomKeysVersion { .. }
-		| Forbidden { .. } => StatusCode::FORBIDDEN,
+		| Forbidden => StatusCode::FORBIDDEN,
 
 		// 401
-		| UnknownToken { .. } | MissingToken | Unauthorized => StatusCode::UNAUTHORIZED,
+		| UnknownToken { .. } | MissingToken | Unauthorized | UserLocked =>
+			StatusCode::UNAUTHORIZED,
 
 		// 400
 		| _ => StatusCode::BAD_REQUEST,
 	}
 }
 
-pub(super) fn ruma_error_message(error: &ruma::api::client::error::Error) -> String {
-	if let ErrorBody::Standard { message, .. } = &error.body {
+pub(super) fn ruma_error_message(error: &RumaError) -> String {
+	if let ErrorBody::Standard(StandardErrorBody { message, .. }) = &error.body {
 		return message.clone();
 	}
 
 	format!("{error}")
 }
 
-pub(super) fn ruma_error_kind(e: &ruma::api::client::error::Error) -> &ErrorKind {
+pub(super) fn ruma_error_kind(e: &RumaError) -> &ErrorKind {
 	e.error_kind().unwrap_or(&ErrorKind::Unknown)
 }
 

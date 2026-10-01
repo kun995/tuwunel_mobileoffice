@@ -1,3 +1,8 @@
+//! Stream adapters for synchronous, concurrent, and fallible transformations.
+//!
+//! The module extends futures streams with ordered and completion-ordered
+//! concurrency, ready closures, aggregation, and result handling.
+
 mod band;
 mod broadband;
 mod cloned;

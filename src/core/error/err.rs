@@ -32,6 +32,11 @@
 //!    callsite and then returns the error with the same string. Caller has the
 //!    option of replacing `error!` with `debug_error!`.
 
+/// Constructs an error result through `err!`.
+///
+/// The supplied tokens select or format an [`Error`](crate::Error), then wrap
+/// it in [`std::result::Result::Err`]. Every input form accepted by `err!` is
+/// supported.
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! Err {
@@ -40,13 +45,25 @@ macro_rules! Err {
 	};
 }
 
+/// Constructs a core error from structured or formatted input.
+///
+/// Variant forms preserve typed Matrix, HTTP, and configuration context.
+/// Forms containing a tracing level also emit the formatted fields before
+/// returning the error.
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! err {
+	(HttpJson($statuscode:ident, $($args:tt)+)) => {
+		$crate::error::Error::HttpJson(
+			$crate::http::StatusCode::$statuscode,
+			::axum::Json(::serde_json::json!($($args)+))
+		)
+	};
+
 	(Request(Forbidden($level:ident!($($args:tt)+)))) => {{
 		let mut buf = String::new();
 		$crate::error::Error::Request(
-			$crate::ruma::api::client::error::ErrorKind::forbidden(),
+			$crate::ruma::api::error::ErrorKind::forbidden(),
 			$crate::err_log!(buf, $level, $($args)+),
 			$crate::http::StatusCode::BAD_REQUEST
 		)
@@ -54,7 +71,7 @@ macro_rules! err {
 
 	(Request(Forbidden($($args:tt)+))) => {
 		$crate::error::Error::Request(
-			$crate::ruma::api::client::error::ErrorKind::forbidden(),
+			$crate::ruma::api::error::ErrorKind::forbidden(),
 			$crate::format_maybe!($($args)+),
 			$crate::http::StatusCode::BAD_REQUEST
 		)
@@ -63,7 +80,7 @@ macro_rules! err {
 	(Request($variant:ident($level:ident!($($args:tt)+)))) => {{
 		let mut buf = String::new();
 		$crate::error::Error::Request(
-			$crate::ruma::api::client::error::ErrorKind::$variant,
+			$crate::ruma::api::error::ErrorKind::$variant,
 			$crate::err_log!(buf, $level, $($args)+),
 			$crate::http::StatusCode::BAD_REQUEST
 		)
@@ -71,9 +88,17 @@ macro_rules! err {
 
 	(Request($variant:ident($($args:tt)+))) => {
 		$crate::error::Error::Request(
-			$crate::ruma::api::client::error::ErrorKind::$variant,
+			$crate::ruma::api::error::ErrorKind::$variant,
 			$crate::format_maybe!($($args)+),
 			$crate::http::StatusCode::BAD_REQUEST
+		)
+	};
+
+	(RequestStatus($status:ident, $variant:ident($($args:tt)+))) => {
+		$crate::error::Error::RequestStatus(
+			$crate::ruma::api::error::ErrorKind::$variant,
+			$crate::format_maybe!($($args)+),
+			$crate::http::StatusCode::$status
 		)
 	};
 
@@ -105,11 +130,11 @@ macro_rules! err {
 	};
 }
 
-/// A trinity of integration between tracing, logging, and Error. This is a
-/// customization of tracing::event! with the primary purpose of sharing the
-/// error string, fieldset parsing and formatting. An added benefit is that we
-/// can share the same callsite metadata for the source of our Error and the
-/// associated logging and tracing event dispatches.
+/// Renders an error message and sends its fields to tracing and the log bridge.
+///
+/// `visit` passes one `ValueSet` to both dispatch paths, then records its
+/// fields into the caller's output buffer. The surrounding `err!` expansion
+/// uses that buffer to construct the error.
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! err_log {
@@ -133,11 +158,21 @@ macro_rules! err_log {
 			fields: $($fields)+,
 		};
 
-		($crate::error::visit)(&mut $out, LEVEL, &__CALLSITE, &mut valueset!(__CALLSITE.metadata().fields(), $($fields)+));
+		($crate::error::visit)(
+			&mut $out,
+			LEVEL,
+			&__CALLSITE,
+			&mut valueset!(__CALLSITE.metadata().fields(), $($fields)+)
+		);
+
 		($out).into()
 	}}
 }
 
+/// Resolves an error macro level to a tracing level.
+///
+/// Debug-sensitive warning and error levels fall back to `DEBUG` outside debug
+/// logging mode. Fixed warning and error inputs retain their respective levels.
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! err_lev {
@@ -180,14 +215,20 @@ struct Visitor<'a>(&'a mut String);
 impl Visit for Visitor<'_> {
 	#[inline]
 	fn record_debug(&mut self, field: &Field, val: &dyn fmt::Debug) {
-		if field.name() == "message" {
-			write!(self.0, "{val:?}").expect("stream error");
-		} else {
-			write!(self.0, " {}={val:?}", field.name()).expect("stream error");
+		match field.name() {
+			| "message" => write!(self.0, "{val:?}").expect("stream error"),
+			// already named in Error::Config Display; suppress the duplicate field here.
+			| "config" => {},
+			| name => write!(self.0, " {name}={val:?}").expect("stream error"),
 		}
 	}
 }
 
+/// Dispatches structured error fields and records their formatted message.
+///
+/// Enabled tracing subscribers receive an event at the supplied call site, and
+/// the tracing-log bridge receives the same values. The visitor then appends
+/// those values to `out` for construction of the returned error.
 pub fn visit(
 	out: &mut String,
 	level: Level,

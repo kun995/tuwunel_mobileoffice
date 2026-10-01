@@ -1,7 +1,11 @@
+#![cfg_attr(not(tokio_unstable), expect(unused))]
+
 use std::{
+	cell::OnceCell,
 	iter::once,
+	path::PathBuf,
 	sync::{
-		Arc, OnceLock,
+		Arc,
 		atomic::{AtomicUsize, Ordering},
 	},
 	thread,
@@ -9,123 +13,154 @@ use std::{
 };
 
 use tokio::runtime::Builder;
-pub use tokio::runtime::{Handle, Runtime};
+#[cfg(tokio_unstable)]
+use tokio::runtime::HistogramConfiguration;
+pub use tokio::runtime::{Handle, Runtime as Tokio};
 #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 use tuwunel_core::result::LogDebugErr;
 use tuwunel_core::{
-	Result, debug, is_true,
-	utils::sys::compute::{nth_core_available, set_affinity},
+	Result, debug, error, implement, is_true,
+	metrics::{Metrics, dump},
+	utils::sys::{
+		self,
+		compute::{nth_core_available, set_affinity},
+		max_threads,
+	},
 };
 
-use crate::{Args, Server};
+pub struct Runtime {
+	runtime: OnceCell<Tokio>,
+	metrics: Arc<Metrics>,
+	state: Arc<State>,
+}
 
-const WORKER_NAME: &str = "tuwunel:worker";
-const WORKER_MIN: usize = 2;
-const WORKER_KEEPALIVE: u64 = 36;
-const MAX_BLOCKING_THREADS: usize = 1024;
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(10000);
-#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
-const DISABLE_MUZZY_THRESHOLD: usize = 4;
+#[derive(Default)]
+struct State {
+	metrics_dump: Option<PathBuf>,
+	usage_dump: Option<PathBuf>,
+	worker_affinity: Option<bool>,
+	gc_on_park: Option<bool>,
+	gc_muzzy: Option<bool>,
+	cores_occupied: AtomicUsize,
+	thread_spawns: AtomicUsize,
+}
 
-static WORKER_AFFINITY: OnceLock<bool> = OnceLock::new();
-static GC_ON_PARK: OnceLock<Option<bool>> = OnceLock::new();
-static GC_MUZZY: OnceLock<Option<bool>> = OnceLock::new();
+const WORKER_THREAD_NAME: &str = "tuwunel:worker";
+const WORKER_THREAD_MIN: usize = 2;
+const BLOCKING_THREAD_KEEPALIVE: u64 = 36;
+const BLOCKING_THREAD_NAME: &str = "tuwunel:spawned";
+const BLOCKING_THREAD_MAX: usize = 1024;
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const DISABLE_MUZZY_THRESHOLD: usize = 8;
 
-pub fn new(args: Option<&Args>) -> Result<Runtime> {
-	let args_default = args.is_none().then(Args::default);
+#[implement(Runtime)]
+pub fn new(args: Option<&crate::Args>) -> Result<Self> {
+	let args_default = args.is_none().then(crate::Args::default);
+
 	let args = args.unwrap_or_else(|| args_default.as_ref().expect("default arguments"));
 
-	WORKER_AFFINITY
-		.set(args.worker_affinity)
-		.expect("set WORKER_AFFINITY from program argument");
+	let max_blocking_threads = max_threads()
+		.expect("obtained RLIMIT_NPROC or default")
+		.0
+		.saturating_div(3)
+		.clamp(WORKER_THREAD_MIN, BLOCKING_THREAD_MAX);
 
-	GC_ON_PARK
-		.set(args.gc_on_park)
-		.expect("set GC_ON_PARK from program argument");
-
-	GC_MUZZY
-		.set(args.gc_muzzy)
-		.expect("set GC_MUZZY from program argument");
+	let state = Arc::new(State {
+		metrics_dump: args.runtime_metrics_dir.clone(),
+		usage_dump: args.runtime_usage_dir.clone(),
+		worker_affinity: Some(args.worker_affinity),
+		gc_on_park: args.gc_on_park,
+		gc_muzzy: args.gc_muzzy,
+		..Default::default()
+	});
 
 	let mut builder = Builder::new_multi_thread();
 	builder
 		.enable_io()
 		.enable_time()
-		.thread_name(WORKER_NAME)
-		.worker_threads(args.worker_threads.max(WORKER_MIN))
-		.max_blocking_threads(MAX_BLOCKING_THREADS)
-		.thread_keep_alive(Duration::from_secs(WORKER_KEEPALIVE))
+		.worker_threads(args.worker_threads.max(WORKER_THREAD_MIN))
+		.max_blocking_threads(max_blocking_threads)
+		.thread_keep_alive(Duration::from_secs(BLOCKING_THREAD_KEEPALIVE))
 		.global_queue_interval(args.global_event_interval)
 		.event_interval(args.kernel_event_interval)
-		.max_io_events_per_tick(args.kernel_events_per_tick)
-		.on_thread_start(thread_start)
-		.on_thread_stop(thread_stop)
-		.on_thread_unpark(thread_unpark)
-		.on_thread_park(thread_park);
+		.max_io_events_per_tick(args.kernel_events_per_tick);
+
+	state.enable_hooks(&mut builder);
 
 	#[cfg(tokio_unstable)]
-	builder
-		.on_task_spawn(task_spawn)
-		.on_before_task_poll(task_enter)
-		.on_after_task_poll(task_leave)
-		.on_task_terminate(task_terminate);
+	enable_poll_histogram(&mut builder, args);
 
 	#[cfg(tokio_unstable)]
-	enable_histogram(&mut builder, args);
+	enable_sched_histogram(&mut builder, args);
 
-	builder.build().map_err(Into::into)
+	let runtime = builder.build()?;
+
+	Ok(Self {
+		metrics: Metrics::new(runtime.handle().into()),
+		runtime: runtime.into(),
+		state,
+	})
+}
+
+impl Drop for Runtime {
+	#[tracing::instrument(name = "stop", level = "info", skip_all)]
+	fn drop(&mut self) {
+		self.wait_shutdown();
+
+		#[cfg(tokio_unstable)]
+		self.dump_runtime_metrics();
+		self.dump_resource_usage();
+	}
 }
 
 #[cfg(tokio_unstable)]
-fn enable_histogram(builder: &mut Builder, args: &Args) {
-	use tokio::runtime::HistogramConfiguration;
-
-	let buckets = args.worker_histogram_buckets;
-	let interval = Duration::from_micros(args.worker_histogram_interval);
-	let linear = HistogramConfiguration::linear(interval, buckets);
-	builder
-		.enable_metrics_poll_time_histogram()
-		.metrics_poll_time_histogram_configuration(linear);
-}
-
-#[cfg(tokio_unstable)]
-#[tracing::instrument(name = "stop", level = "info", skip_all)]
-pub fn shutdown(server: &Arc<Server>, runtime: Runtime) -> Result {
+#[implement(Runtime)]
+fn dump_runtime_metrics(&self) {
 	use tracing::Level;
+	use tuwunel_core::event;
 
 	// The final metrics output is promoted to INFO when tokio_unstable is active in
 	// a release/bench mode and DEBUG is likely optimized out
-	const LEVEL: Level = if cfg!(debug_assertions) {
-		Level::DEBUG
-	} else {
-		Level::INFO
+	const IS_DEBUG: bool = cfg!(not(any(tokio_unstable, feature = "release_max_log_level")));
+
+	const LEVEL: Level = if IS_DEBUG { Level::DEBUG } else { Level::INFO };
+
+	let Some(runtime_metrics) = self.metrics.runtime_interval() else {
+		return;
 	};
 
-	wait_shutdown(server, runtime);
-	let runtime_metrics = server
-		.server
-		.metrics
-		.runtime_interval()
-		.unwrap_or_default();
+	event!(LEVEL, ?runtime_metrics, "Final runtime metrics.");
 
-	tuwunel_core::event!(LEVEL, ?runtime_metrics, "Final runtime metrics");
-	Ok(())
+	if let Some(dir) = self.state.metrics_dump.as_deref() {
+		dump::write_runtime_metrics(dir, &runtime_metrics);
+	}
 }
 
-#[cfg(not(tokio_unstable))]
-#[tracing::instrument(name = "stop", level = "info", skip_all)]
-pub fn shutdown(server: &Arc<Server>, runtime: Runtime) -> Result {
-	wait_shutdown(server, runtime);
-	Ok(())
+#[implement(Runtime)]
+fn dump_resource_usage(&self) {
+	let Some(dir) = self.state.usage_dump.as_deref() else {
+		return;
+	};
+
+	match sys::usage() {
+		| Ok(usage) => dump::write_resource_usage(dir, &usage),
+		| Err(error) => error!(
+			%error,
+			"Failed to read getrusage at exit."
+		),
+	}
 }
 
-fn wait_shutdown(_server: &Arc<Server>, runtime: Runtime) {
+#[implement(Runtime)]
+fn wait_shutdown(&mut self) {
 	debug!(
-		timeout = ?SHUTDOWN_TIMEOUT,
+		timeout = ?RUNTIME_SHUTDOWN_TIMEOUT,
 		"Waiting for runtime..."
 	);
 
-	runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+	if let Some(runtime) = self.runtime.take() {
+		runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+	}
 
 	// Join any jemalloc threads so they don't appear in use at exit.
 	#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
@@ -134,33 +169,139 @@ fn wait_shutdown(_server: &Arc<Server>, runtime: Runtime) {
 		.ok();
 }
 
+#[implement(Runtime)]
+#[inline]
+pub fn block_on<F: Future>(&self, future: F) -> F::Output { self.runtime().block_on(future) }
+
+#[implement(Runtime)]
+#[inline]
+pub fn metrics(&self) -> Arc<Metrics> { self.metrics.clone() }
+
+#[implement(Runtime)]
+#[inline]
+pub fn handle(&self) -> &Handle { self.runtime().handle() }
+
+#[implement(Runtime)]
+#[inline]
+pub fn runtime(&self) -> &Tokio {
+	self.runtime
+		.get()
+		.expect("Runtime must be initialized")
+}
+
+#[cfg(tokio_unstable)]
+fn enable_poll_histogram(builder: &mut Builder, args: &crate::Args) {
+	let linear =
+		linear_histogram(args.worker_poll_histogram_interval, args.worker_poll_histogram_buckets);
+
+	builder
+		.enable_metrics_poll_time_histogram()
+		.metrics_poll_time_histogram_configuration(linear);
+}
+
+#[cfg(tokio_unstable)]
+fn enable_sched_histogram(builder: &mut Builder, args: &crate::Args) {
+	let linear = linear_histogram(
+		args.worker_sched_histogram_interval,
+		args.worker_sched_histogram_buckets,
+	);
+
+	builder
+		.enable_metrics_schedule_latency_histogram()
+		.metrics_schedule_latency_histogram_configuration(linear);
+}
+
+#[cfg(tokio_unstable)]
+fn linear_histogram(micros: u64, buckets: usize) -> HistogramConfiguration {
+	HistogramConfiguration::linear(Duration::from_micros(micros), buckets)
+}
+
+#[implement(State)]
+fn enable_hooks(self: &Arc<Self>, builder: &mut Builder) {
+	{
+		let state = self.clone();
+		builder.thread_name_fn(move || state.thread_name())
+	};
+	{
+		let state = self.clone();
+		builder.on_thread_start(move || state.thread_start())
+	};
+	{
+		let state = self.clone();
+		builder.on_thread_stop(move || state.thread_stop())
+	};
+	{
+		let state = self.clone();
+		builder.on_thread_unpark(move || state.thread_unpark())
+	};
+	{
+		let state = self.clone();
+		builder.on_thread_park(move || state.thread_park())
+	};
+	#[cfg(tokio_unstable)]
+	{
+		let state = self.clone();
+		builder.on_task_spawn(move |meta| state.task_spawn(meta))
+	};
+	#[cfg(tokio_unstable)]
+	{
+		let state = self.clone();
+		builder.on_before_task_poll(move |meta| state.task_enter(meta))
+	};
+	#[cfg(tokio_unstable)]
+	{
+		let state = self.clone();
+		builder.on_after_task_poll(move |meta| state.task_leave(meta))
+	};
+	#[cfg(tokio_unstable)]
+	{
+		let state = self.clone();
+		builder.on_task_terminate(move |meta| state.task_terminate(meta))
+	};
+}
+
+#[implement(State)]
+fn thread_name(&self) -> String {
+	let handle = Handle::current();
+	let num_workers = handle.metrics().num_workers();
+	let i = self.thread_spawns.load(Ordering::Acquire);
+
+	if i >= num_workers {
+		BLOCKING_THREAD_NAME.into()
+	} else {
+		WORKER_THREAD_NAME.into()
+	}
+}
+
+#[implement(State)]
 #[tracing::instrument(
 	name = "fork",
 	level = "debug",
 	skip_all,
 	fields(
-		id = ?thread::current().id(),
+		tid = ?thread::current().id(),
 		name = %thread::current().name().unwrap_or("None"),
 	),
 )]
-fn thread_start() {
-	debug_assert_eq!(
-		Some(WORKER_NAME),
-		thread::current().name(),
+fn thread_start(&self) {
+	debug_assert!(
+		thread::current().name() == Some(WORKER_THREAD_NAME)
+			|| thread::current().name() == Some(BLOCKING_THREAD_NAME),
 		"tokio worker name mismatch at thread start"
 	);
 
-	if WORKER_AFFINITY.get().is_some_and(is_true!()) {
-		set_worker_affinity();
+	if self.worker_affinity.is_some_and(is_true!()) {
+		self.set_worker_affinity();
 	}
+
+	self.thread_spawns.fetch_add(1, Ordering::AcqRel);
 }
 
-fn set_worker_affinity() {
-	static CORES_OCCUPIED: AtomicUsize = AtomicUsize::new(0);
-
+#[implement(State)]
+fn set_worker_affinity(&self) {
 	let handle = Handle::current();
 	let num_workers = handle.metrics().num_workers();
-	let i = CORES_OCCUPIED.fetch_add(1, Ordering::Relaxed);
+	let i = self.cores_occupied.fetch_add(1, Ordering::AcqRel);
 	if i >= num_workers {
 		return;
 	}
@@ -170,65 +311,66 @@ fn set_worker_affinity() {
 	};
 
 	set_affinity(once(id));
-	set_worker_mallctl(id);
+	self.set_worker_mallctl(id);
 }
 
-#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
-fn set_worker_mallctl(_id: usize) {
-	use tuwunel_core::alloc::je::this_thread::set_muzzy_decay;
-
-	let muzzy_option = GC_MUZZY
-		.get()
-		.expect("GC_MUZZY initialized by runtime::new()");
-
+#[implement(State)]
+fn set_worker_mallctl(&self, _id: usize) {
 	let muzzy_auto_disable =
 		tuwunel_core::utils::available_parallelism() >= DISABLE_MUZZY_THRESHOLD;
 
-	if matches!(muzzy_option, Some(false) | None if muzzy_auto_disable) {
-		set_muzzy_decay(-1).log_debug_err().ok();
+	if matches!(self.gc_muzzy, Some(false) | None if muzzy_auto_disable) {
+		#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
+		tuwunel_core::alloc::je::this_thread::set_muzzy_decay(-1)
+			.log_debug_err()
+			.ok();
 	}
 }
 
-#[cfg(any(not(feature = "jemalloc"), target_env = "msvc"))]
-fn set_worker_mallctl(_: usize) {}
-
+#[implement(State)]
 #[tracing::instrument(
 	name = "join",
 	level = "debug",
 	skip_all,
 	fields(
-		id = ?thread::current().id(),
+		tid = ?thread::current().id(),
 		name = %thread::current().name().unwrap_or("None"),
 	),
 )]
-fn thread_stop() {}
+#[expect(clippy::unused_self)]
+fn thread_stop(&self) {
+	if cfg!(any(tokio_unstable, not(feature = "release_max_log_level")))
+		&& let Ok(resource_usage) = sys::thread_usage()
+	{
+		tuwunel_core::debug!(?resource_usage, "Thread resource usage.");
+	}
+}
 
+#[implement(State)]
 #[tracing::instrument(
 	name = "work",
 	level = "trace",
 	skip_all,
 	fields(
-		id = ?thread::current().id(),
+		tid = ?thread::current().id(),
 		name = %thread::current().name().unwrap_or("None"),
 	),
 )]
-fn thread_unpark() {}
+#[expect(clippy::unused_self)]
+fn thread_unpark(&self) {}
 
+#[implement(State)]
 #[tracing::instrument(
 	name = "park",
 	level = "trace",
 	skip_all,
 	fields(
-		id = ?thread::current().id(),
+		tid = ?thread::current().id(),
 		name = %thread::current().name().unwrap_or("None"),
 	),
 )]
-fn thread_park() {
-	match GC_ON_PARK
-		.get()
-		.as_ref()
-		.expect("GC_ON_PARK initialized by runtime::new()")
-	{
+fn thread_park(&self) {
+	match self.gc_on_park {
 		| Some(true) | None if cfg!(feature = "jemalloc_conf") => gc_on_park(),
 		| _ => (),
 	}
@@ -242,45 +384,57 @@ fn gc_on_park() {
 }
 
 #[cfg(tokio_unstable)]
+#[implement(State)]
 #[tracing::instrument(
 	name = "spawn",
 	level = "trace",
 	skip_all,
 	fields(
 		id = %meta.id(),
+		tid = ?thread::current().id(),
 	),
 )]
-fn task_spawn(meta: &tokio::runtime::TaskMeta<'_>) {}
+#[expect(clippy::unused_self)]
+fn task_spawn(&self, meta: &tokio::runtime::TaskMeta<'_>) {}
 
 #[cfg(tokio_unstable)]
+#[implement(State)]
 #[tracing::instrument(
 	name = "finish",
 	level = "trace",
 	skip_all,
 	fields(
-		id = %meta.id()
+		id = %meta.id(),
+		tid = ?thread::current().id()
 	),
 )]
-fn task_terminate(meta: &tokio::runtime::TaskMeta<'_>) {}
+#[expect(clippy::unused_self)]
+fn task_terminate(&self, meta: &tokio::runtime::TaskMeta<'_>) {}
 
 #[cfg(tokio_unstable)]
+#[implement(State)]
 #[tracing::instrument(
 	name = "enter",
 	level = "trace",
 	skip_all,
 	fields(
-		id = %meta.id()
+		id = %meta.id(),
+		tid = ?thread::current().id()
 	),
 )]
-fn task_enter(meta: &tokio::runtime::TaskMeta<'_>) {}
+#[expect(clippy::unused_self)]
+fn task_enter(&self, meta: &tokio::runtime::TaskMeta<'_>) {}
 
 #[cfg(tokio_unstable)]
+#[implement(State)]
 #[tracing::instrument(
 	name = "leave",
 	level = "trace",
 	skip_all,
 	fields(
-		id = %meta.id()
+		id = %meta.id(),
+		tid = ?thread::current().id()
 	),
 )]
-fn task_leave(meta: &tokio::runtime::TaskMeta<'_>) {}
+#[expect(clippy::unused_self)]
+fn task_leave(&self, meta: &tokio::runtime::TaskMeta<'_>) {}

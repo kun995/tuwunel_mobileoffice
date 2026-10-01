@@ -1,0 +1,701 @@
+use std::{collections::BTreeMap, iter::once};
+
+use minicbor_serde::{from_slice, to_vec};
+use ruma::{
+	OwnedRoomId, RoomId, UInt,
+	api::client::sync::sync_events::v5::{
+		ListId, Ranges, Request,
+		request::{self, List, ListConfig, ListFilters},
+	},
+	directory::RoomTypeFilter,
+	events::StateEventType,
+	profile::ProfileFieldName,
+	room_id,
+};
+use serde::{Deserialize, Serialize};
+
+use super::{Connection, Lists, Room, Subscriptions};
+
+const LIST_ID: &str = "main";
+
+#[derive(Deserialize, Serialize)]
+struct RoomV1 {
+	roomsince: u64,
+	config_hash: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ConnectionV1 {
+	globalsince: u64,
+	next_batch: u64,
+	lists: Lists,
+	extensions: request::Extensions,
+	subscriptions: Subscriptions,
+	rooms: BTreeMap<OwnedRoomId, RoomV1>,
+}
+
+#[test]
+fn update_cache_replaces_existing_list_ranges() {
+	let mut conn = Connection::default();
+
+	assert!(conn.update_cache(&request_with_list(list_with_ranges(&[(0, 19)]))));
+	assert!(conn.update_cache(&request_with_list(list_with_ranges(&[(20, 39)]))));
+
+	assert_cached_ranges(&conn, &[(20, 39)]);
+}
+
+#[test]
+fn update_cache_allows_empty_ranges_to_replace_existing_ranges() {
+	let mut conn = Connection::default();
+
+	assert!(conn.update_cache(&request_with_list(list_with_ranges(&[(0, 19)]))));
+	assert!(conn.update_cache(&request_with_list(list_with_ranges(&[]))));
+
+	assert_cached_ranges(&conn, &[]);
+}
+
+#[test]
+fn update_cache_keeps_ranges_when_list_is_omitted() {
+	let mut conn = Connection::default();
+
+	assert!(conn.update_cache(&request_with_list(list_with_ranges(&[(0, 19)]))));
+	assert!(!conn.update_cache(&Request::new()));
+
+	assert_cached_ranges(&conn, &[(0, 19)]);
+}
+
+#[test]
+fn update_cache_preserves_sticky_list_metadata() {
+	let mut conn = Connection::default();
+	let required_state = vec![(StateEventType::RoomMember, "$LAZY".into())];
+
+	assert!(conn.update_cache(&request_with_list(list_with_required_state(
+		&[(0, 19)],
+		required_state.clone(),
+	))));
+
+	assert!(conn.update_cache(&request_with_list(list_with_ranges(&[(20, 39)]))));
+
+	let cached = conn
+		.lists
+		.get(&list_id())
+		.expect("list must remain cached");
+
+	assert_eq!(cached.room_details.required_state, required_state);
+	assert_cached_ranges(&conn, &[(20, 39)]);
+}
+
+#[test]
+fn update_cache_clears_dropped_list_filters() {
+	let mut conn = Connection::default();
+	let dropped = ListFilters {
+		not_room_types: vec![RoomTypeFilter::Space],
+		..Default::default()
+	};
+
+	assert!(conn.update_cache(&request_with_list(list_with_filters(dropped))));
+	assert!(conn.update_cache(&request_with_list(list_with_filters(ListFilters::default()))));
+
+	let filters = cached_filters(&conn);
+
+	assert!(
+		filters.not_room_types.is_empty(),
+		"a filter the client dropped must clear, not persist stickily"
+	);
+}
+
+#[test]
+fn update_cache_keeps_filters_when_omitted() {
+	let mut conn = Connection::default();
+	let kept = ListFilters {
+		not_room_types: vec![RoomTypeFilter::Space],
+		..Default::default()
+	};
+
+	assert!(conn.update_cache(&request_with_list(list_with_filters(kept))));
+	assert!(conn.update_cache(&request_with_list(list_with_ranges(&[(0, 19)]))));
+
+	let filters = cached_filters(&conn);
+
+	assert_eq!(filters.not_room_types, vec![RoomTypeFilter::Space]);
+}
+
+#[test]
+fn epilogue_advances_only_complete_ranges() {
+	let complete = room_id!("!a:example.com");
+	let incomplete = room_id!("!b:example.com");
+	let complete_room = Room {
+		roomsince: 3,
+		config_hash: 11,
+		required_state: [2, 4].into_iter().collect(),
+	};
+
+	let incomplete_room = Room {
+		roomsince: 3,
+		config_hash: 12,
+		required_state: [3, 5].into_iter().collect(),
+	};
+
+	let mut conn = Connection {
+		next_batch: 5,
+		rooms: [(complete.to_owned(), complete_room), (incomplete.to_owned(), incomplete_room)]
+			.into(),
+		..Default::default()
+	};
+
+	conn.update_rooms_epilogue(once((complete, Some((23, once(4).collect())))));
+
+	assert_eq!(conn.rooms[complete].roomsince, 5);
+	assert_eq!(conn.rooms[complete].config_hash, 23);
+	assert_eq!(conn.rooms[complete].required_state.as_slice(), &[4]);
+	assert_eq!(conn.rooms[incomplete].roomsince, 3);
+	assert_eq!(conn.rooms[incomplete].config_hash, 12);
+	assert_eq!(conn.rooms[incomplete].required_state.as_slice(), &[3, 5]);
+}
+
+#[test]
+fn epilogue_tracks_a_first_complete_range() {
+	let complete = room_id!("!new:example.com");
+	let mut conn = Connection { next_batch: 7, ..Default::default() };
+
+	conn.update_rooms_epilogue(once((complete, None)));
+
+	assert_eq!(conn.rooms[complete].roomsince, 7);
+	assert_eq!(conn.rooms[complete].config_hash, 0);
+	assert!(conn.rooms[complete].required_state.is_empty());
+}
+
+#[test]
+fn prologue_rewinds_a_complete_range_for_replay() {
+	let replay = room_id!("!replay:example.com");
+	let retained = room_id!("!retained:example.com");
+	let replay_room = Room {
+		roomsince: 9,
+		config_hash: 17,
+		required_state: [2, 4].into_iter().collect(),
+	};
+
+	let retained_room = Room {
+		roomsince: 4,
+		config_hash: 18,
+		required_state: [3, 5].into_iter().collect(),
+	};
+
+	let mut conn = Connection {
+		rooms: [(replay.to_owned(), replay_room), (retained.to_owned(), retained_room)].into(),
+		..Default::default()
+	};
+
+	conn.update_rooms_prologue(Some(5));
+
+	assert_eq!(conn.rooms[replay].roomsince, 5);
+	assert_eq!(conn.rooms[replay].config_hash, 0);
+	assert!(conn.rooms[replay].required_state.is_empty());
+	assert_eq!(conn.rooms[retained].roomsince, 4);
+	assert_eq!(conn.rooms[retained].config_hash, 18);
+	assert_eq!(conn.rooms[retained].required_state.as_slice(), &[3, 5]);
+}
+
+#[test]
+fn update_cache_identical_effective_list_is_clean() {
+	let mut conn = Connection::default();
+	let list = List {
+		ranges: ranges_from_u64(&[(0, 19)]),
+		room_details: ListConfig {
+			required_state: vec![(StateEventType::RoomMember, "$LAZY".into())],
+			timeline_limit: uint(1),
+		},
+		filters: Some(ListFilters {
+			not_room_types: vec![RoomTypeFilter::Space],
+			..Default::default()
+		}),
+	};
+
+	assert!(conn.update_cache(&request_with_list(list.clone())));
+	assert!(!conn.update_cache(&request_with_list(list)));
+}
+
+#[test]
+fn update_cache_sticky_omissions_are_clean() {
+	let mut conn = Connection::default();
+	let list = List {
+		ranges: ranges_from_u64(&[(0, 19)]),
+		room_details: ListConfig {
+			required_state: vec![(StateEventType::RoomMember, "$LAZY".into())],
+			..Default::default()
+		},
+		filters: Some(ListFilters {
+			not_room_types: vec![RoomTypeFilter::Space],
+			..Default::default()
+		}),
+	};
+
+	assert!(conn.update_cache(&request_with_list(list)));
+	assert!(!conn.update_cache(&request_with_list(list_with_ranges(&[(0, 19)]))));
+}
+
+#[test]
+fn update_cache_copies_changed_timeline_limit() {
+	let mut conn = Connection::default();
+
+	assert!(conn.update_cache(&request_with_list(list_with_timeline_limit(1))));
+	assert!(conn.update_cache(&request_with_list(list_with_timeline_limit(2))));
+
+	let cached = conn
+		.lists
+		.get(&list_id())
+		.expect("list must be cached");
+
+	assert_eq!(cached.room_details.timeline_limit, uint(2));
+
+	assert!(conn.update_cache(&request_with_list(list_with_timeline_limit(0))));
+
+	let cached = conn
+		.lists
+		.get(&list_id())
+		.expect("list must be cached");
+
+	assert_eq!(cached.room_details.timeline_limit, uint(0));
+}
+
+#[test]
+fn update_cache_detects_changed_required_state() {
+	let mut conn = Connection::default();
+	let room_name = vec![(StateEventType::RoomName, "".into())];
+	let room_member = vec![(StateEventType::RoomMember, "$LAZY".into())];
+	let initial = list_with_required_state(&[(0, 19)], room_name);
+	let changed = list_with_required_state(&[(0, 19)], room_member.clone());
+
+	assert!(conn.update_cache(&request_with_list(initial)));
+	assert!(conn.update_cache(&request_with_list(changed)));
+
+	let cached = conn
+		.lists
+		.get(&list_id())
+		.expect("list must be cached");
+
+	assert_eq!(cached.room_details.required_state, room_member);
+}
+
+#[test]
+fn update_cache_detects_new_default_list() {
+	let mut conn = Connection::default();
+
+	assert!(conn.update_cache(&request_with_list(List::default())));
+}
+
+#[test]
+fn update_cache_tracks_subscription_changes() {
+	let room_id = room_id!("!subscription:example.com");
+	let initial = ListConfig {
+		required_state: vec![(StateEventType::RoomName, "".into())],
+		..Default::default()
+	};
+
+	let expanded = ListConfig {
+		required_state: vec![
+			(StateEventType::RoomName, "".into()),
+			(StateEventType::RoomMember, "$LAZY".into()),
+		],
+		..Default::default()
+	};
+
+	let mut conn = Connection::default();
+
+	assert!(conn.update_cache(&request_with_subscription(room_id, initial.clone())));
+	assert!(!conn.update_cache(&request_with_subscription(room_id, initial)));
+	assert!(conn.update_cache(&request_with_subscription(room_id, expanded.clone())));
+	assert!(!conn.update_cache(&request_with_subscription(room_id, expanded)));
+	assert!(conn.update_cache(&Request::new()));
+	assert!(!conn.update_cache(&Request::new()));
+}
+
+#[test]
+fn epilogue_leaves_configuration_for_extension_only_range() {
+	let room_id = room_id!("!extension:example.com");
+	let room = Room {
+		roomsince: 3,
+		config_hash: 19,
+		required_state: [2, 4].into_iter().collect(),
+	};
+
+	let mut conn = Connection {
+		next_batch: 7,
+		rooms: [(room_id.to_owned(), room)].into(),
+		..Default::default()
+	};
+
+	conn.update_rooms_epilogue(once((room_id, None)));
+
+	assert_eq!(conn.rooms[room_id].roomsince, 7);
+	assert_eq!(conn.rooms[room_id].config_hash, 19);
+	assert_eq!(conn.rooms[room_id].required_state.as_slice(), &[2, 4]);
+}
+
+#[test]
+fn own_profile_is_owed_to_a_new_connection() {
+	let mut conn = Connection::default();
+
+	conn.update_cache(&request_with_profiles(true));
+
+	assert!(conn.own_profile_owed());
+}
+
+#[test]
+fn own_profile_is_not_owed_without_the_extension() {
+	let mut conn = Connection { next_batch: 7, ..Default::default() };
+
+	conn.update_profiles_epilogue();
+
+	assert!(!conn.own_profile_owed());
+	assert_eq!(conn.own_profile_since, 0);
+}
+
+#[test]
+fn epilogue_records_an_owed_own_profile() {
+	let mut conn = Connection {
+		globalsince: 3,
+		next_batch: 7,
+		..Default::default()
+	};
+
+	conn.update_cache(&request_with_profiles(true));
+	conn.update_profiles_epilogue();
+
+	assert_eq!(conn.own_profile_since, 7);
+}
+
+#[test]
+fn acknowledged_own_profile_is_not_owed() {
+	let mut conn = Connection {
+		globalsince: 7,
+		next_batch: 9,
+		own_profile_since: 7,
+		..Default::default()
+	};
+
+	conn.update_cache(&request_with_profiles(true));
+	conn.update_profiles_epilogue();
+
+	assert!(!conn.own_profile_owed());
+	assert_eq!(conn.own_profile_since, 7);
+}
+
+#[test]
+fn own_profile_is_owed_again_on_replay() {
+	let mut conn = Connection {
+		globalsince: 5,
+		own_profile_since: 7,
+		..Default::default()
+	};
+
+	conn.update_cache(&request_with_profiles(true));
+
+	assert!(conn.own_profile_owed());
+}
+
+#[test]
+fn switching_profiles_off_owes_the_own_profile_again() {
+	let mut conn = Connection {
+		globalsince: 7,
+		own_profile_since: 7,
+		..Default::default()
+	};
+
+	conn.update_cache(&request_with_profiles(false));
+
+	assert!(!conn.own_profile_owed());
+	assert_eq!(conn.own_profile_since, 0);
+
+	conn.update_cache(&request_with_profiles(true));
+
+	assert!(conn.own_profile_owed());
+}
+
+#[test]
+fn omitted_profiles_config_keeps_the_acknowledged_own_profile() {
+	let mut conn = Connection {
+		globalsince: 7,
+		own_profile_since: 7,
+		..Default::default()
+	};
+
+	conn.update_cache(&request_with_profiles(true));
+	conn.update_cache(&Request::new());
+
+	assert!(!conn.own_profile_owed());
+	assert_eq!(conn.own_profile_since, 7);
+}
+
+#[test]
+fn widening_the_fields_owes_the_own_profile_again() {
+	let mut conn = Connection {
+		globalsince: 7,
+		own_profile_since: 7,
+		..Default::default()
+	};
+
+	conn.update_cache(&request_with_fields(&[ProfileFieldName::AvatarUrl]));
+
+	assert!(!conn.own_profile_owed());
+
+	conn.update_cache(&request_with_fields(&[
+		ProfileFieldName::AvatarUrl,
+		ProfileFieldName::DisplayName,
+	]));
+
+	assert!(conn.own_profile_owed());
+	assert!(conn.profiles_fields_owed());
+}
+
+#[test]
+fn narrowing_the_fields_owes_nothing() {
+	let mut conn = Connection {
+		globalsince: 7,
+		own_profile_since: 7,
+		..Default::default()
+	};
+
+	conn.update_cache(&request_with_fields(&[
+		ProfileFieldName::AvatarUrl,
+		ProfileFieldName::DisplayName,
+	]));
+
+	conn.update_cache(&request_with_fields(&[ProfileFieldName::AvatarUrl]));
+
+	assert!(!conn.own_profile_owed());
+	assert!(!conn.profiles_fields_owed());
+}
+
+#[test]
+fn an_unfiltered_connection_cannot_widen() {
+	let mut conn = Connection {
+		globalsince: 7,
+		own_profile_since: 7,
+		..Default::default()
+	};
+
+	conn.update_cache(&request_with_profiles(true));
+	conn.update_cache(&request_with_fields(&[ProfileFieldName::AvatarUrl]));
+
+	assert!(!conn.own_profile_owed());
+	assert!(!conn.profiles_fields_owed());
+}
+
+#[test]
+fn widened_fields_clear_once_acknowledged() {
+	let mut conn = Connection {
+		globalsince: 7,
+		next_batch: 9,
+		own_profile_since: 7,
+		..Default::default()
+	};
+
+	let widened = [ProfileFieldName::AvatarUrl, ProfileFieldName::DisplayName];
+
+	conn.update_cache(&request_with_fields(&[ProfileFieldName::AvatarUrl]));
+	conn.update_cache(&request_with_fields(&widened));
+	conn.update_profiles_epilogue();
+
+	assert_eq!(conn.own_profile_since, 9);
+	assert!(conn.profiles_fields_owed());
+
+	conn.globalsince = 9;
+	conn.update_cache(&request_with_fields(&widened));
+
+	assert!(!conn.profiles_fields_owed());
+	assert!(!conn.profiles_fields_widened);
+}
+
+#[test]
+fn connection_cbor_is_compatible_across_versions() {
+	#[derive(Deserialize, Serialize)]
+	struct RoomV0 {
+		roomsince: u64,
+	}
+
+	#[derive(Deserialize, Serialize)]
+	struct ConnectionV0 {
+		globalsince: u64,
+		next_batch: u64,
+		lists: Lists,
+		extensions: request::Extensions,
+		subscriptions: Subscriptions,
+		rooms: BTreeMap<OwnedRoomId, RoomV0>,
+	}
+
+	let room_id = room_id!("!legacy:example.com");
+	let legacy = ConnectionV0 {
+		globalsince: 5,
+		next_batch: 8,
+		lists: Default::default(),
+		extensions: Default::default(),
+		subscriptions: Default::default(),
+		rooms: [(room_id.to_owned(), RoomV0 { roomsince: 7 })].into(),
+	};
+
+	let bytes = to_vec(&legacy).expect("old connection must encode");
+	let decoded: Connection = from_slice(&bytes).expect("old connection must decode");
+
+	assert_eq!(decoded.globalsince, 5);
+	assert_eq!(decoded.next_batch, 8);
+	assert_eq!(decoded.rooms[room_id].roomsince, 7);
+	assert_eq!(decoded.rooms[room_id].config_hash, 0);
+	assert!(decoded.rooms[room_id].required_state.is_empty());
+	assert_eq!(decoded.own_profile_since, 0);
+	assert!(!decoded.profiles_fields_widened);
+
+	let current = Connection { own_profile_since: 9, ..decoded };
+	let bytes = to_vec(&current).expect("current connection must encode");
+	let downgraded: ConnectionV0 = from_slice(&bytes).expect("old binary must decode");
+
+	assert_eq!(downgraded.next_batch, 8);
+	assert_eq!(downgraded.rooms[room_id].roomsince, 7);
+}
+
+#[test]
+fn previous_connection_cbor_defaults_required_state() {
+	let room_id = room_id!("!legacy:example.com");
+	let room = RoomV1 { roomsince: 7, config_hash: 19 };
+	let legacy = ConnectionV1 {
+		globalsince: 5,
+		next_batch: 8,
+		lists: Default::default(),
+		extensions: Default::default(),
+		subscriptions: Default::default(),
+		rooms: [(room_id.to_owned(), room)].into(),
+	};
+
+	let bytes = to_vec(&legacy).expect("previous connection must encode");
+	let decoded: Connection = from_slice(&bytes).expect("previous connection must decode");
+
+	assert_eq!(decoded.globalsince, 5);
+	assert_eq!(decoded.next_batch, 8);
+	assert_eq!(decoded.rooms[room_id].roomsince, 7);
+	assert_eq!(decoded.rooms[room_id].config_hash, 19);
+	assert!(decoded.rooms[room_id].required_state.is_empty());
+}
+
+#[test]
+fn connection_cbor_preserves_required_state_and_allows_downgrade() {
+	let room_id = room_id!("!stored:example.com");
+	let room = Room {
+		roomsince: 7,
+		config_hash: 19,
+		required_state: (1..=32).collect(),
+	};
+
+	let conn = Connection {
+		globalsince: 5,
+		next_batch: 8,
+		rooms: [(room_id.to_owned(), room)].into(),
+		..Default::default()
+	};
+
+	let bytes = to_vec(&conn).expect("connection must encode");
+	let decoded: Connection = from_slice(&bytes).expect("connection must decode");
+	let downgraded: ConnectionV1 = from_slice(&bytes).expect("previous reader must decode");
+
+	assert_eq!(decoded.globalsince, 5);
+	assert_eq!(decoded.next_batch, 8);
+	assert_eq!(decoded.rooms[room_id].roomsince, 7);
+	assert_eq!(decoded.rooms[room_id].config_hash, 19);
+	assert_eq!(decoded.rooms[room_id].required_state, conn.rooms[room_id].required_state);
+	assert_eq!(downgraded.globalsince, 5);
+	assert_eq!(downgraded.next_batch, 8);
+	assert_eq!(downgraded.rooms[room_id].roomsince, 7);
+	assert_eq!(downgraded.rooms[room_id].config_hash, 19);
+}
+
+fn request_with_list(list: List) -> Request {
+	let mut request = Request::new();
+
+	request.lists.insert(list_id(), list);
+
+	request
+}
+
+fn request_with_subscription(room_id: &RoomId, config: ListConfig) -> Request {
+	let mut request = Request::new();
+
+	request.room_subscriptions = [(room_id.to_owned(), config)].into();
+
+	request
+}
+
+fn request_with_profiles(enabled: bool) -> Request {
+	let mut request = Request::new();
+
+	request.extensions.profiles.enabled = Some(enabled);
+
+	request
+}
+
+fn request_with_fields(fields: &[ProfileFieldName]) -> Request {
+	let mut request = request_with_profiles(true);
+
+	request.extensions.profiles.fields = Some(fields.to_owned());
+
+	request
+}
+
+fn list_with_ranges(ranges: &[(u64, u64)]) -> List {
+	list_with_required_state(ranges, Vec::new())
+}
+
+fn list_with_timeline_limit(timeline_limit: u64) -> List {
+	List {
+		room_details: ListConfig {
+			timeline_limit: uint(timeline_limit),
+			..Default::default()
+		},
+		..Default::default()
+	}
+}
+
+fn list_with_required_state(
+	ranges: &[(u64, u64)],
+	required_state: Vec<(StateEventType, ruma::events::StateKey)>,
+) -> List {
+	List {
+		ranges: ranges_from_u64(ranges),
+		room_details: ListConfig { required_state, ..Default::default() },
+		..Default::default()
+	}
+}
+
+fn list_with_filters(filters: ListFilters) -> List {
+	List {
+		filters: Some(filters),
+		..Default::default()
+	}
+}
+
+fn cached_filters(conn: &Connection) -> ListFilters {
+	conn.lists
+		.get(&list_id())
+		.expect("list must be cached")
+		.filters
+		.clone()
+		.expect("filters must be cached")
+}
+
+fn assert_cached_ranges(conn: &Connection, expected: &[(u64, u64)]) {
+	let cached = conn
+		.lists
+		.get(&list_id())
+		.expect("list must be cached");
+
+	assert_eq!(cached.ranges, ranges_from_u64(expected));
+}
+
+fn ranges_from_u64(ranges: &[(u64, u64)]) -> Ranges {
+	ranges
+		.iter()
+		.map(|&(start, end)| (uint(start), uint(end)))
+		.collect()
+}
+
+fn uint(value: u64) -> UInt { UInt::new(value).expect("range value must fit UInt") }
+
+fn list_id() -> ListId { LIST_ID.into() }

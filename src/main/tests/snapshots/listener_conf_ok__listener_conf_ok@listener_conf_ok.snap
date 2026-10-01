@@ -1,0 +1,8 @@
+---
+source: src/main/tests/listener_conf_ok.rs
+description: Listener Configuration Ok
+expression: result
+---
+Ok(
+    (),
+)

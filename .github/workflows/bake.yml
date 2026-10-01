@@ -42,9 +42,13 @@ on:
         type: string
         default: '[]'
         description: Matrix inclusions
+      rust_nightly:
+        type: string
+        default: ${{vars.RUST_NIGHTLY || 'nightly'}}
+        description: Override nightly toolchain with more specific nightly.
       checkout:
         type: string
-        default: 'HEAD'
+        default: ${{github.sha}}
         description: Specific commit to checkout
       max-parallel:
         type: number
@@ -69,6 +73,9 @@ on:
       release_url:
         type: string
         description: Upload url for created release.
+      rustdoc_base_path:
+        type: string
+        description: Path where rustdoc will be deployed for finding static assets
       artifact:
         type: string
         default: '{}'
@@ -76,6 +83,18 @@ on:
           Map of targets to artifact files to upload. Key is bake target (image prefix),
           value is a JSON object containing keys 'src' and 'dst'. dst is the artifact name,
           src is optional path inside image, defaulting to dst.
+
+    secrets:
+      cachix_auth_token:
+        required: false
+        description: >
+          Write token for the Cachix binary cache. When absent the nix targets
+          still substitute from the caches, they just do not upload.
+      attic_token:
+        required: false
+        description: >
+          Write token for the self-hosted binary cache. Independent of the
+          Cachix token; either, both, or neither may be present.
 
 jobs:
   bake:
@@ -112,11 +131,12 @@ jobs:
         machine: ${{fromJSON(inputs.machines)}}
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
       with:
-        persist-credentials: false
-        fetch-depth: 0
+        ref: ${{inputs.checkout || github.sha}}
+        fetch-depth: 1
         fetch-tags: true
+        persist-credentials: false
 
     # Call docker
     - name: Bake ${{matrix.bake_target}}
@@ -135,7 +155,11 @@ jobs:
         CI_VERBOSE_ENV: ${{inputs.verbose_env}}
         CI_SILENT_BAKE: ${{inputs.silent_bake}}
         CI_PRINT_BAKE: ${{inputs.print_bake}}
+        rust_nightly: ${{inputs.rust_nightly}}
         git_checkout: ${{inputs.checkout}}
+        rustdoc_base_path: ${{inputs.rustdoc_base_path}}
+        CACHIX_AUTH_TOKEN: ${{secrets.cachix_auth_token}}
+        ATTIC_TOKEN: ${{secrets.attic_token}}
 
       run: |
         docker/bake.sh "${{matrix.bake_target}}"
@@ -156,6 +180,7 @@ jobs:
 
       run: |
         cid=$(docker create "$iid" /)
+        trap 'docker rm -f "$cid" >/dev/null' EXIT
         rm -rf _artifact
         mkdir -p "_artifact"
         docker cp "$cid:$src" "_artifact/$dst"
@@ -195,6 +220,23 @@ jobs:
         mv "$src" "_artifact/$dst"
         chmod "$mod" "_artifact/$dst"
 
+    # Tar an extracted directory for downstream Compress/Upload steps
+    - name: Tar Directory Artifact
+      if: >
+        !failure() && !cancelled()
+        && fromJSON(inputs.artifact)[matrix.bake_target].dst
+        && fromJSON(inputs.artifact)[matrix.bake_target].dir == true
+
+      env:
+        dst: ${{ fromJSON(inputs.artifact)[matrix.bake_target].dst }}
+
+      run: |
+        if test -d "_artifact/$dst"; then
+          tar -cf "_artifact/$dst.tar" -C "_artifact" "$dst"
+          rm -rf "_artifact/$dst"
+          mv "_artifact/$dst.tar" "_artifact/$dst"
+        fi
+
     # Optionally compress extracted artifact
     - name: Compress Artifact
       if: >
@@ -223,7 +265,7 @@ jobs:
         !failure() && !cancelled()
         && fromJSON(inputs.artifact)[matrix.bake_target].dst
 
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         path: _artifact/*
         name: ${{matrix.cargo_profile}}-${{matrix.feat_set}}-${{matrix.sys_target}}-${{fromJSON(inputs.artifact)[matrix.bake_target].dst}}
@@ -235,10 +277,10 @@ jobs:
         && fromJSON(inputs.artifact)[matrix.bake_target].dst
         && fromJSON(inputs.artifact)[matrix.bake_target].pages == true
 
-      uses: actions/upload-pages-artifact@v3
+      uses: actions/upload-pages-artifact@v5
       with:
         path: _artifact/${{fromJSON(inputs.artifact)[matrix.bake_target].dst}}
-        name: github-pages
+        name: github-pages-${{fromJSON(inputs.artifact)[matrix.bake_target].dst}}
 
     # Optionally upload artifact as release-artifact
     - name: Upload Release Artifact

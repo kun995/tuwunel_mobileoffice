@@ -23,10 +23,6 @@ let
       # sentry telemetry isn't useful for complement, disabled by default anyways
       "sentry_telemetry"
       "perf_measurements"
-      # this is non-functional on nix for some reason
-      "hardened_malloc"
-      # dont include experimental features
-      "experimental"
       # compression isn't needed for complement
       "brotli_compression"
       "gzip_compression"
@@ -50,6 +46,10 @@ in
 dockerTools.buildImage {
   name = "complement-tuwunel";
   tag = "main";
+
+  # The appservice_dir configured in config.toml must exist for the server
+  # to start; Complement only copies registration files into it.
+  extraCommands = "mkdir -p complement/appservice";
 
   copyToRoot = buildEnv {
     name = "root";

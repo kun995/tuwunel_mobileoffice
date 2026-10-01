@@ -1,0 +1,126 @@
+//! S3-compatible storage-provider construction.
+//!
+//! Configuration and environment values feed the object-store S3 builder.
+//! Providers without a URL or bucket are treated as disabled, while enabled
+//! providers expose signing through the common interface.
+
+use std::{sync::Arc, time::Duration};
+
+/// Object-store transfer types used by the S3 provider boundary.
+///
+/// These re-exports match the common storage module's transfer vocabulary and
+/// avoid exposing backend-specific paths to callers.
+/// Their behavior remains defined by the object-store backend.
+pub use object_store::{GetResult, GetResultPayload, PutPayload, PutResult};
+use object_store::{aws::AmazonS3Builder, client::ClientOptions, signer::Signer};
+use tuwunel_core::{
+	Result,
+	config::{StorageProvider, StorageProviderS3},
+	debug, debug_info, error, trace,
+	version::user_agent,
+};
+
+use super::Provider;
+
+/// Builds an enabled S3-compatible provider.
+///
+/// A configuration with neither a URL nor a bucket returns `None`. Other
+/// settings override the environment-derived builder before the client and its
+/// URL signer are retained by the provider.
+#[tracing::instrument(name = "new", level = "info", skip_all, err)]
+pub(in super::super) fn new(
+	args: &crate::Args<'_>,
+	name: &str,
+	config: &StorageProviderS3,
+) -> Result<Option<(String, Arc<Provider>)>> {
+	// Fail successfully if this provider is disabled by the configuration..
+	if config.url.is_none() && config.bucket.is_none() {
+		debug!(?name, "s3_provider.bucket not set. This configuration will be skipped");
+		return Ok(None);
+	}
+
+	let mut builder = AmazonS3Builder::from_env().with_client_options(
+		ClientOptions::new()
+			.with_user_agent(user_agent().try_into()?)
+			.with_pool_max_idle_per_host(args.server.config.request_idle_per_host.into())
+			.with_pool_idle_timeout(Duration::from_secs(args.server.config.request_idle_timeout)),
+	);
+
+	if let Some(url) = config.url.clone() {
+		builder = builder.with_url(url);
+	}
+
+	if let Some(region) = config.region.clone() {
+		builder = builder.with_region(region);
+	}
+
+	if let Some(bucket) = config.bucket.clone() {
+		builder = builder.with_bucket_name(bucket);
+	}
+
+	if let Some(key) = config.key.clone() {
+		builder = builder.with_access_key_id(key);
+	}
+
+	if let Some(secret) = config.secret.clone() {
+		builder = builder.with_secret_access_key(secret);
+	}
+
+	if let Some(kms) = config.kms.clone() {
+		builder = builder.with_ssec_encryption(kms);
+	}
+
+	if let Some(token) = config.token.clone() {
+		builder = builder.with_token(token);
+	}
+
+	if let Some(endpoint) = config.endpoint.clone() {
+		builder = builder.with_endpoint(endpoint);
+	}
+
+	if let Some(use_bucket_key) = config.use_bucket_key {
+		builder = builder.with_bucket_key(use_bucket_key);
+	}
+
+	if let Some(use_https) = config.use_https {
+		builder = builder.with_allow_http(!use_https);
+	}
+
+	if let Some(use_signatures) = config.use_signatures {
+		builder = builder.with_skip_signature(!use_signatures);
+	}
+
+	if let Some(use_payload_signatures) = config.use_payload_signatures {
+		builder = builder.with_unsigned_payload(!use_payload_signatures);
+	}
+
+	if let Some(use_vhost_request) = config.use_vhost_request {
+		builder = builder.with_virtual_hosted_style_request(use_vhost_request);
+	}
+
+	trace!(?name, ?config, "Initializing S3...");
+
+	let client = builder
+		.build()
+		.inspect_err(|e| error!("Failed to configure S3 storage client: {e}"))?;
+
+	debug_info!(
+		credentials = ?client.credentials(),
+		"Started S3 storage client."
+	);
+
+	#[allow(clippy::allow_attributes, clippy::redundant_clone)] // buggy, nursery
+	let signer: Arc<dyn Signer> = Arc::new(client.clone());
+
+	let provider = Provider {
+		name: name.to_owned(),
+		base_path: config.base_path.clone().map(Into::into),
+		config: StorageProvider::s3(Box::new(config.clone())),
+		startup_check: config.startup_check,
+		services: args.services.clone(),
+		provider: Box::new(client),
+		signer: Some(signer),
+	};
+
+	Ok(Some((name.to_owned(), Arc::new(provider))))
+}

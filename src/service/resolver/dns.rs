@@ -1,21 +1,41 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+	io,
+	io::ErrorKind::PermissionDenied,
+	net::{IpAddr, SocketAddr},
+	sync::Arc,
+	time::Duration,
+};
 
 use futures::FutureExt;
 use hickory_resolver::{
 	TokioResolver,
-	config::{LookupIpStrategy, ResolverConfig, ResolverOpts},
+	config::{LookupIpStrategy, NameServerConfig, ProtocolConfig, ResolverConfig, ResolverOpts},
 	lookup_ip::LookupIp,
+	net::runtime::TokioRuntimeProvider,
+	system_conf::read_system_conf,
 };
+use ipaddress::IPAddress;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-use tuwunel_core::{Result, Server, err, trace};
+use tuwunel_core::{Result, Server, config::proxy::ProxyHosts, err, trace};
 
 use super::cache::{Cache, CachedOverride};
+use crate::client::ipaddress_from_std;
 
 pub struct Resolver {
 	pub(crate) resolver: Arc<TokioResolver>,
 	pub(crate) passthru: Arc<Passthru>,
 	pub(crate) hooked: Arc<Hooked>,
 	server: Arc<Server>,
+}
+
+/// Filters destination DNS answers through the configured CIDR denylist.
+///
+/// Proxy endpoint names are exempt because their addresses describe the
+/// transport hop rather than the request destination.
+pub(crate) struct Validating<R> {
+	inner: Arc<R>,
+	denylist: Arc<[IPAddress]>,
+	proxy_hosts: ProxyHosts,
 }
 
 pub(crate) struct Hooked {
@@ -40,7 +60,7 @@ impl Resolver {
 		let (conf, mut opts) = Self::configure(server)?;
 		opts.negative_min_ttl = Some(Duration::from_secs(config.dns_min_ttl_nxdomain));
 		opts.positive_min_ttl = Some(Duration::from_secs(config.dns_min_ttl));
-		opts.cache_size = config.dns_cache_entries.try_into()?;
+		opts.cache_size = config.dns_cache_entries.into();
 		let resolver = Self::create(server, conf.clone(), opts.clone())?;
 
 		// Create the passthru resolver with modified options.
@@ -71,49 +91,97 @@ impl Resolver {
 		conf: ResolverConfig,
 		opts: ResolverOpts,
 	) -> Result<Arc<TokioResolver>> {
-		let rt_prov = hickory_resolver::proto::runtime::TokioRuntimeProvider::new();
-		let conn_prov = hickory_resolver::name_server::TokioConnectionProvider::new(rt_prov);
-		let mut builder = TokioResolver::builder_with_config(conf, conn_prov);
+		let mut builder =
+			TokioResolver::builder_with_config(conf, TokioRuntimeProvider::default());
 		*builder.options_mut() = Self::configure_opts(server, opts);
 
-		Ok(Arc::new(builder.build()))
+		builder
+			.build()
+			.map(Arc::new)
+			.map_err(|e| err!(error!("Failed to build DNS resolver: {e}")))
 	}
 
 	fn configure(server: &Arc<Server>) -> Result<(ResolverConfig, ResolverOpts)> {
 		let config = &server.config;
-		let (sys_conf, opts) =
-			hickory_resolver::system_conf::read_system_conf().map_err(|e| {
+
+		// hickory's android system_conf panics in ndk-context without a JVM.
+		#[cfg(target_os = "android")]
+		if config.dns_servers.is_empty() {
+			return Err(err!(Config(
+				"dns_servers",
+				"The system resolver requires a JVM on Android; set dns_servers to your \
+				 upstream nameservers instead."
+			)));
+		}
+
+		let (base_conf, opts) = if config.dns_servers.is_empty() {
+			read_system_conf().map_err(|e| {
 				err!(error!("Failed to configure DNS resolver from `/etc/resolv.conf': {e}"))
-			})?;
+			})?
+		} else {
+			(Self::configure_custom(&config.dns_servers)?, ResolverOpts::default())
+		};
 
-		let mut conf = ResolverConfig::new();
-		if let Some(domain) = sys_conf.domain() {
-			conf.set_domain(domain.clone());
-		}
+		let name_servers = base_conf
+			.name_servers()
+			.iter()
+			.cloned()
+			.map(|mut ns| {
+				ns.trust_negative_responses = !config.query_all_nameservers;
+				if config.query_over_tcp_only {
+					ns.connections
+						.retain(|conn| matches!(conn.protocol, ProtocolConfig::Tcp));
+				}
 
-		for sys_conf in sys_conf.search() {
-			conf.add_search(sys_conf.clone());
-		}
+				ns
+			})
+			.collect();
 
-		for sys_conf in sys_conf.name_servers() {
-			let mut ns = sys_conf.clone();
-			ns.trust_negative_responses = !config.query_all_nameservers;
-			if config.query_over_tcp_only {
-				ns.protocol = hickory_resolver::proto::xfer::Protocol::Tcp;
-			}
-
-			conf.add_name_server(ns);
-		}
+		let conf = ResolverConfig::from_parts(
+			base_conf.domain().cloned(),
+			base_conf.search().to_vec(),
+			name_servers,
+		);
 
 		Ok((conf, opts))
+	}
+
+	fn configure_custom(servers: &[String]) -> Result<ResolverConfig> {
+		let name_servers = servers
+			.iter()
+			.map(String::as_str)
+			.map(Self::parse_nameserver)
+			.collect::<Result<_>>()?;
+
+		Ok(ResolverConfig::from_parts(None, vec![], name_servers))
+	}
+
+	pub(super) fn parse_nameserver(server: &str) -> Result<NameServerConfig> {
+		let (ip, port) = server
+			.parse::<SocketAddr>()
+			.map(|addr| (addr.ip(), addr.port()))
+			.or_else(|_| server.parse::<IpAddr>().map(|ip| (ip, 53)))
+			.map_err(|e| {
+				err!(Config(
+					"dns_servers",
+					"{server:?} is not an IP address or socket address: {e}"
+				))
+			})?;
+
+		let mut conf = NameServerConfig::udp_and_tcp(ip);
+		for connection in &mut conf.connections {
+			connection.port = port;
+		}
+
+		Ok(conf)
 	}
 
 	#[expect(clippy::as_conversions)]
 	fn configure_opts(server: &Arc<Server>, mut opts: ResolverOpts) -> ResolverOpts {
 		let config = &server.config;
 
-		opts.negative_max_ttl = Some(Duration::from_secs(60 * 60 * 24 * 30));
-		opts.positive_max_ttl = Some(Duration::from_secs(60 * 60 * 24 * 7));
+		opts.negative_max_ttl = Some(Duration::from_hours(720));
+		opts.positive_max_ttl = Some(Duration::from_hours(168));
 		opts.timeout = Duration::from_secs(config.dns_timeout);
 		opts.attempts = config.dns_attempts as usize;
 		opts.try_tcp_on_error = config.dns_tcp_fallback;
@@ -135,6 +203,54 @@ impl Resolver {
 	/// Clear the in-memory hickory-dns caches
 	#[inline]
 	pub fn clear_cache(&self) { self.resolver.clear_cache(); }
+}
+
+impl<R: Resolve + 'static> Validating<R> {
+	pub(crate) fn new(
+		inner: Arc<R>,
+		denylist: Arc<[IPAddress]>,
+		proxy_hosts: ProxyHosts,
+	) -> Arc<Self> {
+		Arc::new(Self { inner, denylist, proxy_hosts })
+	}
+}
+
+impl<R: Resolve + 'static> Resolve for Validating<R> {
+	fn resolve(&self, name: Name) -> Resolving {
+		if self
+			.proxy_hosts
+			.iter()
+			.any(|host| host.eq_ignore_ascii_case(name.as_str()))
+		{
+			return self.inner.resolve(name);
+		}
+
+		validate_addrs(self.inner.clone(), self.denylist.clone(), name).boxed()
+	}
+}
+
+async fn validate_addrs<R: Resolve + 'static>(
+	inner: Arc<R>,
+	denylist: Arc<[IPAddress]>,
+	name: Name,
+) -> ResolvingResult {
+	let addrs = inner.resolve(name).await?;
+
+	let mut filtered = addrs
+		.filter(move |sa| {
+			let ip = ipaddress_from_std(sa.ip());
+			!denylist.iter().any(|cidr| cidr.includes(&ip))
+		})
+		.peekable();
+
+	if filtered.peek().is_none() {
+		return Err(Box::new(io::Error::new(
+			PermissionDenied,
+			"All resolved addresses are denied by ip_range_denylist",
+		)));
+	}
+
+	Ok(Box::new(filtered))
 }
 
 impl Resolve for Resolver {
@@ -220,15 +336,18 @@ async fn resolve_to_reqwest(
 	resolver: Arc<TokioResolver>,
 	name: Name,
 ) -> ResolvingResult {
-	use std::{io, io::ErrorKind::Interrupted};
+	use std::io::ErrorKind::Interrupted;
 
 	let handle_shutdown = || Box::new(io::Error::new(Interrupted, "Server shutting down"));
-	let handle_results = |results: LookupIp| {
-		Box::new(
-			results
-				.into_iter()
-				.map(|ip| SocketAddr::new(ip, 0)),
-		)
+
+	let handle_results = |results: LookupIp| -> Addrs {
+		let addrs = results
+			.iter()
+			.map(|ip| SocketAddr::new(ip, 0))
+			.collect::<Vec<_>>()
+			.into_iter();
+
+		Box::new(addrs)
 	};
 
 	tokio::select! {

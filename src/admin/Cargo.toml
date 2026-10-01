@@ -59,13 +59,13 @@ lz4_compression = [
 	"tuwunel-service/lz4_compression",
 ]
 release_max_log_level = [
+	"log/max_level_trace",
+	"log/release_max_level_info",
+	"tracing/max_level_trace",
+	"tracing/release_max_level_info",
 	"tuwunel-core/release_max_log_level",
 	"tuwunel-database/release_max_log_level",
 	"tuwunel-service/release_max_log_level",
-	"tracing/max_level_trace",
-	"tracing/release_max_level_info",
-	"log/max_level_trace",
-	"log/release_max_level_info",
 ]
 zstd_compression = [
 	"tuwunel-core/zstd_compression",
@@ -74,7 +74,9 @@ zstd_compression = [
 ]
 
 [dependencies]
+async-trait.workspace = true
 base64.workspace = true
+bytes.workspace = true
 clap.workspace = true
 tuwunel-core.workspace = true
 tuwunel-database.workspace = true
@@ -82,15 +84,19 @@ tuwunel-macros.workspace = true
 tuwunel-service.workspace = true
 const-str.workspace = true
 ctor.workspace = true
+dtor.workspace = true
 futures.workspace = true
 log.workspace = true
+regex.workspace = true
 ruma.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+smallvec.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

@@ -24,19 +24,29 @@ sudo pacman -S nginx
 Create a new configuration file at `/etc/nginx/sites-available/tuwunel` (or `/etc/nginx/conf.d/tuwunel.conf` on some distributions):
 
 ```nginx
-# Client-Server API over HTTPS (port 443)
+upstream tuwunel {
+  server 127.0.0.1:8008; # IP and port where tuwunel is listening
+}
+
 server {
-  listen 443 ssl http2;
-  listen [::]:443 ssl http2;
+  # Client-Server API over HTTPS (port 443)
+  listen 443 ssl;
+  listen [::]:443 ssl;
+  # Matrix Federation over HTTPS (port 8448)
+  # Only needed if you want to federate with other homeservers
+  # Don't forget to open port 8448 in your firewall!
+  listen 8448 ssl;
+  listen [::]:8448 ssl;
+  http2 on;
   server_name matrix.example.com;
 
   # Nginx standard body size is 1MB, which is quite small for media uploads
   # Increase this to match the max_request_size in your tuwunel.toml
   client_max_body_size 100M;
 
-  # Forward requests to Tuwunel (listening on 127.0.0.1:8008)
+  # Forward requests to Tuwunel
   location / {
-    proxy_pass http://127.0.0.1:8008;
+    proxy_pass http://tuwunel;
 
     # Preserve host and scheme - critical for proper Matrix operation
     proxy_set_header Host $host;
@@ -48,36 +58,15 @@ server {
   ssl_certificate /etc/letsencrypt/live/matrix.example.com/fullchain.pem;
   ssl_certificate_key /etc/letsencrypt/live/matrix.example.com/privkey.pem;
 }
-
-# Matrix Federation over HTTPS (port 8448)
-# Only needed if you want to federate with other homeservers
-# Don't forget to open port 8448 in your firewall!
-server {
-  listen 8448 ssl http2;
-  listen [::]:8448 ssl http2;
-  server_name matrix.example.com;
-
-  # Same body size increase for larger files
-  client_max_body_size 100M;
-
-  # Forward to the same local port as client-server API
-  location / {
-    proxy_pass http://127.0.0.1:8008;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $remote_addr;
-    proxy_set_header X-Forwarded-Proto https;
-  }
-
-  # TLS configuration (same certificates as above)
-  ssl_certificate /etc/letsencrypt/live/matrix.example.com/fullchain.pem;
-  ssl_certificate_key /etc/letsencrypt/live/matrix.example.com/privkey.pem;
-}
 ```
 
 ### Important Notes
 
 - **Replace `matrix.example.com`** with your actual server name
 - **`client_max_body_size`**: Must match or exceed `max_request_size` in your `tuwunel.toml`
+- **`ip_source`**: If Nginx is the only way clients can reach Tuwunel, set
+  `ip_source = "rightmost_x_forwarded_for"` so Tuwunel uses the trusted
+  `X-Forwarded-For` value
 - **Do NOT use `$request_uri`** in `proxy_pass` - while some guides suggest this, it's not necessary for Tuwunel and can cause issues
 - **IPv6**: The `listen [::]:443` and `listen [::]:8448` lines enable IPv6 support. Remove them if you don't need IPv6
 
@@ -103,7 +92,7 @@ However, if you experience federation retries or dropped long-poll connections, 
 
 ```nginx
 location / {
-  proxy_pass http://127.0.0.1:8008;
+  proxy_pass http://tuwunel;
   proxy_set_header Host $host;
   proxy_set_header X-Forwarded-For $remote_addr;
   proxy_set_header X-Forwarded-Proto https;

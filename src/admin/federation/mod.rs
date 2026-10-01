@@ -1,4 +1,8 @@
-mod commands;
+mod disable_room;
+mod enable_room;
+mod fetch_support_well_known;
+mod incoming_federation;
+mod remote_user_in_rooms;
 
 use clap::Subcommand;
 use ruma::{OwnedRoomId, OwnedServerName, OwnedUserId};
@@ -13,11 +17,17 @@ pub(super) enum FederationCommand {
 	IncomingFederation,
 
 	/// - Disables incoming federation handling for a room.
+	///
+	/// The room's `m.federate` property is unaffected; it is fixed at room
+	/// creation.
 	DisableRoom {
 		room_id: OwnedRoomId,
 	},
 
 	/// - Enables incoming federation handling for a room again.
+	///
+	/// The room's `m.federate` property is unaffected; it is fixed at room
+	/// creation.
 	EnableRoom {
 		room_id: OwnedRoomId,
 	},

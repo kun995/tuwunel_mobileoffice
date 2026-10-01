@@ -1,3 +1,8 @@
+//! Shared registration state for active captures.
+//!
+//! The state coordinates capture guards with the subscriber layer.
+//! Registrations are reference counted and protected for concurrent access.
+
 use std::sync::{Arc, RwLock};
 
 use super::Capture;
@@ -12,6 +17,10 @@ impl Default for State {
 }
 
 impl State {
+	/// Creates empty capture registration state.
+	///
+	/// No events are captured until a `Capture` is started against the returned
+	/// state. The state can then be shared with a subscriber layer.
 	#[must_use]
 	pub fn new() -> Self { Self { active: RwLock::new(Vec::new()) } }
 

@@ -18,7 +18,8 @@ use tuwunel_core::{
 	matrix::{Event, pdu::PduCount},
 	pair_of,
 	utils::{
-		BoolExt, IterStream, ReadyExt, TryFutureExtExt, future::OptionStream,
+		BoolExt, FutureBoolExt, IterStream, ReadyExt, TryFutureExtExt,
+		future::{OptionFutureExt, OptionStream, ReadyBoolExt},
 		stream::BroadbandExt,
 	},
 };
@@ -80,13 +81,20 @@ pub(super) async fn collect(
 		})
 		.map(Option::unwrap_or_default);
 
-	let (left, device_one_time_keys_count) = join(left, device_one_time_keys_count)
-		.boxed()
-		.await;
+	let device_unused_fallback_key_types = services
+		.users
+		.unused_fallback_key_algorithms(sender_user, sender_device)
+		.collect::<Vec<_>>()
+		.map(Some);
+
+	let (left, device_one_time_keys_count, device_unused_fallback_key_types) =
+		join3(left, device_one_time_keys_count, device_unused_fallback_key_types)
+			.boxed()
+			.await;
 
 	Ok(response::E2EE {
 		device_one_time_keys_count,
-		device_unused_fallback_key_types: None,
+		device_unused_fallback_key_types,
 		device_lists: DeviceLists {
 			changed: changed.into_iter().collect(),
 			left,
@@ -138,40 +146,50 @@ async fn collect_room(
 		return Ok(lists);
 	}
 
-	let encrypted_room = services
-		.state_accessor
-		.state_get(current_shortstatehash, &StateEventType::RoomEncryption, "")
-		.is_ok();
+	let encrypted_at = |shortstatehash| {
+		services
+			.state_accessor
+			.state_get_shortid(shortstatehash, &StateEventType::RoomEncryption, "")
+			.is_ok()
+	};
 
-	let since_encryption = services
-		.state_accessor
-		.state_get(since_shortstatehash, &StateEventType::RoomEncryption, "")
-		.is_ok();
+	let current_encrypted = encrypted_at(current_shortstatehash).await;
 
-	let sender_joined_count = services
-		.state_cache
-		.get_joined_count(room_id, sender_user);
-
-	let (encrypted_room, since_encryption, sender_joined_count) =
-		join3(encrypted_room, since_encryption, sender_joined_count).await;
-
-	if !encrypted_room {
+	if !current_encrypted
+		&& services
+			.config
+			.device_key_update_encrypted_rooms_only
+	{
 		return Ok(lists);
 	}
 
-	let encrypted_since_last_sync = !since_encryption;
-	let joined_since_last_sync = sender_joined_count.is_ok_and(|count| count > conn.globalsince);
-	let joined_members_burst =
-		(joined_since_last_sync || encrypted_since_last_sync).then_async(|| {
-			services
-				.state_cache
-				.room_members(room_id)
-				.ready_filter(|&user_id| user_id != sender_user)
-				.map(ToOwned::to_owned)
-				.map(|user_id| (MembershipState::Join, user_id))
-				.boxed()
-				.into_future()
-		});
+	let joined_since_last_sync = services
+		.state_cache
+		.get_joined_count(room_id, sender_user)
+		.map_ok_or(false, |count| count > conn.globalsince);
+
+	// A plaintext room bursts only on the sender's own join.
+	let newly_encrypted = current_encrypted
+		.then_async(|| encrypted_at(since_shortstatehash).is_false())
+		.unwrap_or_default();
+
+	// The keyed membership read leads; the state lookup trails it.
+	let members_burst = joined_since_last_sync
+		.is_false()
+		.and(newly_encrypted.is_false())
+		.is_false()
+		.await;
+
+	let joined_members_burst = members_burst.then_async(|| {
+		services
+			.state_cache
+			.room_members(room_id)
+			.ready_filter(|&user_id| user_id != sender_user)
+			.map(ToOwned::to_owned)
+			.map(|user_id| (MembershipState::Join, user_id))
+			.boxed()
+			.into_future()
+	});
 
 	services
 		.state_accessor

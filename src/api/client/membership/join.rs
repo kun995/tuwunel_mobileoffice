@@ -1,14 +1,13 @@
 use axum::extract::State;
-use axum_client_ip::InsecureClientIp;
-use futures::FutureExt;
 use ruma::{
-	RoomId,
+	CanonicalJsonObject, CanonicalJsonValue, RoomId,
 	api::client::membership::{join_room_by_id, join_room_by_id_or_alias},
 };
 use tuwunel_core::{Result, warn};
+use tuwunel_service::membership::Join;
 
 use super::banned_room_check;
-use crate::Ruma;
+use crate::{ClientIp, Ruma};
 
 /// # `POST /_matrix/client/r0/rooms/{roomId}/join`
 ///
@@ -21,7 +20,7 @@ use crate::Ruma;
 #[tracing::instrument(skip_all, fields(%client), name = "join")]
 pub(crate) async fn join_room_by_id_route(
 	State(services): State<crate::State>,
-	InsecureClientIp(client): InsecureClientIp,
+	ClientIp(client): ClientIp,
 	body: Ruma<join_room_by_id::v3::Request>,
 ) -> Result<join_room_by_id::v3::Response> {
 	let sender_user = body.sender_user();
@@ -31,11 +30,7 @@ pub(crate) async fn join_room_by_id_route(
 	banned_room_check(&services, sender_user, room_id, None, client).await?;
 
 	// Check room member limit
-	if let Ok(current_count) = services
-		.state_cache
-		.room_joined_count(room_id)
-		.await
-	{
+	if let Ok(current_count) = services.state_cache.room_joined_count(room_id).await {
 		// Try to get member limit from room state
 		if let Ok(limit_data) = services
 			.state_accessor
@@ -44,13 +39,13 @@ pub(crate) async fn join_room_by_id_route(
 		{
 			// Parse the limit from state event content
 			if let Ok(limit_event) =
-				serde_json::from_str::<serde_json::Value>(limit_data.content.get())
+				serde_json::from_str::<serde_json::Value>(limit_data.content.json().get())
 			{
 				if let Some(limit) = limit_event.get("limit").and_then(|v| v.as_u64()) {
 					if current_count >= limit {
-						use ruma::api::client::error::ErrorKind;
+						use ruma::api::error::ErrorKind;
 						return Err(tuwunel_core::Error::Request(
-							ErrorKind::LimitExceeded { retry_after: None },
+							ErrorKind::LimitExceeded(ruma::api::error::LimitExceededErrorData { retry_after: None }),
 							"Room has reached maximum member limit".into(),
 							http::StatusCode::BAD_REQUEST,
 						));
@@ -60,21 +55,20 @@ pub(crate) async fn join_room_by_id_route(
 		}
 	}
 
-	let state_lock = services.state.mutex.lock(room_id).await;
+	let extra_content = extra_member_content(body.json_body.as_ref());
 
 	let mut errors = 0_usize;
 	while let Err(e) = services
 		.membership
-		.join(
+		.join(Join {
 			sender_user,
 			room_id,
-			None,
-			body.reason.clone(),
-			&[],
-			body.appservice_info.is_some(),
-			&state_lock,
-		)
-		.boxed()
+			orig_room_id: None,
+			reason: body.reason.clone(),
+			servers: &[],
+			is_appservice: body.appservice_info.is_some(),
+			extra_content: extra_content.clone(),
+		})
 		.await
 	{
 		errors = errors.saturating_add(1);
@@ -87,9 +81,9 @@ pub(crate) async fn join_room_by_id_route(
 		}
 	}
 
-	drop(state_lock);
-
-	Ok(join_room_by_id::v3::Response { room_id: room_id.to_owned() })
+	Ok(join_room_by_id::v3::Response {
+		room_id: room_id.to_owned(),
+	})
 }
 
 /// # `POST /_matrix/client/r0/join/{roomIdOrAlias}`
@@ -104,7 +98,7 @@ pub(crate) async fn join_room_by_id_route(
 #[tracing::instrument(skip_all, fields(%client), name = "join")]
 pub(crate) async fn join_room_by_id_or_alias_route(
 	State(services): State<crate::State>,
-	InsecureClientIp(client): InsecureClientIp,
+	ClientIp(client): ClientIp,
 	body: Ruma<join_room_by_id_or_alias::v3::Request>,
 ) -> Result<join_room_by_id_or_alias::v3::Response> {
 	let sender_user = body.sender_user();
@@ -115,15 +109,17 @@ pub(crate) async fn join_room_by_id_or_alias_route(
 		.maybe_resolve_with_servers(&body.room_id_or_alias, Some(&body.via))
 		.await?;
 
-	banned_room_check(&services, sender_user, &room_id, Some(&body.room_id_or_alias), client)
-		.await?;
+	banned_room_check(
+		&services,
+		sender_user,
+		&room_id,
+		Some(&body.room_id_or_alias),
+		client,
+	)
+	.await?;
 
 	// Check room member limit
-	if let Ok(current_count) = services
-		.state_cache
-		.room_joined_count(&room_id)
-		.await
-	{
+	if let Ok(current_count) = services.state_cache.room_joined_count(&room_id).await {
 		// Try to get member limit from room state
 		if let Ok(limit_data) = services
 			.state_accessor
@@ -132,13 +128,13 @@ pub(crate) async fn join_room_by_id_or_alias_route(
 		{
 			// Parse the limit from state event content
 			if let Ok(limit_event) =
-				serde_json::from_str::<serde_json::Value>(limit_data.content.get())
+				serde_json::from_str::<serde_json::Value>(limit_data.content.json().get())
 			{
 				if let Some(limit) = limit_event.get("limit").and_then(|v| v.as_u64()) {
 					if current_count >= limit {
-						use ruma::api::client::error::ErrorKind;
+						use ruma::api::error::ErrorKind;
 						return Err(tuwunel_core::Error::Request(
-							ErrorKind::LimitExceeded { retry_after: None },
+							ErrorKind::LimitExceeded(ruma::api::error::LimitExceededErrorData { retry_after: None }),
 							"Room has reached maximum member limit".into(),
 							http::StatusCode::BAD_REQUEST,
 						));
@@ -148,21 +144,20 @@ pub(crate) async fn join_room_by_id_or_alias_route(
 		}
 	}
 
-	let state_lock = services.state.mutex.lock(&room_id).await;
+	let extra_content = extra_member_content(body.json_body.as_ref());
 
 	let mut errors = 0_usize;
 	while let Err(e) = services
 		.membership
-		.join(
+		.join(Join {
 			sender_user,
-			&room_id,
-			Some(&body.room_id_or_alias),
-			body.reason.clone(),
-			&servers,
-			appservice_info.is_some(),
-			&state_lock,
-		)
-		.boxed()
+			room_id: &room_id,
+			orig_room_id: Some(&body.room_id_or_alias),
+			reason: body.reason.clone(),
+			servers: &servers,
+			is_appservice: appservice_info.is_some(),
+			extra_content: extra_content.clone(),
+		})
 		.await
 	{
 		errors = errors.saturating_add(1);
@@ -175,7 +170,28 @@ pub(crate) async fn join_room_by_id_or_alias_route(
 		}
 	}
 
-	drop(state_lock);
+	Ok(join_room_by_id_or_alias::v3::Response {
+		room_id: room_id.clone(),
+	})
+}
 
-	Ok(join_room_by_id_or_alias::v3::Response { room_id: room_id.clone() })
+const RESERVED_JOIN_KEYS: [&str; 3] = [
+	"reason",
+	"third_party_signed",
+	"join_authorised_via_users_server",
+];
+
+// Drop recognized and server-owned keys the client must not set.
+fn extra_member_content(json_body: Option<&CanonicalJsonValue>) -> Option<CanonicalJsonObject> {
+	let CanonicalJsonValue::Object(object) = json_body? else {
+		return None;
+	};
+
+	let extra: CanonicalJsonObject = object
+		.iter()
+		.filter(|(key, _)| !RESERVED_JOIN_KEYS.contains(&key.as_str()))
+		.map(|(key, value)| (key.clone(), value.clone()))
+		.collect();
+
+	(!extra.is_empty()).then_some(extra)
 }

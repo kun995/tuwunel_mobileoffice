@@ -7,6 +7,7 @@ pub struct State {
 	services: *const Services,
 }
 
+#[clippy::has_significant_drop]
 pub struct Guard {
 	services: Arc<Services>,
 }

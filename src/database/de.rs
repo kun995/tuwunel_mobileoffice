@@ -1,14 +1,30 @@
+//! Deserialization for the database's compact record codec.
+//!
+//! Compound values are divided into records by [`crate::SEP`]. A trailing type
+//! that accepts empty input can decode a missing final field from an older,
+//! shorter tuple, while writing the extended tuple emits an additional
+//! separator before that appended field.
+
 use serde::{
 	Deserialize, de,
 	de::{DeserializeSeed, Visitor},
 };
 use tuwunel_core::{
-	Error, Result, arrayvec::ArrayVec, checked, debug::DebugInspect, err, utils::string,
+	Error, Result, arrayvec::ArrayVec, checked, debug::DebugInspect, err, unhandled,
+	utils::string,
 };
 
-use crate::util::unhandled;
-
-/// Deserialize into T from buffer.
+/// Deserializes a value from database record bytes.
+///
+/// The result may borrow from `buf` according to `T`'s deserialization
+/// implementation. Debug builds additionally verify that decoding consumed the
+/// input, apart from one trailing record separator.
+///
+/// # Panics
+///
+/// Panics if `T` requests a Serde data-model operation unsupported by this
+/// codec. In debug builds, decoding also panics when record-layout invariants
+/// are violated or unexpected trailing bytes remain.
 #[cfg_attr(
 	unabridged,
 	tracing::instrument(
@@ -18,7 +34,7 @@ use crate::util::unhandled;
 		fields(len = %buf.len()),
 	)
 )]
-pub(crate) fn from_slice<'a, T>(buf: &'a [u8]) -> Result<T>
+pub fn from_slice<'a, T>(buf: &'a [u8]) -> Result<T>
 where
 	T: Deserialize<'a>,
 {
@@ -31,7 +47,12 @@ where
 	})
 }
 
-/// Deserialization state.
+/// Cursor state for decoding the compact database record format.
+///
+/// The byte position and record counters advance independently so incomplete
+/// tuple tails can be presented to inner deserializers as empty input.
+/// `next_element_seed` compares the record count with the expected sequence
+/// length when deciding whether iteration is complete.
 pub(crate) struct Deserializer<'de> {
 	buf: &'de [u8],
 	pos: usize,
@@ -39,14 +60,20 @@ pub(crate) struct Deserializer<'de> {
 	seq: usize,
 }
 
-/// Directive to ignore a record. This type can be used to skip deserialization
-/// until the next separator is found.
-#[derive(Debug, Deserialize)]
+/// Skips one encoded record when deserialized inside a sequence.
+///
+/// At the top level, the directive consumes all remaining records so the input
+/// finishes cleanly. It produces only the unit value represented by this
+/// marker.
+#[derive(Clone, Copy, Debug, Deserialize)]
 pub struct Ignore;
 
-/// Directive to ignore all remaining records. This can be used in a sequence to
-/// ignore the rest of the sequence.
-#[derive(Debug, Deserialize)]
+/// Skips the current record and every record that follows it.
+///
+/// Place this directive inside a sequence to discard its remaining encoded
+/// elements. It consumes the trailing input and produces only the unit value
+/// represented by this marker.
+#[derive(Clone, Copy, Debug, Deserialize)]
 pub struct IgnoreAll;
 
 impl<'de> Deserializer<'de> {
@@ -119,7 +146,10 @@ impl<'de> Deserializer<'de> {
 	}
 
 	/// Consume the record separator such that the position cleanly points to
-	/// the start of the next record. (Case for some sequences)
+	/// the start of the next record. When input is exhausted but the
+	/// sequence is not, advance no bytes; the caller deserializes from an
+	/// empty slice. See `next_element_seed` for the additive-tail mechanic
+	/// this enables.
 	#[inline]
 	fn record_start(&mut self) {
 		let started = self.pos != 0 || self.rec > 0;
@@ -350,11 +380,15 @@ impl<'a, 'de: 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
 	}
 
 	#[cfg_attr(unabridged, tracing::instrument(level = "trace", skip_all))]
-	fn deserialize_u8<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value> {
-		unhandled!(
-			"deserialize u8 not implemented; try dereferencing the Handle for [u8] access \
-			 instead"
-		)
+	fn deserialize_u8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+		let byte = self
+			.buf
+			.get(self.pos)
+			.copied()
+			.ok_or_else(|| Self::Error::SerdeDe("u8 buffer underflow".into()))?;
+
+		self.inc_pos(1);
+		visitor.visit_u8(byte)
 	}
 
 	#[cfg_attr(unabridged, tracing::instrument(level = "trace", skip_all))]
@@ -481,11 +515,18 @@ impl<'a, 'de: 'a> de::SeqAccess<'de> for &'a mut Deserializer<'de> {
 		// Completely satisfied the output.
 		let complete = self.rec >= self.seq;
 
-		// Leave after reaching the end of both the input and output. Leaving before
-		// reaching the end of the input trips the finished() assertion. Leaving before
-		// reaching the end of the output causes a length expectation panic on type T
-		// i.e. tuple of size X instead of Y and trailing defaulting elements will not
-		// be possible.
+		// Early-return only when both input and output are exhausted. If
+		// input is exhausted but the tuple is not, fall through:
+		// `record_start` does not advance pos and the inner deserializer
+		// runs against an empty slice. Tail types that visit an empty slice
+		// successfully (`&str` -> "", `&[u8]` -> &[], `Option<_>` -> None)
+		// round-trip; non-tolerant tails (numerics, typed Matrix IDs) error.
+		// This enables additive evolution of record-key tuples without a
+		// migration.
+		//
+		// Returning early before the input is exhausted trips the
+		// `finished()` check; before the tuple is exhausted, serde's length
+		// check.
 		if finished && complete {
 			return Ok(None);
 		}

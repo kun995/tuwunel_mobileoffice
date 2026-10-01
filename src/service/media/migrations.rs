@@ -1,8 +1,8 @@
 use std::{
 	collections::HashSet,
 	ffi::{OsStr, OsString},
-	fs::{self},
-	path::PathBuf,
+	fs, io,
+	path::{Path, PathBuf},
 	sync::Arc,
 	time::Instant,
 };
@@ -14,8 +14,15 @@ use tuwunel_core::{
 	utils::{ReadyExt, stream::TryIgnore},
 	warn,
 };
+use tuwunel_database::{Database, Map};
 
 use crate::Services;
+
+struct MediaStorage<'a> {
+	database: &'a Arc<Database>,
+	mediaid_file: &'a Arc<Map>,
+	mediaid_user: &'a Arc<Map>,
+}
 
 /// Migrates a media directory from legacy base64 file names to sha2 file names.
 /// All errors are fatal. Upon success the database is keyed to not perform this
@@ -24,6 +31,10 @@ pub(crate) async fn migrate_sha256_media(services: &Services) -> Result {
 	let db = &services.db;
 	let config = &services.server.config;
 
+	if config.media_storage.strategy != tuwunel_core::config::StorageStrategy::Filesystem {
+		db["global"].insert(b"feat_sha256_media", []);
+		return Ok(());
+	}
 	warn!("Migrating legacy base64 file names to sha256 file names");
 	let mediaid_file = &db["mediaid_file"];
 
@@ -33,8 +44,8 @@ pub(crate) async fn migrate_sha256_media(services: &Services) -> Result {
 		.raw_keys()
 		.ignore_err()
 		.ready_for_each(|key| {
-			let old = services.media.get_media_file_b64(key);
-			let new = services.media.get_media_file_sha256(key);
+			let old = services.media.get_media_path_b64(key);
+			let new = services.media.get_media_path_sha256(key);
 			debug!(?key, ?old, ?new, num = changes.len(), "change");
 			changes.push((old, new));
 		})
@@ -45,7 +56,7 @@ pub(crate) async fn migrate_sha256_media(services: &Services) -> Result {
 		if old_path.exists() {
 			tokio::fs::rename(&old_path, &path).await?;
 			if config.media_compat_file_link {
-				tokio::fs::symlink(&path, &old_path).await?;
+				symlink_file(&path, &old_path).await?;
 			}
 		}
 	}
@@ -62,13 +73,18 @@ pub(crate) async fn migrate_sha256_media(services: &Services) -> Result {
 pub(crate) async fn checkup_sha256_media(services: &Services) -> Result {
 	use crate::media::encode_key;
 
+	// Fork S3/hybrid objects and deduplicated files do not use the upstream
+	// key-addressed local filenames. Never prune them using a filesystem scan.
+	if services.config.media_storage.strategy != tuwunel_core::config::StorageStrategy::Filesystem {
+		return Ok(());
+	}
 	debug!("Checking integrity of media directory");
 	let db = &services.db;
 	let media = &services.media;
 	let config = &services.server.config;
 	let mediaid_file = &db["mediaid_file"];
 	let mediaid_user = &db["mediaid_user"];
-	let dbs = (mediaid_file, mediaid_user);
+	let storage = MediaStorage { database: db, mediaid_file, mediaid_user };
 	let timer = Instant::now();
 
 	let dir = media.get_media_dir();
@@ -80,9 +96,13 @@ pub(crate) async fn checkup_sha256_media(services: &Services) -> Result {
 		.collect();
 
 	for key in media.db.get_all_media_keys().await {
-		let new_path = media.get_media_file_sha256(&key).into_os_string();
-		let old_path = media.get_media_file_b64(&key).into_os_string();
-		if let Err(e) = handle_media_check(&dbs, config, &files, &key, &new_path, &old_path).await
+		if media.db.get_media_hash(&key).is_some() {
+			continue;
+		}
+		let new_path = media.get_media_path_sha256(&key).into_os_string();
+		let old_path = media.get_media_path_b64(&key).into_os_string();
+		if let Err(e) =
+			handle_media_check(&storage, config, &files, &key, &new_path, &old_path).await
 		{
 			error!(
 				media_id = ?encode_key(&key), ?new_path, ?old_path,
@@ -100,7 +120,7 @@ pub(crate) async fn checkup_sha256_media(services: &Services) -> Result {
 }
 
 async fn handle_media_check(
-	dbs: &(&Arc<tuwunel_database::Map>, &Arc<tuwunel_database::Map>),
+	storage: &MediaStorage<'_>,
 	config: &Config,
 	files: &HashSet<OsString>,
 	key: &[u8],
@@ -109,11 +129,9 @@ async fn handle_media_check(
 ) -> Result {
 	use crate::media::encode_key;
 
-	let (mediaid_file, mediaid_user) = dbs;
-
 	let new_exists = files.contains(new_path);
 	let old_exists = files.contains(old_path);
-	let old_is_symlink = || async {
+	let old_is_symlink = async || {
 		tokio::fs::symlink_metadata(old_path)
 			.await
 			.is_ok_and(|md| md.is_symlink())
@@ -125,8 +143,11 @@ async fn handle_media_check(
 			"Media is missing at all paths. Removing from database..."
 		);
 
-		mediaid_file.remove(key);
-		mediaid_user.remove(key);
+		let mut txn = storage.database.txn();
+
+		txn.del_raw(storage.mediaid_file, key);
+		txn.del_raw(storage.mediaid_user, key);
+		txn.execute();
 	}
 
 	if config.media_compat_file_link && !old_exists && new_exists {
@@ -135,7 +156,7 @@ async fn handle_media_check(
 			"Media found but missing legacy link. Fixing..."
 		);
 
-		tokio::fs::symlink(&new_path, &old_path).await?;
+		symlink_file(&new_path, &old_path).await?;
 	}
 
 	if config.media_compat_file_link && !new_exists && old_exists {
@@ -150,7 +171,7 @@ async fn handle_media_check(
 		);
 
 		tokio::fs::rename(&old_path, &new_path).await?;
-		tokio::fs::symlink(&new_path, &old_path).await?;
+		symlink_file(&new_path, &old_path).await?;
 	}
 
 	if !config.media_compat_file_link && old_exists && old_is_symlink().await {
@@ -168,4 +189,32 @@ async fn handle_media_check(
 	}
 
 	Ok(())
+}
+
+/// Links `link` to the file at `target`.
+///
+/// `tokio::fs::symlink` is unix-only. Windows distinguishes a link to a file
+/// from a link to a directory and offers `symlink_file` for the former, which
+/// is what every caller here wants. Elsewhere there is no portable equivalent
+/// to call.
+async fn symlink_file(target: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
+	#[cfg(unix)]
+	{
+		tokio::fs::symlink(target, link).await
+	}
+
+	#[cfg(windows)]
+	{
+		tokio::fs::symlink_file(target, link).await
+	}
+
+	#[cfg(not(any(unix, windows)))]
+	{
+		_ = (target, link);
+
+		Err(io::Error::new(
+			io::ErrorKind::Unsupported,
+			"Symlinks are not supported on this platform.",
+		))
+	}
 }

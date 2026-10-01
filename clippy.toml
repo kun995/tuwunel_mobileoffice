@@ -1,11 +1,14 @@
 stack-size-threshold = 393216
 future-size-threshold = 24576
 array-size-threshold = 4096
+enum-variant-size-threshold = 128           # TODO reduce me ALARA
 large-error-threshold = 256                 # TODO reduce me ALARA
-too-many-lines-threshold = 780              # TODO reduce me to <= 100
+too-many-lines-threshold = 150              # TODO reduce me to <= 100
 excessive-nesting-threshold = 8
 type-complexity-threshold = 250             # reduce me to ~200
 cognitive-complexity-threshold = 100        # TODO reduce me ALARA
+
+allow-unwrap-in-tests = true
 
 #disallowed-macros = [
 #	{ path = "log::error", reason = "use tuwunel_core::error" },

@@ -1,0 +1,134 @@
+# syntax = docker/dockerfile:1.11-labs
+
+# matrix-rust-sdk FFI build + uniffi-bindgen-go bindings. Inherits from the
+# `rust` image (which carries the Go toolchain via kitchen_packages too).
+FROM input AS complement-crypto-deps
+ARG RUSTUP_HOME
+ARG CARGO_HOME
+ARG rust_toolchain
+# matrix-sdk-ffi-0.18.0 release; carries SqliteStoreBuilder::key for complement-crypto.
+ARG mrsdk_ref="1c44fb66214667c6d00acaf72ab592493653708b"
+ARG complement_crypto_ref="8d382355008f2a37fca7088da64cc29f250a0faa"
+ARG MRSDK_TARGET_DIR="/usr/src/matrix-rust-sdk/target"
+# Building the FFI crate and the bindgen tool are compile jobs.
+ARG sched_policy="--batch"
+ARG sched_prio=0
+
+ENV PATH="${CARGO_HOME}/bin:${PATH}"
+ENV sched_policy=${sched_policy}
+ENV sched_prio=${sched_prio}
+
+# uniffi-bindgen-go's generated bindings use `import "C"`; with CGO_ENABLED=0
+# the Go toolchain silently excludes those files, which presents as
+# `go fmt: no Go source files` from bindgen post-format and then
+# `build constraints exclude all Go files` from `go test -list`. The kitchen
+# image ships `clang` (no `gcc`), so point cgo at it directly.
+ENV CGO_ENABLED=1
+ENV CC=clang
+
+WORKDIR /usr/src
+ADD --link https://github.com/matrix-construct/complement-crypto.git#${complement_crypto_ref} complement-crypto
+ADD --link https://github.com/matrix-construct/matrix-rust-sdk.git#${mrsdk_ref} matrix-rust-sdk
+
+SHELL ["/bin/bash", "-c"]
+
+# uniffi-bindgen-go (tag pinned to match upstream install_uniffi_bindgen_go.sh).
+RUN \
+--mount=type=cache,dst=${CARGO_HOME}/registry,sharing=shared \
+--mount=type=cache,dst=${CARGO_HOME}/git,sharing=shared \
+<<EOF
+    set -eux
+    rustup run ${rust_toolchain} sched_wrap.sh \
+        cargo install uniffi-bindgen-go \
+            --git https://github.com/NordSecurity/uniffi-bindgen-go \
+            --tag v0.7.0+v0.31.0 \
+            ;
+EOF
+
+# Build matrix-sdk-ffi and generate Go bindings into
+# /usr/src/complement-crypto/internal/api/rust. The script also patches in the
+# `-lmatrix_sdk_ffi` LDFLAGS the cgo wrapper needs.
+WORKDIR /usr/src/complement-crypto
+RUN \
+--mount=type=cache,dst=${CARGO_HOME}/registry,sharing=shared \
+--mount=type=cache,dst=${CARGO_HOME}/git,sharing=shared \
+--mount=type=cache,dst=${MRSDK_TARGET_DIR},sharing=locked \
+<<EOF
+    set -eux
+    rustup run ${rust_toolchain} sched_wrap.sh ./rebuild_rust_sdk.sh /usr/src/matrix-rust-sdk
+    # MRSDK_TARGET_DIR is a cache mount and disappears at the end of this RUN.
+    # Persist the FFI shared+static libs into the image so downstream stages
+    # (complement-crypto-base's `go test`, complement-crypto-tester's runtime)
+    # can find `-lmatrix_sdk_ffi`.
+    mkdir -p /usr/local/lib/matrix-rust-sdk
+    cp -L "${MRSDK_TARGET_DIR}/debug/libmatrix_sdk_ffi.a" \
+          "${MRSDK_TARGET_DIR}/debug/libmatrix_sdk_ffi.so" \
+          /usr/local/lib/matrix-rust-sdk/
+EOF
+ENV LIBRARY_PATH="/usr/local/lib/matrix-rust-sdk"
+ENV LD_LIBRARY_PATH="/usr/local/lib/matrix-rust-sdk"
+
+
+# Compile-time validation of the Go side. Pre-listing tests fails fast if
+# anything in the bindings / test sources fails to type-check before the
+# runtime stage spends an hour starting docker containers.
+FROM complement-crypto-deps AS complement-crypto-base
+ARG complement_crypto_tags="rust"
+ARG complement_crypto_run=".*"
+ARG complement_crypto_client_matrix="rr"
+
+WORKDIR /usr/src/complement-crypto
+ENV COMPLEMENT_BASE_IMAGE="complement-testee"
+# TestMain runs at `go test -list` time and panics on any language in the
+# client matrix whose bindings weren't built (default `jj,jr,rj,rr` pulls in
+# JS; `-tags=rust` only compiles the rust binding). Pin the matrix here so
+# discovery sees only languages we built. -tester inherits this and may
+# override.
+ENV COMPLEMENT_CRYPTO_TEST_CLIENT_MATRIX="$complement_crypto_client_matrix"
+RUN \
+--mount=type=cache,dst=/go/pkg/mod/cache,sharing=locked \
+<<EOF
+    set -eux
+    sched_wrap.sh go test -tags="$complement_crypto_tags" -list="$complement_crypto_run" ./tests
+EOF
+
+
+FROM complement-crypto-base AS complement-crypto-tester
+ARG complement_crypto_verbose=0
+ARG complement_crypto_count=1
+ARG complement_crypto_parallel=1
+ARG complement_crypto_shuffle=1337
+ARG complement_crypto_timeout="1h"
+ARG complement_crypto_run=".*"
+ARG complement_crypto_skip=""
+ARG complement_crypto_tags="rust"
+ARG complement_crypto_tests="./tests"
+ARG complement_crypto_client_matrix="rr"
+ARG complement_crypto_base_image
+
+# Rename ARGs to drop the _crypto_ infix inside the tester stage. The outer
+# container envs (passed via `docker run -e ...` from the script wrapper) are
+# remapped at the docker boundary, so uwu.sh sees the same plain
+# `complement_*` names as the non-crypto flavour.
+WORKDIR /usr/src/complement-crypto
+ENV complement_count="$complement_crypto_count"
+ENV complement_parallel="$complement_crypto_parallel"
+ENV complement_shuffle="$complement_crypto_shuffle"
+ENV complement_tags="$complement_crypto_tags"
+ENV complement_timeout="$complement_crypto_timeout"
+ENV complement_tests="$complement_crypto_tests"
+ENV complement_skip="$complement_crypto_skip"
+ENV complement_run="$complement_crypto_run"
+ENV complement_base_image="$complement_crypto_base_image"
+ENV COMPLEMENT_CRYPTO_TEST_CLIENT_MATRIX="$complement_crypto_client_matrix"
+ENV COMPLEMENT_ALWAYS_PRINT_SERVER_LOGS="$complement_crypto_verbose"
+ENV COMPLEMENT_HOSTNAME_RUNNING_COMPLEMENT="host.docker.internal"
+ENV COMPLEMENT_HOST_MOUNTS="/var/run/docker.sock:/var/run/docker.sock"
+ENV COMPLEMENT_POST_TEST_SCRIPT="/usr/src/complement-crypto/post_test.sh"
+
+COPY docker/lib/post_test.sh post_test.sh
+RUN chmod a+x post_test.sh
+
+COPY docker/lib/uwu.sh uwu.sh
+RUN chmod a+x uwu.sh
+ENTRYPOINT ["/bin/bash", "/usr/src/complement-crypto/uwu.sh"]

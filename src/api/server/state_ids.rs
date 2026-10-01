@@ -5,7 +5,7 @@ use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, future::try_join
 use ruma::{OwnedEventId, api::federation::event::get_room_state_ids};
 use tuwunel_core::{Result, at, err};
 
-use super::AccessCheck;
+use super::{AccessCheck, utils::require_event_in_room};
 use crate::Ruma;
 
 /// # `GET /_matrix/federation/v1/state_ids/{roomId}`
@@ -16,14 +16,16 @@ pub(crate) async fn get_room_state_ids_route(
 	State(services): State<crate::State>,
 	body: Ruma<get_room_state_ids::v1::Request>,
 ) -> Result<get_room_state_ids::v1::Response> {
-	AccessCheck {
+	let access_check = AccessCheck {
 		services: &services,
 		origin: body.origin(),
 		room_id: &body.room_id,
 		event_id: None,
-	}
-	.check()
-	.await?;
+	};
+
+	access_check.check().await?;
+
+	require_event_in_room(&services, &body.event_id, &body.room_id).await?;
 
 	let shortstatehash = services
 		.state

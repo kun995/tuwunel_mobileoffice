@@ -1,3 +1,8 @@
+//! HTML color values for log levels.
+//!
+//! Helpers map tracing metadata to hexadecimal colors for Matrix-formatted log
+//! output. HTML and code-tag capture formatters share these values.
+
 use super::Level;
 
 /// @returns (Foreground, Background)

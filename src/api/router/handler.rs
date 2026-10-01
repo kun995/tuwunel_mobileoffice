@@ -1,67 +1,126 @@
-use std::fmt::Debug;
+use std::{any::Any, fmt::Debug};
 
 use axum::{
 	Router,
-	extract::FromRequestParts,
-	response::IntoResponse,
+	body::Body,
+	extract::{FromRequest, FromRequestParts},
+	handler::Handler,
+	response::{IntoResponse, Response},
 	routing::{MethodFilter, on},
 };
-use futures::{Future, TryFutureExt};
-use http::Method;
-use ruma::api::IncomingRequest;
-use tuwunel_core::{Result, trace};
+use http::{Method, Request};
+use ruma::api::{IncomingRequest, path_builder::PathBuilder};
+use tuwunel_core::Result;
 
-use super::{Ruma, RumaResponse, State};
+use super::{Ruma, RumaResponse, State, auth::AuthDispatch};
 
 pub(in super::super) trait RumaHandler<T> {
-	fn add_route(&'static self, router: Router<State>, path: &str) -> Router<State>;
 	fn add_routes(&'static self, router: Router<State>) -> Router<State>;
+
+	fn add_route(&'static self, router: Router<State>, path: &str) -> Router<State>;
+
+	fn call_route(
+		handler: RouteHandler,
+		state: State,
+		request: Request<Body>,
+	) -> impl Future<Output = Response> + Send + 'static;
 }
 
 pub(in super::super) trait RouterExt {
-	fn ruma_route<H, T>(self, handler: &'static H) -> Self
-	where
-		H: RumaHandler<T>;
+	fn ruma_route<H: RumaHandler<T>, T>(self, handler: &'static H) -> Self;
+}
+
+struct Route<Fut> {
+	call: RouteCall<Fut>,
+	handler: RouteHandler,
+}
+
+type RouteCall<Fut> = fn(RouteHandler, State, Request<Body>) -> Fut;
+type RouteHandler = &'static (dyn Any + Send + Sync);
+
+impl<Fut> Copy for Route<Fut> {}
+
+impl<Fut> Clone for Route<Fut> {
+	fn clone(&self) -> Self { *self }
 }
 
 impl RouterExt for Router<State> {
-	fn ruma_route<H, T>(self, handler: &'static H) -> Self
-	where
-		H: RumaHandler<T>,
-	{
+	fn ruma_route<H: RumaHandler<T>, T>(self, handler: &'static H) -> Self {
 		handler.add_routes(self)
+	}
+}
+
+impl<Fut> Handler<(), State> for Route<Fut>
+where
+	Fut: Future<Output = Response> + Send + 'static,
+{
+	type Future = Fut;
+
+	fn call(self, request: Request<Body>, state: State) -> Self::Future {
+		(self.call)(self.handler, state, request)
 	}
 }
 
 macro_rules! ruma_handler {
 	( $($tx:ident),* $(,)? ) => {
-		#[allow(clippy::allow_attributes)]
-		#[allow(non_snake_case)]
-		impl<Err, Req, Fut, Fun, $($tx,)*> RumaHandler<($($tx,)* Ruma<Req>,)> for Fun
+		#[allow(clippy::allow_attributes, non_snake_case)]
+		impl<Err, Req, Fut, Fun, const ADMIN: bool, $($tx,)*> RumaHandler<($($tx,)* Ruma<Req, ADMIN>,)> for Fun
 		where
-			Fun: Fn($($tx,)* Ruma<Req>,) -> Fut + Send + Sync + 'static,
-			Fut: Future<Output = Result<Req::OutgoingResponse, Err>> + Send,
+			Fun: Fn($($tx,)* Ruma<Req, ADMIN>,) -> Fut + Send + Sync + 'static,
+			Fut: Future<Output = Result<Req::OutgoingResponse, Err>> + Send + 'static,
 			Req: IncomingRequest + Debug + Send + Sync + 'static,
-			Err: IntoResponse + Debug + Send,
-			<Req as IncomingRequest>::OutgoingResponse: Debug + Send,
+			Req::Authentication: AuthDispatch,
+			Err: IntoResponse + Send,
+			<Req as IncomingRequest>::OutgoingResponse: Send,
 			$( $tx: FromRequestParts<State> + Send + Sync + 'static, )*
 		{
 			fn add_routes(&'static self, router: Router<State>) -> Router<State> {
-				Req::METADATA
-					.history
+				Req::PATH_BUILDER
 					.all_paths()
 					.fold(router, |router, path| self.add_route(router, path))
 			}
 
 			fn add_route(&'static self, router: Router<State>, path: &str) -> Router<State> {
-				let method = method_to_filter(&Req::METADATA.method);
-				let action = |$($tx,)* req| {
-					self($($tx,)* req)
-						.inspect_ok(|result| trace!(?result))
-						.map_ok(RumaResponse)
+				let route = Route { handler: self, call: Self::call_route };
+
+				router.route(path, on(method_to_filter(&Req::METHOD), route))
+			}
+
+			fn call_route(
+				handler: RouteHandler,
+				state: State,
+				request: Request<Body>,
+			) -> impl Future<Output = Response> + Send + 'static {
+				let handler: &'static Fun = handler
+					.downcast_ref()
+					.expect("route handler matches the type it registered with");
+
+				let response = async move {
+					#[allow(unused_mut)]
+					let (mut parts, body) = request.into_parts();
+					$(
+						let $tx = match $tx::from_request_parts(&mut parts, &state).await {
+							| Err(error) => return error.into_response(),
+							| Ok(value) => value,
+						};
+					)*
+
+					let request = Request::from_parts(parts, body);
+					let args = match Ruma::<Req, ADMIN>::from_request(request, &state).await {
+						| Err(error) => return error.into_response(),
+						| Ok(args) => args,
+					};
+
+					match handler($($tx,)* args).await {
+						| Err(error) => error.into_response(),
+						| Ok(response) => RumaResponse(response).into_response(),
+					}
 				};
 
-				router.route(path, on(method, action))
+				cfg_select! {
+					debug_assertions => Box::pin(response),
+					_ => response,
+				}
 			}
 		}
 	}
@@ -72,16 +131,16 @@ ruma_handler!(T1, T2);
 ruma_handler!(T1, T2, T3);
 ruma_handler!(T1, T2, T3, T4);
 
-const fn method_to_filter(method: &Method) -> MethodFilter {
-	match *method {
-		| Method::DELETE => MethodFilter::DELETE,
-		| Method::GET => MethodFilter::GET,
-		| Method::HEAD => MethodFilter::HEAD,
-		| Method::OPTIONS => MethodFilter::OPTIONS,
-		| Method::PATCH => MethodFilter::PATCH,
-		| Method::POST => MethodFilter::POST,
-		| Method::PUT => MethodFilter::PUT,
-		| Method::TRACE => MethodFilter::TRACE,
+fn method_to_filter(method: &Method) -> MethodFilter {
+	match method {
+		| &Method::DELETE => MethodFilter::DELETE,
+		| &Method::GET => MethodFilter::GET,
+		| &Method::HEAD => MethodFilter::HEAD,
+		| &Method::OPTIONS => MethodFilter::OPTIONS,
+		| &Method::PATCH => MethodFilter::PATCH,
+		| &Method::POST => MethodFilter::POST,
+		| &Method::PUT => MethodFilter::PUT,
+		| &Method::TRACE => MethodFilter::TRACE,
 		| _ => panic!("Unsupported HTTP method"),
 	}
 }

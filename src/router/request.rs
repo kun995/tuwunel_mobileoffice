@@ -1,18 +1,23 @@
 use std::{
+	convert::Infallible,
 	fmt::Debug,
 	sync::{Arc, atomic::Ordering},
 	time::Duration,
 };
 
 use axum::{
-	extract::State,
+	extract::{MatchedPath, Request},
 	response::{IntoResponse, Response},
 };
 use futures::FutureExt;
 use http::{Method, StatusCode, Uri};
-use tokio::time::sleep;
-use tracing::Span;
-use tuwunel_core::{Result, debug, debug_error, debug_warn, err, error, trace};
+use ruma::api::error::ErrorKind;
+use tokio::{sync::Notify, task, time::sleep};
+use tower::{Service, ServiceExt};
+use tracing::{Span, field::Empty};
+use tuwunel_core::{
+	Error, Result, debug, debug_error, debug_warn, defer, error, trace, utils::SanitizedUri,
+};
 use tuwunel_service::Services;
 
 #[tracing::instrument(
@@ -25,18 +30,33 @@ use tuwunel_service::Services;
 			.server
 			.metrics
 			.requests_count
-			.fetch_add(1, Ordering::Relaxed)
+			.fetch_add(1, Ordering::Relaxed),
+		origin = Empty,
+		user_id = Empty,
+		device_id = Empty,
 	)
 )]
-pub(crate) async fn handle(
-	State(services): State<Arc<Services>>,
-	req: http::Request<axum::body::Body>,
-	next: axum::middleware::Next,
-) -> Result<Response, StatusCode> {
-	if !services.server.running() {
+pub(crate) async fn handle<S>(
+	services: Arc<Services>,
+	mut req: Request,
+	inner: S,
+) -> Result<Response, StatusCode>
+where
+	S: Service<Request, Error = Infallible> + Send + 'static,
+	S::Response: IntoResponse,
+	S::Future: Send + 'static,
+{
+	let matched_path = req.extensions().get::<MatchedPath>().cloned();
+
+	if !services.server.is_running() {
+		let uri = matched_path.as_ref().map_or_else(
+			|| SanitizedUri::new(req.uri()),
+			|path| SanitizedUri::with_path(req.uri(), path.as_str()),
+		);
+
 		debug_warn!(
 			method = %req.method(),
-			uri = %req.uri(),
+			%uri,
 			"unavailable pending shutdown"
 		);
 
@@ -45,25 +65,59 @@ pub(crate) async fn handle(
 
 	let uri = req.uri().clone();
 	let method = req.method().clone();
-	let services_ = services.clone();
 	let parent = Span::current();
-	let task = services.server.runtime().spawn(async move {
+	req.extensions_mut().insert(parent.clone());
+
+	let response = match method {
+		Method::PUT | Method::POST | Method::DELETE | Method::PATCH => {
+			spawn_execute(services, req, inner, parent).await?
+		}
+		_ => execute(&services, req, inner, &parent).await,
+	};
+
+	handle_result(&method, &uri, matched_path.as_ref(), response)
+}
+
+async fn spawn_execute<S>(
+	services: Arc<Services>,
+	mut req: Request,
+	inner: S,
+	parent: Span,
+) -> Result<Response, StatusCode>
+where
+	S: Service<Request, Error = Infallible> + Send + 'static,
+	S::Response: IntoResponse,
+	S::Future: Send + 'static,
+{
+	let detached = Arc::new(Notify::new());
+	req.extensions_mut().insert(detached.clone());
+
+	let task = services.clone().server.runtime().spawn(async move {
 		tokio::select! {
-			response = execute(&services_, req, next, &parent) => response,
-			response = services_.server.until_shutdown()
+			response = execute(&services, req, inner, &parent) => response,
+			response = services.server.until_shutdown()
 				.then(|()| {
-					let timeout = services_.server.config.client_shutdown_timeout;
-					let timeout = Duration::from_secs(timeout);
-					sleep(timeout)
+					let timeout = services.config.client_shutdown_timeout;
+					sleep(Duration::from_secs(timeout))
 				})
 				.map(|()| StatusCode::SERVICE_UNAVAILABLE)
 				.map(IntoResponse::into_response) => response,
 		}
 	});
 
-	task.await
-		.map_err(unhandled)
-		.and_then(move |result| handle_result(&method, &uri, result))
+	let abort = task.abort_handle();
+	defer! {{
+		if !abort.is_finished() {
+			debug_warn!(
+				task = ?abort.id(),
+				"Client disconnected; detached request."
+			);
+
+			detached.notify_one();
+		}
+	}};
+
+	task.await.map_err(unhandled)
 }
 
 #[tracing::instrument(
@@ -74,15 +128,19 @@ pub(crate) async fn handle(
 	ret(level = "trace"),
 )]
 #[cfg_attr(not(debug_assertions), expect(unused_variables))]
-async fn execute(
+async fn execute<S>(
 	// we made a safety contract that Services will not go out of scope
 	// during the request; this ensures a reference is accounted for at
 	// the base frame of the task regardless of its detachment.
 	services: &Arc<Services>,
-	req: http::Request<axum::body::Body>,
-	next: axum::middleware::Next,
+	req: Request,
+	inner: S,
 	parent: &Span,
-) -> Response {
+) -> Response
+where
+	S: Service<Request, Error = Infallible>,
+	S::Response: IntoResponse,
+{
 	#[cfg(debug_assertions)]
 	services
 		.server
@@ -91,7 +149,7 @@ async fn execute(
 		.fetch_add(1, Ordering::Relaxed);
 
 	#[cfg(debug_assertions)]
-	tuwunel_core::defer! {{
+	defer! {{
 		_ = services.server
 			.metrics
 			.requests_handle_finished
@@ -102,28 +160,44 @@ async fn execute(
 			.fetch_sub(1, Ordering::Relaxed);
 	}};
 
-	next.run(req).await
+	inner.oneshot(req).map(IntoResponse::into_response).await
 }
 
-fn handle_result(method: &Method, uri: &Uri, result: Response) -> Result<Response, StatusCode> {
+fn handle_result(
+	method: &Method,
+	uri: &Uri,
+	matched_path: Option<&MatchedPath>,
+	result: Response,
+) -> Result<Response, StatusCode> {
 	let status = result.status();
 	let code = status.as_u16();
-	let reason = status
-		.canonical_reason()
-		.unwrap_or("Unknown Reason");
+	let reason = status.canonical_reason().unwrap_or("Unknown Reason");
 
-	if status.is_server_error() {
-		error!(method = ?method, uri = ?uri, "{code} {reason}");
-	} else if status.is_client_error() {
-		debug_error!(method = ?method, uri = ?uri, "{code} {reason}");
-	} else if status.is_redirection() {
-		debug!(method = ?method, uri = ?uri, "{code} {reason}");
-	} else {
-		trace!(method = ?method, uri = ?uri, "{code} {reason}");
+	let uri = matched_path.map_or_else(
+		|| SanitizedUri::new(uri),
+		|path| SanitizedUri::with_path(uri, path.as_str()),
+	);
+
+	match status {
+		status if status.is_redirection() => {
+			debug!(method = ?method, %uri, status = code, %reason, "request complete")
+		}
+		status if status.is_server_error() => {
+			error!(method = ?method, %uri, status = code, %reason, "request complete")
+		}
+		status if status.is_client_error() => {
+			debug_error!(method = ?method, %uri, status = code, %reason, "request complete");
+		}
+		_ => trace!(method = ?method, %uri, status = code, %reason, "request complete"),
 	}
 
 	if status == StatusCode::METHOD_NOT_ALLOWED {
-		return Ok(err!(Request(Unrecognized("Method Not Allowed"))).into_response());
+		return Ok(Error::Request(
+			ErrorKind::Unrecognized,
+			"Method Not Allowed".into(),
+			StatusCode::METHOD_NOT_ALLOWED,
+		)
+		.into_response());
 	}
 
 	Ok(result)
@@ -131,7 +205,7 @@ fn handle_result(method: &Method, uri: &Uri, result: Response) -> Result<Respons
 
 #[cold]
 fn unhandled<Error: Debug>(e: Error) -> StatusCode {
-	error!("unhandled error or panic during request: {e:?}");
+	error!(error = ?e, "unhandled error or panic during request");
 
 	StatusCode::INTERNAL_SERVER_ERROR
 }

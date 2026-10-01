@@ -3,7 +3,6 @@
 /// This module provides a trait-based abstraction for media storage,
 /// allowing different backends (filesystem, S3, hybrid) to be used
 /// interchangeably.
-
 pub mod filesystem;
 
 #[cfg(feature = "s3_storage")]

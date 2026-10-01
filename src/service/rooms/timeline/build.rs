@@ -1,27 +1,34 @@
+//! Builds and appends locally authored room events.
+//!
+//! Event construction, authorization, signing, state advancement, and timeline
+//! insertion are coordinated under the caller's room state guard. Successfully
+//! persisted events are then queued for federation to participating servers.
+
 use std::{collections::HashSet, iter::once};
 
 use futures::{FutureExt, StreamExt};
 use ruma::{
-	OwnedEventId, OwnedServerName, RoomId, RoomVersionId, UserId,
+	OwnedEventId, OwnedServerName, RoomId, UserId,
 	events::{
 		TimelineEventType,
-		room::{
-			member::{MembershipState, RoomMemberEventContent},
-			redaction::RoomRedactionEventContent,
-		},
+		room::member::{MembershipState, RoomMemberEventContent},
 	},
 };
+use serde_json::value::to_raw_value;
 use tuwunel_core::{
 	Err, Result, implement,
-	matrix::{event::Event, pdu::PduBuilder},
+	matrix::{event::Event, pdu::PduBuilder, room_version},
 	utils::{IterStream, ReadyExt},
 };
 
 use super::RoomMutexGuard;
 
-/// Creates a new persisted data unit and adds it to a room. This function
-/// takes a roomid_mutex_state, meaning that only this function is able to
-/// mutate the room state.
+/// Builds, signs, validates, and persists a locally authored room event.
+///
+/// The caller's state guard serializes state derivation and advancement while
+/// the event is inserted into the accepted timeline. Federation enqueue occurs
+/// after persistence, so its failure can be returned after the event and room
+/// state have already been stored.
 #[implement(super::Service)]
 #[tracing::instrument(
 	name = "build_and_append"
@@ -31,12 +38,18 @@ use super::RoomMutexGuard;
 )]
 pub async fn build_and_append_pdu(
 	&self,
-	pdu_builder: PduBuilder,
+	mut pdu_builder: PduBuilder,
 	sender: &UserId,
 	room_id: &RoomId,
 	state_lock: &RoomMutexGuard,
 ) -> Result<OwnedEventId> {
-	let (pdu, pdu_json) = self
+	if pdu_builder.event_type == TimelineEventType::RoomMember {
+		self.sanitize_member_authorisation(&mut pdu_builder, room_id)
+			.boxed() // size firewall
+			.await?;
+	}
+
+	let (pdu, mut pdu_json) = self
 		.create_hash_and_sign_event(pdu_builder, sender, room_id, state_lock)
 		.await?;
 
@@ -56,70 +69,40 @@ pub async fn build_and_append_pdu(
 		.await
 	{
 		self.check_pdu_for_admin_room(&pdu, sender)
-			.boxed()
+			.boxed() // cold arm: admin room
 			.await?;
 	}
 
 	// If redaction event is not authorized, do not append it to the timeline
 	if *pdu.kind() == TimelineEventType::RoomRedaction {
-		use RoomVersionId::*;
-		match self
+		let room_version = self
 			.services
 			.state
 			.get_room_version(pdu.room_id())
-			.await?
+			.await?;
+
+		let room_rules = room_version::rules(&room_version)?;
+
+		let redacts_id = pdu.redacts_id(&room_rules);
+
+		if let Some(redacts_id) = &redacts_id
+			&& !self
+				.services
+				.state_accessor
+				.user_can_redact(redacts_id, pdu.sender(), pdu.room_id(), false)
+				.await?
 		{
-			| V1 | V2 | V3 | V4 | V5 | V6 | V7 | V8 | V9 | V10 => {
-				if let Some(redact_id) = pdu.redacts()
-					&& !self
-						.services
-						.state_accessor
-						.user_can_redact(redact_id, pdu.sender(), pdu.room_id(), false)
-						.await?
-				{
-					return Err!(Request(Forbidden("User cannot redact this event.")));
-				}
-			},
-			| _ => {
-				let content: RoomRedactionEventContent = pdu.get_content()?;
-				if let Some(redact_id) = &content.redacts
-					&& !self
-						.services
-						.state_accessor
-						.user_can_redact(redact_id, pdu.sender(), pdu.room_id(), false)
-						.await?
-				{
-					return Err!(Request(Forbidden("User cannot redact this event.")));
-				}
-			},
+			return Err!(Request(Forbidden("User cannot redact this event.")));
 		}
 	}
 
-	if *pdu.kind() == TimelineEventType::RoomMember {
-		let content: RoomMemberEventContent = pdu.get_content()?;
-
-		if content.join_authorized_via_users_server.is_some()
-			&& content.membership != MembershipState::Join
-		{
-			return Err!(Request(BadJson(
-				"join_authorised_via_users_server is only for member joins"
-			)));
-		}
-
-		if content
-			.join_authorized_via_users_server
-			.as_ref()
-			.is_some_and(|authorising_user| {
-				!self
-					.services
-					.globals
-					.user_is_local(authorising_user)
-			}) {
-			return Err!(Request(InvalidParam(
-				"Authorising user does not belong to this homeserver"
-			)));
-		}
-	}
+	// MSC4284: ask the room's policy server (if any) to sign this event before
+	// federating it. Refusal aborts; fail-open on transport errors.
+	self.services
+		.event_handler
+		.sign_outgoing_pdu(&mut pdu_json, &pdu)
+		.boxed() // size firewall
+		.await?;
 
 	// We append to state before appending the pdu, so we don't have a moment in
 	// time with the pdu without it's state. This is okay because append_pdu can't
@@ -135,6 +118,7 @@ pub async fn build_and_append_pdu(
 			once(pdu.event_id()),
 			state_lock,
 		)
+		.boxed() // size firewall
 		.await?;
 
 	// We set the room state after inserting the pdu, so that we never have a moment
@@ -176,6 +160,57 @@ pub async fn build_and_append_pdu(
 
 #[implement(super::Service)]
 #[tracing::instrument(skip_all, level = "debug")]
+async fn sanitize_member_authorisation(
+	&self,
+	pdu_builder: &mut PduBuilder,
+	room_id: &RoomId,
+) -> Result {
+	let content: RoomMemberEventContent = pdu_builder.content.deserialize_as_unchecked()?;
+
+	let Some(authorising_user) = &content.join_authorized_via_users_server else {
+		return Ok(());
+	};
+
+	if content.membership != MembershipState::Join {
+		return Err!(Request(BadJson(
+			"join_authorised_via_users_server is only for member joins"
+		)));
+	}
+
+	// Already joined or invited: strip the inapplicable authorising user.
+	if let Some(target) = pdu_builder
+		.state_key
+		.as_deref()
+		.and_then(|key| UserId::parse(key).ok())
+		&& self
+			.services
+			.state_cache
+			.user_membership(&target, room_id)
+			.await
+			.is_some_and(|m| matches!(m, MembershipState::Join | MembershipState::Invite))
+	{
+		let mut object = pdu_builder.content.deserialize()?;
+		object.remove("join_authorised_via_users_server");
+		pdu_builder.content = to_raw_value(&object)?.into();
+
+		return Ok(());
+	}
+
+	if !self
+		.services
+		.globals
+		.user_is_local(authorising_user)
+	{
+		return Err!(Request(InvalidParam(
+			"Authorising user does not belong to this homeserver"
+		)));
+	}
+
+	Ok(())
+}
+
+#[implement(super::Service)]
+#[tracing::instrument(skip_all, level = "debug")]
 async fn check_pdu_for_admin_room<Pdu>(&self, pdu: &Pdu, sender: &UserId) -> Result
 where
 	Pdu: Event,
@@ -204,11 +239,10 @@ where
 					let count = self
 						.services
 						.state_cache
-						.room_members(pdu.room_id())
-						.ready_filter(|user| self.services.globals.user_is_local(user))
+						.local_users_in_room(pdu.room_id())
 						.ready_filter(|user| *user != target)
-						.boxed()
 						.count()
+						.boxed() // cold arm: admin membership check
 						.await;
 
 					if count < 2 {
@@ -228,11 +262,10 @@ where
 					let count = self
 						.services
 						.state_cache
-						.room_members(pdu.room_id())
-						.ready_filter(|user| self.services.globals.user_is_local(user))
+						.local_users_in_room(pdu.room_id())
 						.ready_filter(|user| *user != target)
-						.boxed()
 						.count()
+						.boxed() // cold arm: admin membership check
 						.await;
 
 					if count < 2 {

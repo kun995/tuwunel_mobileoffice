@@ -1,10 +1,14 @@
-use ruma::events::room::message::RoomMessageEventContent;
-use tokio::time::{Duration, sleep};
+use tokio::task::yield_now;
 use tuwunel_core::{Err, Result, debug, debug_info, error, implement, info};
+#[cfg(feature = "console")]
+use tuwunel_core::{log::is_terminal_mode, warn};
+
+use super::CommandOutput;
 
 pub(super) const SIGNAL: &str = "SIGUSR2";
 
-/// Possibly spawn the terminal console at startup if configured.
+/// Possibly spawn the terminal console at startup if configured and standard
+/// input is a terminal.
 #[implement(super::Service)]
 #[cfg_attr(not(feature = "console"), expect(clippy::unused_async))]
 pub(super) async fn console_auto_start(&self) {
@@ -15,8 +19,13 @@ pub(super) async fn console_auto_start(&self) {
 		.config
 		.admin_console_automatic
 	{
+		if !is_terminal_mode() {
+			warn!("Not starting the admin console: standard input is not a terminal");
+			return;
+		}
+
 		// Allow more of the startup sequence to execute before spawning
-		tokio::task::yield_now().await;
+		yield_now().await;
 		self.console.start();
 	}
 }
@@ -31,7 +40,7 @@ pub(super) async fn console_auto_stop(&self) {
 
 /// Execute admin commands after startup
 #[implement(super::Service)]
-pub(super) async fn startup_execute(&self) -> Result {
+pub async fn startup_execute(&self) -> Result {
 	// List of commands to execute
 	let commands = &self.services.server.config.admin_execute;
 
@@ -46,9 +55,6 @@ pub(super) async fn startup_execute(&self) -> Result {
 			.config
 			.admin_execute_errors_ignore;
 
-	//TODO: remove this after run-states are broadcast
-	sleep(Duration::from_millis(500)).await;
-
 	for (i, command) in commands.iter().enumerate() {
 		if let Err(e) = self.execute_command(i, command.clone()).await
 			&& !errors
@@ -56,7 +62,7 @@ pub(super) async fn startup_execute(&self) -> Result {
 			return Err(e);
 		}
 
-		tokio::task::yield_now().await;
+		yield_now().await;
 	}
 
 	// The smoketest functionality is placed here for now and simply initiates
@@ -98,7 +104,7 @@ pub(super) async fn signal_execute(&self) -> Result {
 			return Err(e);
 		}
 
-		tokio::task::yield_now().await;
+		yield_now().await;
 	}
 
 	Ok(())
@@ -121,28 +127,28 @@ async fn execute_command(&self, i: usize, command: String) -> Result {
 
 #[cfg(feature = "console")]
 #[implement(super::Service)]
-fn execute_command_output(i: usize, content: &RoomMessageEventContent) -> Result {
+fn execute_command_output(i: usize, content: &CommandOutput) -> Result {
 	debug_info!("Execute command #{i} completed:");
-	super::console::print(content.body());
+	super::console::print(content.as_str());
 	Ok(())
 }
 
 #[cfg(feature = "console")]
 #[implement(super::Service)]
-fn execute_command_error(i: usize, content: &RoomMessageEventContent) -> Result {
-	super::console::print_err(content.body());
+fn execute_command_error(i: usize, content: &CommandOutput) -> Result {
+	super::console::print_err(content.as_str());
 	Err!(debug_error!("Execute command #{i} failed."))
 }
 
 #[cfg(not(feature = "console"))]
 #[implement(super::Service)]
-fn execute_command_output(i: usize, content: &RoomMessageEventContent) -> Result {
-	info!("Execute command #{i} completed:\n{:#}", content.body());
+fn execute_command_output(i: usize, content: &CommandOutput) -> Result {
+	info!("Execute command #{i} completed:\n{:#}", content.as_str());
 	Ok(())
 }
 
 #[cfg(not(feature = "console"))]
 #[implement(super::Service)]
-fn execute_command_error(i: usize, content: &RoomMessageEventContent) -> Result {
-	Err!(error!("Execute command #{i} failed:\n{:#}", content.body()))
+fn execute_command_error(i: usize, content: &CommandOutput) -> Result {
+	Err!(error!("Execute command #{i} failed:\n{:#}", content.as_str()))
 }

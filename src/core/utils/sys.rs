@@ -1,35 +1,38 @@
+//! Operating-system resource and platform-integration utilities.
+//!
+//! Submodules expose compute, resource-limit, storage, and usage information.
+//! Top-level helpers normalize executable paths, parse device metadata, and
+//! classify socket file descriptors on Unix.
+
 pub mod compute;
+
+pub mod limits;
+
 pub mod storage;
 
+pub mod usage;
+
+#[cfg(unix)]
+use std::os::fd::AsFd;
 use std::path::PathBuf;
 
-pub use compute::available_parallelism;
-
-use crate::{Result, at, debug};
-
-/// This is needed for opening lots of file descriptors, which tends to
-/// happen more often when using RocksDB and making lots of federation
-/// connections at startup. The soft limit is usually 1024, and the hard
-/// limit is usually 512000; I've personally seen it hit >2000.
-///
-/// * <https://www.freedesktop.org/software/systemd/man/systemd.exec.html#id-1.12.2.1.17.6>
-/// * <https://github.com/systemd/systemd/commit/0abf94923b4a95a7d89bc526efc84e7ca2b71741>
 #[cfg(unix)]
-pub fn maximize_fd_limit() -> Result<(), nix::errno::Errno> {
-	use nix::sys::resource::{Resource::RLIMIT_NOFILE as NOFILE, getrlimit, setrlimit};
+use nix::{
+	errno::Errno,
+	sys::socket::{getsockopt, sockopt::Ipv6V6Only},
+};
 
-	let (soft_limit, hard_limit) = getrlimit(NOFILE)?;
-	if soft_limit < hard_limit {
-		setrlimit(NOFILE, hard_limit, hard_limit)?;
-		assert_eq!((hard_limit, hard_limit), getrlimit(NOFILE)?, "getrlimit != setrlimit");
-		debug!(to = hard_limit, from = soft_limit, "Raised RLIMIT_NOFILE",);
-	}
+pub use self::{
+	compute::available_parallelism,
+	limits::*,
+	usage::{Usage, statm, thread_usage, usage},
+};
+use crate::{Result, at};
 
-	Ok(())
-}
-
-/// Return a possibly corrected std::env::current_exe() even if the path is
-/// marked deleted.
+/// Returns the current executable path without a trailing deletion marker.
+///
+/// The literal ` (deleted)` suffix is removed when the path is valid UTF-8.
+/// Other paths remain unchanged, and executable lookup errors are propagated.
 pub fn current_exe() -> Result<PathBuf> {
 	let exe = std::env::current_exe()?;
 	match exe.to_str() {
@@ -41,9 +44,10 @@ pub fn current_exe() -> Result<PathBuf> {
 	}
 }
 
-/// Determine if the server's executable was removed or replaced. This is a
-/// specific check; useful for successful restarts. May not be available or
-/// accurate on all platforms; defaults to false.
+/// Reports whether the current executable path carries a deletion marker.
+///
+/// A trailing ` (deleted)` suffix can indicate that the executable was removed
+/// or replaced. Lookup failures and non-UTF-8 paths return `false`.
 #[must_use]
 pub fn current_exe_deleted() -> bool {
 	std::env::current_exe().is_ok_and(|exe| {
@@ -52,8 +56,11 @@ pub fn current_exe_deleted() -> bool {
 	})
 }
 
-/// Parse the `KEY=VALUE` contents of a `uevent` file searching for `key` and
-/// returning the `value`.
+/// Searches newline-delimited `KEY=VALUE` text for a key.
+///
+/// Lines without `=` are ignored, and the first exact key match is returned.
+/// The borrowed value contains everything after the first `=`, including any
+/// additional separators.
 #[inline]
 #[must_use]
 pub fn uevent_find<'a>(uevent: &'a str, key: &'a str) -> Option<&'a str> {
@@ -62,4 +69,60 @@ pub fn uevent_find<'a>(uevent: &'a str, key: &'a str) -> Option<&'a str> {
 		.filter_map(|line| line.split_once('='))
 		.find(|&(key_, _)| key.eq(key_))
 		.map(at!(1))
+}
+
+/// Classifies the socket address families recognized by the server.
+///
+/// IPv4 and IPv6 addresses share the Internet variant, while Unix-domain
+/// addresses use the local variant. Other address families are rejected by
+/// [`get_socket_family`].
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+pub enum SocketFamily {
+	/// An IPv4 or IPv6 Internet socket.
+	///
+	/// Both Internet address families map to this variant.
+	Inet,
+
+	/// A Unix-domain socket.
+	///
+	/// Every recognized local socket address maps to this variant.
+	Unix,
+}
+
+/// Determines the address family of an open socket file descriptor on Unix.
+///
+/// IPv4 and IPv6 descriptors return [`SocketFamily::Inet`], and Unix-domain
+/// descriptors return [`SocketFamily::Unix`]. Socket inspection failures,
+/// missing families, and unsupported families are returned as errors.
+#[cfg(unix)]
+pub fn get_socket_family(fd: i32) -> Result<SocketFamily> {
+	use nix::sys::socket::{AddressFamily, SockaddrLike, SockaddrStorage};
+
+	use crate::{Err, err};
+
+	let sockname: SockaddrStorage = nix::sys::socket::getsockname(fd)?;
+
+	let family = sockname
+		.family()
+		.ok_or_else(|| err!("Invalid socket"))?;
+
+	match family {
+		| AddressFamily::Inet | AddressFamily::Inet6 => Ok(SocketFamily::Inet),
+		| AddressFamily::Unix => Ok(SocketFamily::Unix),
+		| _ => Err!("Unknown socket family: {family:?}"),
+	}
+}
+
+/// Whether an IPv6 socket serves IPv6 traffic alone.
+///
+/// A dual-stack socket answers on the IPv4-mapped range too, so an unspecified
+/// address of one binds both families. The option does not exist on other
+/// families, which are reported as unrestricted.
+#[cfg(unix)]
+pub fn is_ipv6_only<F: AsFd>(socket: &F) -> Result<bool> {
+	getsockopt(socket, Ipv6V6Only).or_else(|e| match e {
+		| Errno::ENOPROTOOPT => Ok(false),
+		| _ => Err(e.into()),
+	})
 }

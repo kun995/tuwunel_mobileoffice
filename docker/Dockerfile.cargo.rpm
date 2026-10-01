@@ -8,39 +8,29 @@ ARG CARGO_HOME
 ARG CARGO_TARGET
 ARG CARGO_TARGET_DIR
 ARG cargo_target_profile
-ARG cargo_target_artifact
-ARG cargo_target_share
-ARG cargo_share
 ARG cargo_profile
 ARG cargo_features
 ARG cargo_spec_features
-ARG targ_dir="${CARGO_TARGET_DIR}/${cargo_target_profile}"
-ARG targ_targ_dir="${CARGO_TARGET_DIR}/${rust_target}/${cargo_target_profile}"
 ARG pkg_dir
 ARG gen_rpm_args=""
-
-WORKDIR /
-COPY --link --from=input . .
+ARG sched_policy="--rr"
+ARG sched_prio=1
 
 WORKDIR /usr/src/tuwunel
+ENV sched_policy=${sched_policy}
+ENV sched_prio=${sched_prio}
+# The packaging inputs (unit files, docs) live outside the compile subset
+# carried by the input layer, so mount them from the full source.
 RUN \
 --mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=shared \
 --mount=type=cache,dst=${CARGO_HOME}/registry,sharing=shared \
 --mount=type=cache,dst=${CARGO_HOME}/git,sharing=shared \
---mount=type=cache,dst=${targ_dir}/deps,id=${cargo_share}/deps,sharing=locked \
---mount=type=cache,dst=${targ_dir}/build,id=${cargo_share}/build,sharing=locked \
---mount=type=cache,dst=${targ_dir}/examples,id=${cargo_share}/examples,sharing=locked \
---mount=type=cache,dst=${targ_dir}/incremental,id=${cargo_share}/incremental,sharing=locked \
---mount=type=cache,dst=${targ_dir}/.fingerprint,id=${cargo_share}/fingerprint,sharing=locked \
---mount=type=cache,dst=${targ_targ_dir}/deps,id=${cargo_target_share}/deps,sharing=locked \
---mount=type=cache,dst=${targ_targ_dir}/build,id=${cargo_target_share}/build,sharing=locked \
---mount=type=cache,dst=${targ_targ_dir}/examples,id=${cargo_target_share}/examples,sharing=locked \
---mount=type=cache,dst=${targ_targ_dir}/incremental,id=${cargo_target_share}/incremental,sharing=locked \
---mount=type=cache,dst=${targ_targ_dir}/.fingerprint,id=${cargo_target_share}/fingerprint,sharing=locked \
+--mount=type=bind,from=source,source=/usr/src/tuwunel/rpm,target=/usr/src/tuwunel/rpm \
+--mount=type=bind,from=source,source=/usr/src/tuwunel/README.md,target=/usr/src/tuwunel/README.md \
 <<EOF
 	set -eux
 	mkdir -p "${pkg_dir}"
-	rustup run ${rust_toolchain} \
+	rustup run ${rust_toolchain} sched_wrap.sh \
 		cargo generate-rpm \
 			--package src/main \
 			--auto-req auto \
@@ -64,13 +54,18 @@ COPY --from=input ${pkg_dir}/tuwunel.rpm .
 FROM input AS rpm-install
 ARG pkg_dir
 
-WORKDIR /
-COPY --link --from=input . .
-
 WORKDIR ${pkg_dir}
 COPY --link --from=rpm . .
+# dnf resolves the Requires the package declares, where rpm -i only asserts
+# they are installed already and failed on anything the base image happened
+# not to carry. An unsigned local package installs regardless of the gpgcheck
+# in dnf.conf, which localpkg_gpgcheck governs and leaves off by default.
 RUN <<EOF
 	set -eux
-	rpm -i --test tuwunel.rpm
-	rpm -i tuwunel.rpm
+	rpm -qip tuwunel.rpm
+	dnf -y install ./tuwunel.rpm
+	# Every program the unit runs comes from the package or from something it
+	# depends on, so hold them against the filesystem the install produced.
+	sed -nE 's/^Exec[A-Za-z]+=[-+!@]*(\/[^ ]+).*/\1/p' \
+		/etc/systemd/system/tuwunel.service | xargs -rt -n1 test -x
 EOF

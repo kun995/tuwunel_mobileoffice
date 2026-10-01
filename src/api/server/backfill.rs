@@ -5,7 +5,7 @@ use futures::{FutureExt, StreamExt, TryStreamExt};
 use ruma::{MilliSecondsSinceUnixEpoch, api::federation::backfill::get_backfill};
 use tuwunel_core::{
 	PduCount, Result,
-	utils::{IterStream, ReadyExt, stream::TryTools},
+	utils::{IterStream, ReadyExt, math::usize_from_ruma_bounded},
 };
 
 use super::AccessCheck;
@@ -34,11 +34,7 @@ pub(crate) async fn get_backfill_route(
 	.check()
 	.await?;
 
-	let limit = body
-		.limit
-		.try_into()
-		.unwrap_or(LIMIT_DEFAULT)
-		.min(LIMIT_MAX);
+	let limit = usize_from_ruma_bounded(body.limit, LIMIT_DEFAULT, LIMIT_MAX);
 
 	let from = body
 		.v
@@ -67,7 +63,6 @@ pub(crate) async fn get_backfill_route(
 		pdus: services
 			.timeline
 			.pdus_rev(None, &body.room_id, Some(from.saturating_add(1)))
-			.try_take(limit)
 			.try_filter_map(async |(_, pdu)| {
 				Ok(services
 					.state_accessor
@@ -82,6 +77,13 @@ pub(crate) async fn get_backfill_route(
 					.await
 					.ok())
 			})
+			.take(limit)
+			.and_then(|pdu| {
+				services
+					.state_accessor
+					.erased_for_server(body.origin(), pdu)
+					.map(Ok)
+			})
 			.and_then(|pdu| {
 				services
 					.federation
@@ -89,6 +91,7 @@ pub(crate) async fn get_backfill_route(
 					.map(Ok)
 			})
 			.try_collect()
+			.boxed()
 			.await?,
 	})
 }

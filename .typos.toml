@@ -1,6 +1,13 @@
+[default]
+# "mis-seeded" and similar: typos splits on the hyphen and flags the "mis" prefix.
+extend-ignore-re = ["mis-[a-z]+"]
+
 [default.extend-words]
+"HELO" = "HELO"
 "allocatedp" = "allocatedp"
 "conduwuit" = "conduwuit"
 "execuse" = "execuse"
 "leafs" = "leafs"
 "serialize" = "serialize"
+"consts" = "consts"
+"fpr" = "fpr"

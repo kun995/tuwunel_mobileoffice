@@ -21,7 +21,7 @@ pub(crate) async fn get_filter_route(
 		.map_err(|_| err!(Request(NotFound("Filter not found."))))
 }
 
-/// # `PUT /_matrix/client/r0/user/{userId}/filter`
+/// # `POST /_matrix/client/r0/user/{userId}/filter`
 ///
 /// Creates a new filter to be used by other endpoints.
 pub(crate) async fn create_filter_route(

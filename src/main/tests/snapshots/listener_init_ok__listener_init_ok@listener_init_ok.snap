@@ -1,0 +1,8 @@
+---
+source: src/main/tests/listener_init_ok.rs
+description: Listener Initialization Ok
+expression: result
+---
+Ok(
+    (),
+)

@@ -1,7 +1,11 @@
 #!/bin/bash
 set -eo pipefail
 
-BASEDIR=$(dirname "$0")
+# Resolve the repository root from the script's own location and chdir there.
+# All subsequent paths and the docker buildx bake` context are relative and
+# require this.
+cd "$(dirname "$0")/.."
+BASEDIR="docker"
 
 CI="${CI:-false}"
 CI_VERBOSE="${CI_VERBOSE:-false}"
@@ -57,12 +61,51 @@ sys_versions="${env_sys_versions:-$default_sys_versions}"
 
 docker_dir="$PWD/$BASEDIR"
 builder_name="${GITHUB_ACTOR:-owo}"
+
+# Translates 'nightly' in `rust_toolchains` to some other value. Needed for
+# github actions to pass some specific nightly. Local users can add the specific
+# nightly to the `rust_toolchains` array as intended. see bake.hcl
+rust_nightly="${rust_nightly:-nightly}"
+
+# Translates 'stable' in `rust_toolchains` to some specific toolchain. Used
+# by default for all callers to ensure the msrv is used instead of latest
+# stable. see bake.hcl
 toolchain_toml="$docker_dir/../rust-toolchain.toml"
 rust_msrv=$(grep "channel = " "$toolchain_toml" | cut -d'=' -f2 | sed 's/\s"\|"$//g')
+
+# Package metadata for OCI image labels/annotations. Mirrors the priority
+# used by src/core/info/version.rs::semantic(): `git describe --tags` falling
+# back to the workspace Cargo.toml version. Existing envs take precedence.
+git_semantic="$(git describe --tags --abbrev=1 2>/dev/null || true)"
+git_semantic="${git_semantic#v}"
+git_semantic="${git_semantic%-*-g*}"
+cargo_semantic="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+package_version="${package_version:-${git_semantic:-$cargo_semantic}}"
+package_revision="${package_revision:-$(git rev-parse HEAD 2>/dev/null || true)}"
+package_last_modified="${package_last_modified:-$(git show -s --format=%cI HEAD 2>/dev/null || true)}"
+
+# Nix binary cache. Substituting from the cache is public and unconditional;
+# uploading requires a token, so forks and local builds simply skip the push.
+# CACHIX_AUTH_TOKEN itself reaches buildkit as a secret mount, never an arg.
+cachix_cache="${cachix_cache:-tuwunel}"
+if test -n "$CACHIX_AUTH_TOKEN"; then
+    cachix_push=1
+else
+    cachix_push=0
+fi
+
+attic_cache="${attic_cache:-tuwunel}"
+attic_endpoint="${attic_endpoint:-https://cache.tuwunel.chat}"
+if test -n "$ATTIC_TOKEN"; then
+    attic_push=1
+else
+    attic_push=0
+fi
+
+# other options
+rustdoc_base_path="${rustdoc_base_path:-}"
 rocksdb_opt_level=3
 rocksdb_portable=1
-git_checkout="${git_checkout:-HEAD}"
-use_chef="true"
 set +a
 
 ###############################################################################

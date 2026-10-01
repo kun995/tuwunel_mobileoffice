@@ -39,24 +39,23 @@ pub(crate) fn get_simple_settings(args: &[Meta]) -> HashMap<String, String> {
 	})
 }
 
-pub(crate) fn is_cargo_build() -> bool {
-	legacy_is_cargo_build()
-		|| std::env::args()
-			.skip_while(|flag| !flag.starts_with("--emit"))
-			.nth(1)
-			.iter()
-			.flat_map(|flag| flag.split(','))
-			.any(|elem| elem == "link")
-}
+pub(crate) fn is_cargo_compile() -> bool {
+	// True for `cargo build` (`--emit=link[,...]`) and for `cargo check` /
+	// `cargo clippy` (`--emit=metadata[,...]`). Accepts both `--emit=foo` and
+	// `--emit foo` forms.
+	let args: Vec<String> = std::env::args().collect();
+	let inline = args
+		.iter()
+		.filter_map(|a| a.strip_prefix("--emit="));
 
-pub(crate) fn legacy_is_cargo_build() -> bool {
-	std::env::args()
-		.find(|flag| flag.starts_with("--emit"))
-		.as_ref()
-		.and_then(|flag| flag.split_once('='))
-		.map(|val| val.1.split(','))
-		.and_then(|mut vals| vals.find(|elem| *elem == "link"))
-		.is_some()
+	let separated = args
+		.windows(2)
+		.filter_map(|pair| (pair[0] == "--emit").then_some(pair[1].as_str()));
+
+	inline
+		.chain(separated)
+		.flat_map(|v| v.split(','))
+		.any(|elem| elem == "link" || elem == "metadata")
 }
 
 pub(crate) fn is_cargo_test() -> bool { std::env::args().any(|flag| flag == "--test") }

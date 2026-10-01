@@ -1,21 +1,27 @@
 mod extensions;
 mod filter;
+mod range;
 mod rooms;
 mod selector;
 
-use std::{collections::BTreeMap, fmt::Debug, time::Duration};
-
-use axum::extract::State;
-use futures::{
-	FutureExt, TryFutureExt,
-	future::{join, try_join},
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	fmt::Debug,
+	sync::Arc,
+	time::Duration,
 };
+
+use axum::extract::{Extension, State};
+use futures::{FutureExt, TryFutureExt, future::join};
 use ruma::{
 	DeviceId, OwnedRoomId, UserId,
 	api::client::sync::sync_events::v5::{ListId, Request, Response, response},
 	events::room::member::MembershipState,
 };
-use tokio::time::{Instant, timeout_at};
+use tokio::{
+	sync::Notify,
+	time::{Instant, timeout_at},
+};
 use tuwunel_core::{
 	Err, Result, debug,
 	debug::INFO_SPAN_LEVEL,
@@ -27,17 +33,28 @@ use tuwunel_core::{
 };
 use tuwunel_service::{
 	Services,
+	presence::Ping,
 	sync::{Connection, into_connection_key},
 };
 
+use self::{
+	extensions::{apply_profiles, apply_ranges, handle as handle_extensions},
+	range::collect as collect_ranges,
+};
 use super::share_encrypted_room;
-use crate::Ruma;
+use crate::{ClientIp, Ruma};
 
 #[derive(Copy, Clone)]
 struct SyncInfo<'a> {
 	services: &'a Services,
 	sender_user: &'a UserId,
 	sender_device: Option<&'a DeviceId>,
+	previous_connection_pos: Option<u64>,
+
+	/// The rooms the user calls direct, read once for the whole pass.
+	///
+	/// Both the list filters and every room payload answer `is_dm` from this.
+	direct_rooms: &'a BTreeSet<OwnedRoomId>,
 }
 
 #[derive(Clone, Debug)]
@@ -45,8 +62,15 @@ struct WindowRoom {
 	room_id: OwnedRoomId,
 	membership: Option<MembershipState>,
 	lists: ListIds,
-	ranked: usize,
-	last_count: u64,
+	event_count: u64,
+	payload_count: u64,
+}
+
+impl WindowRoom {
+	#[inline]
+	fn payload_is_fresh(&self, roomsince: u64) -> bool {
+		roomsince == 0 || self.payload_count > roomsince
+	}
 }
 
 type Window = BTreeMap<OwnedRoomId, WindowRoom>;
@@ -75,6 +99,8 @@ type ListIds = SmallVec<[ListId; 1]>;
 	)
 )]
 pub(crate) async fn sync_events_v5_route(
+	Extension(interrupted): Extension<Arc<Notify>>,
+	ClientIp(client): ClientIp,
 	State(ref services): State<crate::State>,
 	body: Ruma<Request>,
 ) -> Result<Response> {
@@ -93,11 +119,7 @@ pub(crate) async fn sync_events_v5_route(
 		.map(Duration::as_millis)
 		.map(TryInto::try_into)
 		.flat_ok()
-		.map(|timeout: u64| {
-			timeout
-				.max(services.config.client_sync_timeout_min)
-				.min(services.config.client_sync_timeout_max)
-		})
+		.map(|timeout: u64| timeout.min(services.config.client_sync_timeout_max))
 		.unwrap_or(0);
 
 	let conn_key = into_connection_key(sender_user, sender_device, request.conn_id.as_deref());
@@ -107,9 +129,16 @@ pub(crate) async fn sync_events_v5_route(
 		.await;
 
 	let conn = conn_val.lock();
+	let ping = Ping {
+		device_id: sender_device,
+		client_ip: Some(client),
+		new_state: Some(&request.set_presence),
+		appservice: body.appservice_info.as_ref(),
+	};
+
 	let ping_presence = services
 		.presence
-		.maybe_ping_presence(sender_user, sender_device, &request.set_presence)
+		.maybe_ping_presence(sender_user, ping)
 		.inspect_err(inspect_log)
 		.ok();
 
@@ -141,7 +170,17 @@ pub(crate) async fn sync_events_v5_route(
 	// Update parameters regardless of replay or advance
 	conn.next_batch = services.globals.wait_pending().await?;
 	conn.globalsince = since.min(conn.next_batch);
-	conn.update_cache(request);
+	let config_changed = conn.update_cache(request);
+	let caught_up = conn.globalsince == conn.next_batch;
+
+	// A whole profile owed to a caught-up connection needs a pass like a new list.
+	let needs_pass = config_changed || conn.own_profile_owed();
+
+	if config_change_needs_position(needs_pass, advancing, caught_up, since) {
+		// The permit publishes the reserved position when it retires on drop.
+		drop(services.globals.next_count());
+	}
+
 	conn.update_rooms_prologue(retarding.then_some(since));
 
 	let mut response = Response {
@@ -156,7 +195,6 @@ pub(crate) async fn sync_events_v5_route(
 		.checked_add(Duration::from_millis(timeout))
 		.expect("configuration must limit maximum timeout");
 
-	let sync_info = SyncInfo { services, sender_user, sender_device };
 	loop {
 		debug_assert!(
 			conn.globalsince <= conn.next_batch,
@@ -164,27 +202,42 @@ pub(crate) async fn sync_events_v5_route(
 		);
 
 		let window;
-		let watchers = services.sync.watch(
-			sender_user,
-			sender_device,
-			services.state_cache.rooms_joined(sender_user),
-		);
+		let watchers = services
+			.sync
+			.watch(sender_user, sender_device, services.state_cache.rooms_joined(sender_user))
+			.await;
 
 		conn.next_batch = services.globals.wait_pending().await?;
+		let direct_rooms = services
+			.account_data
+			.direct_rooms(sender_user)
+			.await;
+
+		let sync_info = SyncInfo {
+			services,
+			sender_user,
+			sender_device,
+			previous_connection_pos: since.ne(&0).then_some(since),
+			direct_rooms: &direct_rooms,
+		};
+
 		(window, response.lists) = selector::selector(&mut conn, sync_info)
 			.boxed()
 			.await;
 
 		if conn.globalsince < conn.next_batch {
-			let rooms = rooms::handle(sync_info, &conn, &window)
-				.map_ok(|response_rooms| response.rooms = response_rooms);
+			let ranges = collect_ranges(sync_info, &conn, &window);
+			let extensions = handle_extensions(sync_info, &conn, &window);
+			let (mut ranges, extensions) = join(ranges, extensions).boxed().await;
 
-			let extensions = extensions::handle(sync_info, &conn, &window)
-				.map_ok(|response_extensions| response.extensions = response_extensions);
+			let mut extensions = extensions?;
 
-			try_join(rooms, extensions).boxed().await?;
-
-			conn.update_rooms_epilogue(window.keys().map(AsRef::as_ref));
+			apply_profiles(sync_info, &conn, &window, &ranges, &mut extensions).await?;
+			apply_ranges(&conn, &window, &mut ranges, &mut extensions);
+			conn.update_rooms_epilogue(ranges.room_updates());
+			conn.update_profiles_epilogue();
+			response.rooms = ranges.into_payloads();
+			response.extensions = extensions.into_response(&response.rooms);
 
 			if !is_empty_response(&response) {
 				response.pos = conn.next_batch.to_string().into();
@@ -194,15 +247,16 @@ pub(crate) async fn sync_events_v5_route(
 			}
 		}
 
-		if timeout == 0
-			|| services.server.is_stopping()
-			|| timeout_at(stop_at, watchers)
-				.boxed()
-				.await
-				.is_err()
-		{
+		let waiter = async || {
+			tokio::select! {
+				() = interrupted.notified() => true,
+				watch = timeout_at(stop_at, watchers) => watch.is_err(),
+			}
+		};
+
+		if timeout == 0 || services.server.is_stopping() || waiter().boxed().await {
 			response.pos = conn.next_batch.to_string().into();
-			trace!(conn.globalsince, conn.next_batch, "timeout; empty response {response:?}");
+			trace!(conn.globalsince, conn.next_batch, "empty response {response:?}");
 			conn.store(&services.sync, &conn_key);
 			return Ok(response);
 		}
@@ -219,6 +273,29 @@ pub(crate) async fn sync_events_v5_route(
 	}
 }
 
+fn config_change_needs_position(
+	config_changed: bool,
+	advancing: bool,
+	caught_up: bool,
+	since: u64,
+) -> bool {
+	config_changed && advancing && caught_up && since != 0
+}
+
 fn is_empty_response(response: &Response) -> bool {
 	response.extensions.is_empty() && response.rooms.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::config_change_needs_position;
+
+	#[test]
+	fn caught_up_advancing_config_change_needs_position() {
+		assert!(config_change_needs_position(true, true, true, 1));
+		assert!(!config_change_needs_position(false, true, true, 1));
+		assert!(!config_change_needs_position(true, false, true, 1));
+		assert!(!config_change_needs_position(true, true, false, 1));
+		assert!(!config_change_needs_position(true, true, true, 0));
+	}
 }

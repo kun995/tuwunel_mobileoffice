@@ -1,15 +1,12 @@
 use axum::extract::State;
-use futures::{
-	StreamExt,
-	future::{join, join5},
-};
-use get_profile_information::v1::ProfileField;
+use futures::StreamExt;
 use rand::seq::SliceRandom;
 use ruma::{
 	OwnedServerName,
 	api::federation::query::{get_profile_information, get_room_information},
+	profile::ProfileFieldValue,
 };
-use tuwunel_core::{Err, Result, err, utils::future::TryExtExt};
+use tuwunel_core::{Err, Result, err};
 
 use crate::Ruma;
 
@@ -36,7 +33,7 @@ pub(crate) async fn get_room_information_route(
 	servers.sort_unstable();
 	servers.dedup();
 
-	servers.shuffle(&mut rand::thread_rng());
+	servers.shuffle(&mut rand::rng());
 
 	// insert our server as the very first choice if in list
 	if let Some(server_index) = servers
@@ -58,8 +55,6 @@ pub(crate) async fn get_profile_information_route(
 	State(services): State<crate::State>,
 	body: Ruma<get_profile_information::v1::Request>,
 ) -> Result<get_profile_information::v1::Response> {
-	use get_profile_information::v1::Response;
-
 	if !services
 		.server
 		.config
@@ -70,66 +65,43 @@ pub(crate) async fn get_profile_information_route(
 		)));
 	}
 
-	if !services
-		.globals
-		.server_is_ours(body.user_id.server_name())
-	{
+	if !services.globals.user_is_local(&body.user_id) {
 		return Err!(Request(InvalidParam("User does not belong to this server.",)));
 	}
 
+	if !services.users.exists(&body.user_id).await {
+		return Err!(Request(NotFound("Profile was not found.")));
+	}
+
 	match &body.field {
-		| Some(ProfileField::AvatarUrl | ProfileField::DisplayName) => {
-			let avatar_url = services.users.avatar_url(&body.user_id).ok();
-
-			let displayname = services.users.displayname(&body.user_id).ok();
-
-			let (avatar_url, displayname) = join(avatar_url, displayname).await;
-
-			Ok(Response {
-				avatar_url,
-				displayname,
-				..Response::default()
-			})
-		},
-		| Some(custom_field) => {
-			if let Ok(value) = services
-				.users
-				.profile_key(&body.user_id, custom_field.as_str())
+		| Some(field) => {
+			let value = services
+				.profile
+				.profile_key(&body.user_id, field)
 				.await
-			{
-				Ok(Response {
-					custom_profile_fields: [(custom_field.to_string(), value)].into(),
-					..Response::default()
-				})
-			} else {
-				Ok(Response::default())
-			}
-		},
-		| None => {
-			let avatar_url = services.users.avatar_url(&body.user_id).ok();
+				.ok();
 
-			let blurhash = services.users.blurhash(&body.user_id).ok();
-
-			let displayname = services.users.displayname(&body.user_id).ok();
-
-			let tz = services.users.timezone(&body.user_id).ok();
-
-			let custom_profile_fields = services
-				.users
-				.all_profile_keys(&body.user_id)
+			let response = value
+				.map(|value| ProfileFieldValue::new(field.as_str(), value))
+				.transpose()
+				.map_err(|_| {
+					err!(Database(
+						error!(user_id = %body.user_id, key = %field, "Invalid json in database profile value")
+					))
+				})?
+				.into_iter()
 				.collect();
 
-			let (avatar_url, blurhash, custom_profile_fields, displayname, tz) =
-				join5(avatar_url, blurhash, custom_profile_fields, displayname, tz).await;
+			Ok(response)
+		},
+		| None => {
+			let response = services
+				.profile
+				.all_profile_keys(&body.user_id)
+				.collect::<_>()
+				.await;
 
-			Ok(Response {
-				avatar_url,
-				blurhash,
-				custom_profile_fields,
-				displayname,
-				tz,
-				..Response::default()
-			})
+			Ok(response)
 		},
 	}
 }

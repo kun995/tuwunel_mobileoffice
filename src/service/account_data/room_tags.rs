@@ -1,3 +1,8 @@
+//! Room tag account data helpers.
+//!
+//! The module updates and retrieves a user's `m.tag` content for an individual room. Tag writes
+//! preserve a readable stored tag set; read failures start a fresh set.
+
 use futures::TryFutureExt;
 use ruma::{
 	RoomId, UserId,
@@ -8,6 +13,14 @@ use ruma::{
 };
 use tuwunel_core::{Result, implement};
 
+/// Add a tag to the room in the user's account data.
+///
+/// The whole tag set is rewritten on every call. A readable stored set is merged with the new tag,
+/// while a read failure starts from an empty set. A tag already present is replaced.
+///
+/// # Panics
+///
+/// Panics when dispatching the global sequence number for the changed tag set fails.
 #[implement(super::Service)]
 pub async fn set_room_tag(
 	&self,
@@ -29,11 +42,15 @@ pub async fn set_room_tag(
 		.await
 }
 
+/// The tags the user has placed on the room, absent when there are none.
+///
+/// Account data is stored as the whole event rather than as its content, so a
+/// read naming the content type here fails on every record.
 #[implement(super::Service)]
 pub async fn get_room_tags(&self, user_id: &UserId, room_id: &RoomId) -> Result<Tags> {
 	self.services
 		.account_data
 		.get_room(room_id, user_id, RoomAccountDataEventType::Tag)
-		.map_ok(|content: TagEventContent| content.tags)
+		.map_ok(|event: TagEvent| event.content.tags)
 		.await
 }

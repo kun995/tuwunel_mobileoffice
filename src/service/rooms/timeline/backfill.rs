@@ -1,4 +1,10 @@
-use std::{collections::HashSet, iter::once};
+//! Retrieves older room history from federation and inserts validated events.
+//!
+//! Candidate servers are selected from trusted and room-related origins, while
+//! remote timestamp claims are checked against the ingested event. Backfilled
+//! events receive negative stream counts so they sort before normal history.
+
+use std::{collections::HashSet, iter::once, num::NonZeroUsize};
 
 use futures::{
 	FutureExt, StreamExt, TryFutureExt,
@@ -6,13 +12,15 @@ use futures::{
 };
 use rand::seq::SliceRandom;
 use ruma::{
-	CanonicalJsonObject, EventId, RoomId, ServerName, api::federation, events::TimelineEventType,
-	uint,
+	CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, RoomId, ServerName,
+	api::Direction, events::TimelineEventType,
 };
+use serde::Deserialize;
 use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
-	Result, at, debug, debug_info, debug_warn, implement, is_false,
+	Err, Result, at, debug, debug_warn, implement, is_false,
 	matrix::{
+		PduEvent,
 		event::Event,
 		pdu::{PduCount, PduId, RawPduId},
 	},
@@ -24,17 +32,38 @@ use tuwunel_core::{
 };
 use tuwunel_database::Json;
 
-use super::ExtractBody;
+use super::{ExtractBody, bias_count};
+use crate::{
+	federation::Candidates,
+	fetcher::{Op, Opts},
+	rooms::state_accessor::plain_text_topic,
+};
 
+/// Events requested per backfill batch.
+const BACKFILL_LIMIT: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+
+const BACKFILL_ATTEMPT_LIMIT: NonZeroUsize = NonZeroUsize::new(5).unwrap();
+
+const BACKFILL_BATCH_ATTEMPTS: usize = 3;
+
+/// The `event_id` and timestamp parsed back out of an [`Op::TimestampToEvent`]
+/// fetch outcome.
+#[derive(Deserialize)]
+struct TimestampHit {
+	event_id: OwnedEventId,
+	origin_server_ts: MilliSecondsSinceUnixEpoch,
+}
+
+/// Attempts federation backfill when a request reaches local history's edge.
+///
+/// Backfill is skipped after the create event and for effectively empty rooms
+/// that are not world-readable. No candidate, a remote fetch failure, or an
+/// empty accepted chunk is treated as a successful best-effort outcome.
 #[implement(super::Service)]
 #[tracing::instrument(name = "backfill", level = "debug", skip(self))]
 pub async fn backfill_if_required(&self, room_id: &RoomId, from: PduCount) -> Result {
-	let (first_pdu_count, first_pdu) = self
-		.first_item_in_room(room_id)
-		.await
-		.expect("Room is not empty");
+	let (first_pdu_count, first_pdu) = self.first_item_in_room(room_id).await?;
 
-	// No backfill required, there are still events between them
 	if first_pdu_count < from {
 		return Ok(());
 	}
@@ -61,15 +90,74 @@ pub async fn backfill_if_required(&self, room_id: &RoomId, from: PduCount) -> Re
 		return Ok(());
 	}
 
-	let canonical_alias = self
-		.services
-		.state_accessor
-		.get_canonical_alias(room_id);
+	let mut eligible = self.backfill_candidates(room_id).await;
 
-	let power_levels = self
-		.services
-		.state_accessor
-		.get_power_levels(room_id);
+	let no_backfill = || {
+		warn!(%room_id, "No servers could backfill, but backfill was needed");
+		Ok(())
+	};
+
+	// Empty here, rather than deferring to the fetcher, keeps backfill scoped to
+	// the authoritative servers; the fetcher would otherwise fall back to the
+	// room's whole population.
+	if eligible.is_empty() {
+		return no_backfill();
+	}
+
+	for _ in 0..BACKFILL_BATCH_ATTEMPTS {
+		let opts = Opts::new(Op::Backfill, room_id.to_owned())
+			.event_id(first_pdu.event_id().to_owned())
+			.candidates(eligible.iter().cloned())
+			.attempt_limit(BACKFILL_ATTEMPT_LIMIT)
+			.backfill_limit(BACKFILL_LIMIT);
+
+		let Ok(outcome) = self.services.fetcher.fetch(opts).await else {
+			return no_backfill();
+		};
+
+		let pdus: Vec<Box<RawJsonValue>> = serde_json::from_slice(&outcome.bytes)?;
+		let batch_size = pdus.len();
+		let prepended = pdus
+			.into_iter()
+			.stream()
+			.fold(0_usize, async |prepended, pdu| {
+				let inserted = self
+					.backfill_pdu(room_id, &outcome.origin, pdu)
+					.await
+					.inspect_err(|e| debug_warn!(%room_id, %e, "Failed to add backfilled pdu"))
+					.unwrap_or(false);
+
+				prepended.saturating_add(usize::from(inserted))
+			})
+			.await;
+
+		debug!(
+			%room_id,
+			origin = %outcome.origin,
+			batch_size,
+			prepended,
+			"Processed backfill response",
+		);
+
+		if prepended > 0 {
+			return Ok(());
+		}
+
+		eligible.retain(|server| server != &outcome.origin);
+		if eligible.is_empty() {
+			break;
+		}
+	}
+
+	warn!(%room_id, "Backfill was required but prepended no events");
+	Ok(())
+}
+
+#[implement(super::Service)]
+async fn backfill_candidates(&self, room_id: &RoomId) -> Candidates {
+	let canonical_alias = self.services.state_accessor.get_canonical_alias(room_id);
+
+	let power_levels = self.services.state_accessor.get_power_levels(room_id);
 
 	let (canonical_alias, power_levels) = join(canonical_alias, power_levels).await;
 
@@ -98,12 +186,9 @@ pub async fn backfill_if_required(&self, room_id: &RoomId, from: PduCount) -> Re
 		.collect::<HashSet<_>>();
 
 	let power_servers = {
-		let mut vec: Vec<_> = power_servers
-			.into_iter()
-			.map(ToOwned::to_owned)
-			.collect();
+		let mut vec: Vec<_> = power_servers.into_iter().map(ToOwned::to_owned).collect();
 
-		vec.shuffle(&mut rand::thread_rng());
+		vec.shuffle(&mut rand::rng());
 		vec.into_iter().stream()
 	};
 
@@ -121,7 +206,7 @@ pub async fn backfill_if_required(&self, room_id: &RoomId, from: PduCount) -> Re
 		.map(ToOwned::to_owned)
 		.stream();
 
-	let mut servers = power_servers
+	power_servers
 		.chain(canonical_room_alias_server)
 		.chain(trusted_servers)
 		.ready_filter(|server_name| !self.services.globals.server_is_ours(server_name))
@@ -132,47 +217,186 @@ pub async fn backfill_if_required(&self, room_id: &RoomId, from: PduCount) -> Re
 				.await
 				.then_some(server_name)
 		})
-		.boxed();
+		.collect()
+		.await
+}
 
-	while let Some(ref backfill_server) = servers.next().await {
-		let request = federation::backfill::get_backfill::v1::Request {
-			room_id: room_id.to_owned(),
-			v: vec![first_pdu.event_id().to_owned()],
-			limit: uint!(100),
-		};
+#[implement(super::Service)]
+/// Finds the nearest event to a timestamp with a federation fallback.
+///
+/// The local answer is retained unless a closer remote claim can be ingested.
+/// The ingested event must belong to this room and its actual timestamp must
+/// remain on the requested side of the query.
+pub async fn get_event_id_near_ts_with_fallback(
+	&self,
+	room_id: &RoomId,
+	ts: MilliSecondsSinceUnixEpoch,
+	dir: Direction,
+) -> Result<(MilliSecondsSinceUnixEpoch, OwnedEventId)> {
+	let local = self.get_event_id_near_ts(room_id, ts, dir).await;
 
-		debug_info!("Asking {backfill_server} for backfill");
-		if let Ok(response) = self
-			.services
-			.federation
-			.execute(backfill_server, request)
-			.inspect_err(|e| {
-				warn!("{backfill_server} failed backfilling for room {room_id}: {e}");
-			})
-			.await
-		{
-			return response
-				.pdus
-				.into_iter()
-				.stream()
-				.for_each(async |pdu| {
-					if let Err(e) = self
-						.backfill_pdu(room_id, backfill_server, pdu)
-						.await
-					{
-						debug_warn!("Failed to add backfilled pdu in room {room_id}: {e}");
-					}
-				})
-				.map(Ok)
-				.await;
+	let federate = match &local {
+		Err(_) => true,
+		Ok((_, event_id)) => {
+			dir == Direction::Forward && self.is_start_edge_hit(room_id, event_id).await
 		}
+	};
+
+	if !federate {
+		return local;
 	}
 
-	warn!("No servers could backfill, but backfill was needed in room {room_id}");
+	let candidates = self.backfill_candidates(room_id).await;
+
+	if candidates.is_empty() {
+		return local;
+	}
+
+	let opts = Opts::new(Op::TimestampToEvent, room_id.to_owned())
+		.ts(ts)
+		.dir(dir)
+		.candidates(candidates)
+		.checks(false);
+
+	let Ok(outcome) = self.services.fetcher.fetch(opts).await else {
+		return local;
+	};
+
+	let Ok(TimestampHit {
+		event_id,
+		origin_server_ts,
+	}) = serde_json::from_slice(&outcome.bytes)
+	else {
+		return local;
+	};
+
+	if let Ok((local_ts, local_id)) = &local
+		&& !nearer(dir, origin_server_ts, *local_ts)
+	{
+		return Ok((*local_ts, local_id.clone()));
+	}
+
+	// Fail closed: an un-ingested event can't be visibility-checked, so keep local.
+	let Ok(pdu) = self
+		.backfill_event(room_id, &event_id, &outcome.origin)
+		.inspect_err(|e| debug_warn!(%room_id, error = ?e, "timestamp fallback backfill failed"))
+		.await
+	else {
+		return local;
+	};
+
+	let actual_ts = pdu.origin_server_ts();
+	let matches_direction = match dir {
+		Direction::Forward => actual_ts >= ts,
+		Direction::Backward => actual_ts <= ts,
+	};
+
+	if actual_ts != origin_server_ts || !matches_direction {
+		debug_warn!(
+			%room_id,
+			%event_id,
+			?dir,
+			?ts,
+			?origin_server_ts,
+			?actual_ts,
+			"timestamp fallback claim was inconsistent with the ingested event"
+		);
+		return local;
+	}
+
+	Ok((actual_ts, event_id))
+}
+
+#[implement(super::Service)]
+async fn is_start_edge_hit(&self, room_id: &RoomId, event_id: &EventId) -> bool {
+	self.first_item_in_room(room_id)
+		.await
+		.is_ok_and(|(_, first)| {
+			*first.event_type() != TimelineEventType::RoomCreate && first.event_id() == event_id
+		})
+}
+
+fn nearer(dir: Direction, a: MilliSecondsSinceUnixEpoch, b: MilliSecondsSinceUnixEpoch) -> bool {
+	match dir {
+		Direction::Forward => a < b,
+		Direction::Backward => a > b,
+	}
+}
+
+#[implement(super::Service)]
+async fn backfill_event(
+	&self,
+	room_id: &RoomId,
+	event_id: &EventId,
+	origin: &ServerName,
+) -> Result<PduEvent> {
+	let opts = Opts::new(Op::Backfill, room_id.to_owned())
+		.event_id(event_id.to_owned())
+		.candidates([origin.to_owned()])
+		.backfill_limit(BACKFILL_LIMIT);
+
+	let outcome = self.services.fetcher.fetch(opts).await?;
+
+	let pdus: Vec<Box<RawJsonValue>> = serde_json::from_slice(&outcome.bytes)?;
+
+	let ingestion = pdus
+		.into_iter()
+		.stream()
+		.fold(Ok(()), async |prior, pdu| {
+			let current = self
+				.backfill_pdu(room_id, &outcome.origin, pdu)
+				.map_ok(|_| ())
+				.inspect_err(|e| debug_warn!(%room_id, error = ?e, "Failed to add backfilled pdu"))
+				.await;
+
+			prior.and(current)
+		})
+		.await;
+
+	match self.get_pdu_count(event_id).await {
+		Err(error) => ingestion.and(Err(error)),
+		Ok(_) => {
+			let pdu = self.get_pdu(event_id).await?;
+
+			if pdu.room_id() != room_id {
+				return Err!(Request(NotFound(
+					"Timestamp fallback target belongs to another room."
+				)));
+			}
+
+			Ok(pdu)
+		}
+	}
+}
+
+/// Fetches one remote event and persists it through the backfill path.
+///
+/// Fetcher checks are disabled only for retrieval; `backfill_pdu`
+/// performs signature, hash, and authorization validation. An event already
+/// accepted completes successfully without another insertion, while a stored
+/// outlier is still validated and promoted.
+#[implement(super::Service)]
+#[tracing::instrument(skip(self), level = "debug")]
+pub async fn fetch_remote_event(&self, room_id: &RoomId, event_id: &EventId) -> Result {
+	let opts = Opts::new(Op::Event, room_id.to_owned())
+		.event_id(event_id.to_owned())
+		.checks(false);
+
+	let outcome = self.services.fetcher.fetch(opts).await?;
+
+	let pdu: Box<RawJsonValue> = serde_json::from_slice(&outcome.bytes)?;
+
+	self.backfill_pdu(room_id, &outcome.origin, pdu).await?;
 
 	Ok(())
 }
 
+/// Validates and inserts one remotely supplied event as backfilled history.
+///
+/// An already accepted duplicate returns `false` without insertion. A new event
+/// or stored outlier receives a negative backfill count, moves to accepted
+/// storage, updates its timestamp and ID indexes, and adds searchable message
+/// or topic content.
 #[implement(super::Service)]
 #[tracing::instrument(skip(self, pdu), level = "debug")]
 pub async fn backfill_pdu(
@@ -180,11 +404,8 @@ pub async fn backfill_pdu(
 	room_id: &RoomId,
 	origin: &ServerName,
 	pdu: Box<RawJsonValue>,
-) -> Result {
-	let parsed = self
-		.services
-		.event_handler
-		.parse_incoming_pdu(&pdu);
+) -> Result<bool> {
+	let parsed = self.services.event_handler.parse_incoming_pdu(&pdu);
 
 	// Lock so we cannot backfill the same pdu twice at the same time
 	let mutex_lock = self
@@ -200,14 +421,13 @@ pub async fn backfill_pdu(
 		.services
 		.event_handler
 		.handle_incoming_pdu(origin, room_id, &event_id, value, false)
-		.boxed()
 		.await?
 		.map(at!(1))
 		.is_some_and(is_false!());
 
 	// Bail if the PDU already exists; a duplicate insertion is not good.
 	if existed {
-		return Ok(());
+		return Ok(false);
 	}
 
 	let pdu = self.get_pdu(&event_id);
@@ -232,40 +452,63 @@ pub async fn backfill_pdu(
 	.into();
 
 	// Insert pdu
-	self.prepend_backfill_pdu(&pdu_id, &event_id, &value);
+	self.prepend_backfill_pdu(
+		&pdu_id,
+		room_id,
+		&event_id,
+		u64::from(pdu.origin_server_ts),
+		&value,
+	);
 	if pdu.kind == TimelineEventType::RoomMessage {
 		self.mark_has_user_message(pdu.room_id());
 	}
 	drop(insert_lock);
 
-	if pdu.kind == TimelineEventType::RoomMessage {
-		let content: ExtractBody = pdu.get_content()?;
-		if let Some(filename) = content.filename.as_deref() {
-			self.services
-				.search
-				.index_pdu(shortroomid, &pdu_id, filename);
+	match pdu.kind {
+		TimelineEventType::RoomMessage => {
+			if let Ok(ExtractBody { body, filename }) = pdu.get_content() {
+				if let Some(filename) = filename {
+					self.services
+						.search
+						.index_pdu(shortroomid, &pdu_id, &filename);
+				}
+				if let Some(body) = body {
+					self.services.search.index_pdu(shortroomid, &pdu_id, &body);
+				}
+			}
 		}
-
-		if let Some(body) = content.body {
-			self.services
-				.search
-				.index_pdu(shortroomid, &pdu_id, &body);
+		TimelineEventType::RoomTopic => {
+			if let Some(topic) = pdu.get_content().ok().and_then(plain_text_topic) {
+				self.services.search.index_pdu(shortroomid, &pdu_id, &topic);
+			}
 		}
+		_ => {}
 	}
+
 	drop(mutex_lock);
 
 	debug!("Prepended backfill pdu");
-	Ok(())
+	Ok(true)
 }
 
 #[implement(super::Service)]
 fn prepend_backfill_pdu(
 	&self,
 	pdu_id: &RawPduId,
+	room_id: &RoomId,
 	event_id: &EventId,
+	origin_server_ts: u64,
 	json: &CanonicalJsonObject,
 ) {
-	self.db.pduid_pdu.raw_put(pdu_id, Json(json));
-	self.db.eventid_pduid.insert(event_id, pdu_id);
-	self.db.eventid_outlierpdu.remove(event_id);
+	let mut txn = self.db.db.txn();
+
+	txn.raw_put(&self.db.pduid_pdu, pdu_id, Json(json));
+	txn.insert_raw(&self.db.eventid_pduid, event_id, pdu_id);
+	txn.del_raw(&self.db.eventid_outlierpdu, event_id);
+
+	let count_key = bias_count(pdu_id.count());
+	let key = (room_id, origin_server_ts, count_key);
+	txn.put_raw(&self.db.roomid_tscount_pducount, key, pdu_id.count());
+
+	txn.execute();
 }

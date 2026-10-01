@@ -25,13 +25,14 @@ use tuwunel_core::{
 	},
 	utils::{
 		BoolExt,
+		math::usize_from_ruma_bounded,
 		result::FlatOk,
 		stream::{ReadyExt, WidebandExt},
 	},
 };
 use tuwunel_service::Services;
 
-use crate::Ruma;
+use crate::{Ruma, client::is_ignored_pdu};
 
 /// # `GET /_matrix/client/r0/rooms/{roomId}/relations/{eventId}/{relType}/{eventType}`
 pub(crate) async fn get_relating_events_with_rel_type_and_event_type_route(
@@ -135,11 +136,9 @@ async fn paginate_relations_with_filter(
 	// Spec (v1.10) recommends depth of at least 3
 	let max_depth: usize = if recurse { 3 } else { 0 };
 
-	let limit: usize = limit
-		.map(TryInto::try_into)
-		.flat_ok()
-		.unwrap_or(30)
-		.min(100);
+	let limit = limit.map_or(30, |limit| usize_from_ruma_bounded(limit, 30, 100));
+
+	let target_event_id: &EventId = target;
 
 	let target = services
 		.timeline
@@ -151,7 +150,9 @@ async fn paginate_relations_with_filter(
 		.state_accessor
 		.user_can_see_state_events(sender_user, room_id)
 		.map(|visible| {
-			visible.ok_or_else(|| err!(Request(Forbidden("You cannot view this room."))))
+			visible
+				.into_option()
+				.ok_or_else(|| err!(Request(Forbidden("You cannot view this room."))))
 		});
 
 	let shortroomid = services.short.get_shortroomid(room_id);
@@ -168,6 +169,16 @@ async fn paginate_relations_with_filter(
 
 	if let PduCount::Backfilled(_) = target.count {
 		return Ok(get_relating_events::v1::Response::new(Vec::new()));
+	}
+
+	if let Ok(target_pdu) = services.timeline.get_pdu(target_event_id).await
+		&& is_ignored_pdu(services, &target_pdu, sender_user).await
+	{
+		return Err!(HttpJson(NOT_FOUND, {
+			"errcode": "M_SENDER_IGNORED",
+			"error": "You have ignored the user that sent this event",
+			"sender": target_pdu.sender().as_str(),
+		}));
 	}
 
 	let fetch = |depth: usize, count: PduCount| {
@@ -207,6 +218,14 @@ async fn paginate_relations_with_filter(
 			.then_some((depth, count, pdu))
 	})
 	.take(limit)
+	.wide_then(async |(depth, count, pdu)| {
+		let pdu = services
+			.pdu_metadata
+			.bundle_aggregations(sender_user, pdu)
+			.await;
+
+		(depth, count, pdu)
+	})
 	.collect::<Vec<_>>()
 	.await;
 

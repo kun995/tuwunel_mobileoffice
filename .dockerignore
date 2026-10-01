@@ -5,16 +5,16 @@ target/
 # Docker files
 Dockerfile*
 docker/
+!docker/lib/
+!docker/lib/*
 
 # IDE files
 .vscode
 .idea
 *.iml
 
-.
-
 # Git folder
-#.git
+.git
 #.gitea
 #.gitlab
 #.github

@@ -133,11 +133,7 @@ pub fn set_workspace_id(&self, room_id: &RoomId, workspace_id: &str) {
 /// Lookup: roomId → workspaceId
 #[implement(Service)]
 pub async fn get_workspace_id(&self, room_id: &RoomId) -> Result<String> {
-	let bytes = self
-		.db
-		.roomid_workspaceid
-		.get(room_id.as_bytes())
-		.await?;
+	let bytes = self.db.roomid_workspaceid.get(room_id.as_bytes()).await?;
 
 	std::str::from_utf8(&bytes)
 		.map(|s| s.to_owned())
@@ -199,29 +195,17 @@ pub async fn user_in_workspace(&self, user_id: &UserId, workspace_id: &str) -> b
 	}
 
 	let key = user_workspace_key(user_id, workspace_id);
-	self.db
-		.userid_workspaceids
-		.get(&key)
-		.await
-		.is_ok()
+	self.db.userid_workspaceids.get(&key).await.is_ok()
 }
 
 #[implement(Service)]
-pub async fn set_user_workspaces(
-	&self,
-	user_id: &UserId,
-	workspace_ids: &[String],
-) -> Vec<String> {
+pub async fn set_user_workspaces(&self, user_id: &UserId, workspace_ids: &[String]) -> Vec<String> {
 	let existing = self.user_workspaces(user_id).await;
 	for workspace_id in existing {
 		let user_workspace_key = user_workspace_key(user_id, &workspace_id);
 		let workspace_user_key = workspace_user_key(&workspace_id, user_id);
-		self.db
-			.userid_workspaceids
-			.remove(&user_workspace_key);
-		self.db
-			.workspaceid_userids
-			.remove(&workspace_user_key);
+		self.db.userid_workspaceids.remove(&user_workspace_key);
+		self.db.workspaceid_userids.remove(&workspace_user_key);
 	}
 
 	let mut workspace_ids = workspace_ids

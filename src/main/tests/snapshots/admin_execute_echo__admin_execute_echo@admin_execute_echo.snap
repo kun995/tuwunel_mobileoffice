@@ -1,0 +1,8 @@
+---
+source: src/main/tests/admin_execute_echo.rs
+description: Admin Execute Echo
+expression: result
+---
+Ok(
+    (),
+)

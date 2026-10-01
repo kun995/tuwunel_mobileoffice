@@ -16,10 +16,10 @@ variations while only paying the cost of rebuilding the last layer for each one.
 
 ### Layout
 
-This directory is made up of three types of files:
+This directory is made up of the following kinds of files:
 
-- Shell scripts are the user interface. Use this system through one of the shell scripts. The
-bake files can still be docker'ed directly but it's recommended to run the script.
+- The top-level shell scripts are the user interface. Use this system through one of the shell
+scripts. The bake files can still be docker'ed directly but it's recommended to run the script.
 
 - The `.hcl` files specify the targets of the tree. This is all standard
 [docker bake](https://docs.docker.com/build/bake/reference/). All targets are ordered where each
@@ -30,6 +30,10 @@ always be a single unified tree.
 - The `Dockerfile.*` files are like "library functions" and provide definition for targets.
 These are written generically in the style of "template functions" with many variables allowing
 many targets to create many variations using the same Dockerfile.
+
+- The `lib/` directory holds the scripts that are not run directly: the per-flavour runners the
+entrypoint scripts delegate to, and the helper scripts `COPY`'d into the images that run inside
+the container (a test runner, a TLS provisioner, per-test hooks).
 
 
 ### Getting started
