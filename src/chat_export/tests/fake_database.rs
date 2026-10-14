@@ -109,8 +109,8 @@ fn exports_fake_service_database_records_by_group_without_private_key_bytes()
 		.db
 		.get("roomuserdataid_accountdata")?
 		.insert(
-			b"@alice:localhost\xffm.direct",
-			br#"{"@bob:localhost":["!room-fixture:localhost"]}"#,
+			b"\xff@alice:localhost\xff1\xffm.direct",
+			br#"{"type":"m.direct","content":{"@bob:localhost":["!room-fixture:localhost"]}}"#,
 		);
 	services
 		.db
@@ -220,16 +220,38 @@ fn exports_fake_service_database_records_by_group_without_private_key_bytes()
 	assert!(
 		rows.iter()
 			.any(|row| row["source_map"] == "roomuserdataid_accountdata"
-				&& row["value"]["@bob:localhost"][0] == "!room-fixture:localhost")
+				&& row["record_type"] == "account_data_item"
+				&& row["identity"]["account_data_type"] == "m.direct"
+				&& row["value"]["content"]["@bob:localhost"][0] == "!room-fixture:localhost")
 	);
 	assert!(
 		rows.iter()
-			.any(|row| row["source_map"] == "senderkey_pusher" && row["value"]["kind"] == "http")
+			.any(|row| row["source_map"] == "senderkey_pusher"
+				&& row["record_type"] == "pusher"
+				&& row["value"]["kind"] == "http")
 	);
 	assert!(
 		rows.iter()
-			.any(|row| row["source_map"] == "mediaid_sha256" && row["value_b64"].is_string())
+			.any(|row| row["source_map"] == "mediaid_sha256"
+				&& row["record_type"] == "media_metadata_item"
+				&& row["value_b64"].is_string())
 	);
+	for (source_map, expected_kind) in [
+		("userid_origin", "sso_identity_link"),
+		("readreceiptid_readreceipt", "receipt"),
+		("userdeviceid_metadata", "device"),
+		("workspaceid_roomids", "room_workspace"),
+		("reminderid_reminder", "reminder_item"),
+		("userroomid_messagepairs", "message_pair"),
+		("usereventsid_deleted", "hidden_dm_checkpoint"),
+		("roomid_hasusermessage", "room_user_message_flag"),
+	] {
+		assert!(
+			rows.iter()
+				.any(|row| row["source_map"] == source_map && row["record_type"] == expected_kind),
+			"missing {source_map} classification"
+		);
+	}
 	assert!(
 		profiles
 			.iter()

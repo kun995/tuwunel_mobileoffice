@@ -22,6 +22,10 @@ struct BusinessRecord {
 	group: &'static str,
 	source_map: &'static str,
 	#[serde(skip_serializing_if = "Option::is_none")]
+	record_type: Option<&'static str>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	identity: Option<BTreeMap<String, Value>>,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	key: Option<Vec<Value>>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	value: Option<Value>,
@@ -149,6 +153,7 @@ pub(crate) async fn export_business_records<W: Write>(
 
 			increment(&mut stats, group, row_bytes)?;
 			let decoded_key = split_key(key);
+			let identity = identity_fields(map_name, &decoded_key);
 			let (value, value_b64) = match serde_json::from_slice::<Value>(value) {
 				| Ok(json) => (Some(json), None),
 				| Err(_) if std::str::from_utf8(value).is_ok() => {
@@ -161,6 +166,8 @@ pub(crate) async fn export_business_records<W: Write>(
 				version: 2,
 				group,
 				source_map: map_name,
+				record_type: Some(record_type(map_name)),
+				identity,
 				key: Some(decoded_key),
 				value,
 				value_b64,
@@ -179,6 +186,8 @@ pub(crate) async fn export_business_records<W: Write>(
 			version: 2,
 			group: "users",
 			source_map: "user_profile",
+			record_type: Some("profile"),
+			identity: None,
 			key: None,
 			value: Some(Value::Object(std::mem::take(&mut fields))),
 			value_b64: None,
@@ -343,6 +352,95 @@ fn split_key(key: &[u8]) -> Vec<Value> {
 				.unwrap_or_else(|_| serde_json::json!({"bytes_b64": STANDARD.encode(part)}))
 		})
 		.collect()
+}
+
+/// Stable importer-facing row kinds. The decoded key/value stay alongside
+/// this classification as provenance because Tuwunel's internal key codecs
+/// are not a public schema.
+fn record_type(map: &str) -> &'static str {
+	match map {
+		| "userid_origin" | "userid_oauthid" => "sso_identity_link",
+		| "roomid_shortstatehash"
+		| "shortstatehash_statediff"
+		| "shortstatekey_statekey"
+		| "shorteventid_shortstatehash"
+		| "statehash_shortstatehash"
+		| "statekey_shortstatekey"
+		| "roomusertype_roomuserdataid"
+		| "roomuserid_joined"
+		| "userroomid_leftstate" => "room_state_index",
+		| "roomuserdataid_accountdata" => "account_data_item",
+		| "senderkey_pusher" | "pushkey_deviceid" => "pusher",
+		| "readreceiptid_readreceipt" => "receipt",
+		| "roomuserid_lastprivatereadupdate"
+		| "roomuserid_lastnotificationread"
+		| "roomuserid_privateread" => "read_marker",
+		| "userdeviceid_metadata" => "device",
+		| "userdeviceid_token" => "device_access_token",
+		| "userdeviceid_refresh" => "device_refresh_token",
+		| "token_userdeviceid" => "access_token_device_index",
+		| "mediaid_file" | "mediaid_user" | "mediaid_sha256" | "media_sha256_refs" => {
+			"media_metadata_item"
+		},
+		| "workspaceid_spaceroomid" => "workspace_space",
+		| "roomid_workspaceid" | "workspaceid_roomids" => "room_workspace",
+		| "userid_workspaceids" | "workspaceid_userids" => "user_workspace",
+		| "reminderid_reminder" | "remindertime_reminderid" | "roomid_reminderids" => {
+			"reminder_item"
+		},
+		| "userroomid_messagepairs" => "message_pair",
+		| "usereventsid_deleted" | "userroomid_deletedbefore" | "userroomid_clearedbefore" => {
+			"hidden_dm_checkpoint"
+		},
+		| "roomid_haslink_pduid" => "room_link_index",
+		| "roomid_hasusermessage" => "room_user_message_flag",
+		| _ => "decoded_kv",
+	}
+}
+
+fn identity_fields(map: &str, key: &[Value]) -> Option<BTreeMap<String, Value>> {
+	let names: &[&str] = match map {
+		| "userid_origin" | "userid_oauthid" => &["user_id", "external_id"],
+		| "roomuserdataid_accountdata" => {
+			&["room_id", "user_id", "stream_position", "account_data_type"]
+		},
+		| "senderkey_pusher" => &["sender_key", "pusher_key"],
+		| "pushkey_deviceid" => &["push_key", "device_id"],
+		| "readreceiptid_readreceipt" => &["receipt_id"],
+		| "roomuserid_lastprivatereadupdate"
+		| "roomuserid_lastnotificationread"
+		| "roomuserid_privateread" => &["room_id", "user_id"],
+		| "userdeviceid_metadata" | "userdeviceid_token" | "userdeviceid_refresh" => {
+			&["user_id", "device_id"]
+		},
+		| "token_userdeviceid" => &["token", "user_id", "device_id"],
+		| "mediaid_file" | "mediaid_user" | "mediaid_sha256" => &["media_id"],
+		| "media_sha256_refs" => &["sha256", "reference"],
+		| "workspaceid_spaceroomid" => &["workspace_id"],
+		| "roomid_workspaceid" | "roomid_hasusermessage" => &["room_id"],
+		| "workspaceid_roomids" => &["workspace_id", "room_id"],
+		| "userid_workspaceids" => &["user_id", "workspace_id"],
+		| "workspaceid_userids" => &["workspace_id", "user_id"],
+		| "reminderid_reminder" => &["reminder_id"],
+		| "remindertime_reminderid" => &["reminder_time", "reminder_id"],
+		| "roomid_reminderids" => &["room_id", "reminder_id"],
+		| "userroomid_messagepairs" | "userroomid_deletedbefore" | "userroomid_clearedbefore" => {
+			&["user_id", "room_id"]
+		},
+		| "usereventsid_deleted" => &["user_id", "event_id"],
+		| "roomid_haslink_pduid" => &["room_id", "event_id"],
+		| _ => return None,
+	};
+	if key.len() != names.len() {
+		return None;
+	}
+	Some(
+		names
+			.iter()
+			.zip(key)
+			.map(|(name, value)| ((*name).to_owned(), value.clone()))
+			.collect(),
+	)
 }
 
 fn single_text_key(key: &[u8]) -> Option<String> {
