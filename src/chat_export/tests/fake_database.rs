@@ -7,13 +7,17 @@ use std::{
 
 use serde_json::Value;
 use tuwunel::{Args, Server, runtime};
-use tuwunel_core::ruma::{RoomId, UserId};
+use tuwunel_core::{
+	matrix::event::gen_event_id,
+	ruma::{CanonicalJsonObject, CanonicalJsonValue, RoomId, RoomVersionId, UserId},
+};
+use tuwunel_database::Json;
 use tuwunel_service::Services;
 
 #[path = "../main.rs"]
 #[allow(dead_code)]
 mod exporter;
-use exporter::export_records;
+use exporter::{export_records, export_records_mode};
 
 #[test]
 fn exports_fake_service_database_records_by_group_without_private_key_bytes()
@@ -60,16 +64,81 @@ fn exports_fake_service_database_records_by_group_without_private_key_bytes()
 		Ok::<(), tuwunel_core::Error>(())
 	})?;
 
-	// Populate source families that require a full room/event API setup with
-	// synthetic Tuwunel-codec values; no live or backup database is involved.
-	services.db.get("eventid_originalpdu")?.insert(
-		b"$fixture-event:localhost",
-		br#"{"event_id":"$fixture-event:localhost","room_id":"!room-fixture:localhost","type":"m.room.message","sender":"@alice:localhost","content":{"body":"fixture"}}"#,
-	);
+	// Populate actual PDU rows with fake canonical events in a two-event DAG.
+	// Event IDs are calculated with the same room-version hashing function as
+	// Tuwunel; no live or backup database is involved.
+	let create = fake_pdu(
+		serde_json::json!({"room_id":room.as_str(),"type":"m.room.create","sender":alice.as_str(),"state_key":"","origin_server_ts":1,"depth":1,"prev_events":[],"auth_events":[],"content":{"creator":alice.as_str(),"room_version":"11"},"hashes":{"sha256":"fixture"},"signatures":{}}),
+		RoomVersionId::V11,
+	)?;
+	let create_id = create["event_id"].as_str().unwrap().to_owned();
+	let message = fake_pdu(
+		serde_json::json!({"room_id":room.as_str(),"type":"m.room.message","sender":alice.as_str(),"origin_server_ts":2,"depth":2,"prev_events":[create_id],"auth_events":[],"content":{"msgtype":"m.text","body":"fixture"},"hashes":{"sha256":"fixture"},"signatures":{}}),
+		RoomVersionId::V11,
+	)?;
+	let message_id = message["event_id"].as_str().unwrap().to_owned();
 	services
 		.db
-		.get("timeredacted_eventid")?
-		.insert(b"1", b"$fixture-redacted:localhost");
+		.get("pduid_pdu")?
+		.raw_put(b"fixture-pdu-create", Json(create));
+	services
+		.db
+		.get("pduid_pdu")?
+		.raw_put(b"fixture-pdu-message", Json(message));
+	services
+		.db
+		.get("eventid_originalpdu")?
+		.insert(message_id.as_bytes(), b"original");
+	services
+		.db
+		.get("userid_password")?
+		.insert(alice.as_bytes(), b"fixture-password-hash");
+	services
+		.db
+		.get("userid_password")?
+		.insert(b"@deactivated:localhost", b"");
+	services
+		.db
+		.get("userid_avatarurl")?
+		.insert(alice.as_bytes(), b"mxc://localhost/avatar");
+	services
+		.db
+		.get("userid_origin")?
+		.insert(b"@alice:localhost\xffkeycloak", b"mobile-office");
+	services
+		.db
+		.get("roomuserdataid_accountdata")?
+		.insert(
+			b"@alice:localhost\xffm.direct",
+			br#"{"@bob:localhost":["!room-fixture:localhost"]}"#,
+		);
+	services
+		.db
+		.get("senderkey_pusher")?
+		.insert(b"@alice:localhost\xffpush-key", br#"{"kind":"http","app_id":"fixture"}"#);
+	services
+		.db
+		.get("readreceiptid_readreceipt")?
+		.insert(
+			b"!room-fixture:localhost\xff@alice:localhost\xff$fixture-event",
+			b"fixture-receipt",
+		);
+	services
+		.db
+		.get("userdeviceid_metadata")?
+		.insert(b"@alice:localhost\xffdevice-fixture", br#"{"display_name":"Fixture device"}"#);
+	services
+		.db
+		.get("mediaid_sha256")?
+		.insert(b"mxc://localhost/media-fixture", b"\x00\xff\x10");
+	services
+		.db
+		.get("roomid_shortstatehash")?
+		.insert(b"!room-fixture:localhost", b"42");
+	services
+		.db
+		.get("roomid_hasusermessage")?
+		.insert(b"!room-fixture:localhost", b"1");
 	services.db.get("reminderid_reminder")?.insert(
 		b"rem_fixture",
 		br#"{"room_id":"!room-fixture:localhost","created_by":"@alice:localhost","title":"fixture reminder"}"#,
@@ -103,21 +172,94 @@ fn exports_fake_service_database_records_by_group_without_private_key_bytes()
 		.iter()
 		.filter_map(|row| row["group"].as_str())
 		.collect();
-	assert!(groups.contains("users"));
-	assert!(groups.contains("workspaces"));
-	assert!(groups.contains("events"));
-	assert!(groups.contains("reminders"));
-	assert!(groups.contains("message_pairs"));
-	assert!(groups.contains("hidden_dm"));
-	assert!(groups.contains("signing_key_ids"));
+	for group in [
+		"users",
+		"sso_links",
+		"workspaces",
+		"events",
+		"current_state",
+		"account_data",
+		"pushers",
+		"receipts",
+		"devices",
+		"media_metadata",
+		"reminders",
+		"message_pairs",
+		"hidden_dm",
+		"custom_state",
+		"signing_key_ids",
+	] {
+		assert!(groups.contains(group), "missing group {group}");
+		assert!(stats[group].0 > 0, "group {group} has no counted rows");
+	}
 	assert!(!jsonl.contains("DO_NOT_EXPORT_PRIVATE_KEY"));
-	assert!(stats["users"].0 >= 2);
-	assert!(stats["events"].0 >= 2);
-	assert!(stats["reminders"].0 >= 1);
+	assert_eq!(stats["events"].0, 2);
+	assert_eq!(stats["reminders"].0, 1);
+	assert_eq!(stats["users"].0, 3);
+	assert!(!jsonl.contains("fixture-password-hash"));
+	let events: Vec<_> = rows
+		.iter()
+		.filter(|row| row["group"] == "events")
+		.collect();
+	assert_eq!(events.len(), 2);
+	assert_eq!(events[0]["event"]["type"], "m.room.create");
+	assert_eq!(events[1]["event_id"], message_id);
+	assert_eq!(events[1]["prev_events"][0], create_id);
+	assert_eq!(events[1]["redacted"], true);
+	assert_eq!(events[1]["event_id_hash_valid"], true);
+	let profiles: Vec<_> = rows
+		.iter()
+		.filter(|row| row["source_map"] == "user_profile")
+		.collect();
+	assert!(
+		profiles
+			.iter()
+			.any(|row| row["user_id"] == "@alice:localhost"
+				&& row["value"]["avatar_url"] == "mxc://localhost/avatar")
+	);
+	assert!(
+		rows.iter()
+			.any(|row| row["source_map"] == "roomuserdataid_accountdata"
+				&& row["value"]["@bob:localhost"][0] == "!room-fixture:localhost")
+	);
+	assert!(
+		rows.iter()
+			.any(|row| row["source_map"] == "senderkey_pusher" && row["value"]["kind"] == "http")
+	);
+	assert!(
+		rows.iter()
+			.any(|row| row["source_map"] == "mediaid_sha256" && row["value_b64"].is_string())
+	);
+	assert!(
+		profiles
+			.iter()
+			.any(|row| row["user_id"] == "@deactivated:localhost"
+				&& row["value"]["deactivated"] == true)
+	);
+
+	let mut raw_writer = BufWriter::new(Vec::new());
+	runtime.block_on(export_records_mode(&services.db, Some(&mut raw_writer), true))?;
+	let raw_output = String::from_utf8(raw_writer.into_inner()?)?;
+	assert!(
+		raw_output
+			.lines()
+			.all(|line| serde_json::from_str::<Value>(line).unwrap()["version"] == 1)
+	);
 
 	drop(services);
 	drop(server);
 	drop(runtime);
 	fs::remove_dir_all(db_path)?;
 	Ok(())
+}
+
+fn fake_pdu(
+	value: Value,
+	room_version: RoomVersionId,
+) -> Result<Value, Box<dyn std::error::Error>> {
+	let canonical: CanonicalJsonObject = serde_json::from_value(value)?;
+	let event_id = gen_event_id(&canonical, &room_version)?;
+	let mut pdu = canonical;
+	pdu.insert("event_id".into(), CanonicalJsonValue::String(event_id.to_string()));
+	Ok(serde_json::to_value(pdu)?)
 }

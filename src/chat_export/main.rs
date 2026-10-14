@@ -15,6 +15,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use tuwunel::{Args as ServerArgs, Server, runtime};
 use tuwunel_database::Database;
 
+mod business;
+
 #[derive(Debug, Parser)]
 #[command(
 	name = "tuwunel-chat-export",
@@ -34,6 +36,9 @@ enum Command {
 	Export {
 		#[arg(long)]
 		output: Option<PathBuf>,
+		/// Emit the lossless v1 key/value envelopes used by the B1 exporter.
+		#[arg(long)]
+		raw: bool,
 		/// Count records and bytes without writing any export file.
 		#[arg(long)]
 		dry_run: bool,
@@ -121,7 +126,7 @@ const MAP_GROUPS: &[(&str, &str)] = &[
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let cli = Cli::parse();
 	match cli.command {
-		| Command::Export { output, dry_run } => {
+		| Command::Export { output, dry_run, raw } => {
 			if dry_run && output.is_some() {
 				return Err("--dry-run cannot be combined with --output".into());
 			}
@@ -136,7 +141,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 				.map(create_private_output)
 				.transpose()?
 				.map(BufWriter::new);
-			let stats = runtime.block_on(export_records(&database, writer.as_mut()))?;
+			let stats = if raw {
+				runtime.block_on(export_records(&database, writer.as_mut()))?
+			} else {
+				runtime.block_on(export_records_mode(&database, writer.as_mut(), false))?
+			};
 			if let Some(out) = writer.as_mut() {
 				out.flush()?;
 			}
@@ -187,8 +196,19 @@ fn open_database(
 
 pub(crate) async fn export_records<W: Write>(
 	database: &Database,
-	mut output: Option<&mut BufWriter<W>>,
+	output: Option<&mut BufWriter<W>>,
 ) -> Result<BTreeMap<&'static str, (u64, u64)>, Box<dyn std::error::Error>> {
+	export_records_mode(database, output, false).await
+}
+
+pub(crate) async fn export_records_mode<W: Write>(
+	database: &Database,
+	mut output: Option<&mut BufWriter<W>>,
+	raw: bool,
+) -> Result<BTreeMap<&'static str, (u64, u64)>, Box<dyn std::error::Error>> {
+	if !raw {
+		return business::export_business_records(database, output).await;
+	}
 	let mut stats = BTreeMap::new();
 	let keys: BTreeSet<&str> = MAP_GROUPS.iter().map(|(map, _)| *map).collect();
 	let unhandled: Vec<&str> = database
