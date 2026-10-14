@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1.7
+
+# Build from SourceTuwunelFork (parent directory), like ../Dockerfile.
+ARG SRC=tuwunel
+FROM rust:1.95.0-bookworm AS chef
+ENV RUSTUP_TOOLCHAIN=1.95.0 CARGO_NET_GIT_FETCH_WITH_CLI=true
+RUN apt-get update && apt-get install -y --no-install-recommends \
+	git ca-certificates libclang-dev librocksdb-dev liburing-dev pkg-config cmake libssl-dev \
+	&& rm -rf /var/lib/apt/lists/*
+RUN rustup component add clippy rustfmt && cargo install cargo-chef --locked
+WORKDIR /usr/src/tuwunel
+
+FROM chef AS planner
+ARG SRC
+COPY ${SRC}/ ./
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+ARG SRC
+ARG CARGO_BUILD_JOBS=2
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+COPY --from=planner /usr/src/tuwunel/recipe.json recipe.json
+RUN --mount=type=cache,id=tuwunel-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+	--mount=type=cache,id=tuwunel-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+	--mount=type=cache,id=tuwunel-target-release,target=/usr/src/tuwunel/target,sharing=locked \
+	cargo chef cook --release --bin tuwunel-chat-export --recipe-path recipe.json
+COPY ${SRC}/ ./
+RUN --mount=type=cache,id=tuwunel-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+	--mount=type=cache,id=tuwunel-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+	--mount=type=cache,id=tuwunel-target-release,target=/usr/src/tuwunel/target,sharing=locked \
+	cargo build --locked --release --bin tuwunel-chat-export && \
+	install -Dm755 target/release/tuwunel-chat-export /out/tuwunel-chat-export
+
+FROM builder AS checks
+ARG CARGO_BUILD_JOBS=2
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+RUN --mount=type=cache,id=tuwunel-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+	--mount=type=cache,id=tuwunel-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+	--mount=type=cache,id=tuwunel-target-debug,target=/usr/src/tuwunel/target,sharing=locked \
+	cargo fmt --package tuwunel-chat-export -- --check && \
+	cargo test --locked -p tuwunel-chat-export && \
+	cargo clippy --locked -p tuwunel-chat-export --bin tuwunel-chat-export --no-deps -- -D warnings
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+	ca-certificates librocksdb-dev liburing2 libssl3 && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /out/tuwunel-chat-export /app/tuwunel-chat-export
+ENTRYPOINT ["/app/tuwunel-chat-export"]

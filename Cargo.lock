@@ -5787,6 +5787,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuwunel-chat-export"
+version = "1.5.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tuwunel",
+ "tuwunel_core",
+ "tuwunel_database",
+ "tuwunel_service",
+]
+
+[[package]]
 name = "tuwunel_admin"
 version = "1.5.0"
 dependencies = [

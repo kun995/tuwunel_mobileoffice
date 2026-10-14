@@ -1,0 +1,32 @@
+[package]
+name = "tuwunel-chat-export"
+default-run = "tuwunel-chat-export"
+authors.workspace = true
+categories.workspace = true
+description = "Read-only chat data export for the iOfficeSI Synapse migration"
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "tuwunel-chat-export"
+path = "main.rs"
+
+[dependencies]
+base64.workspace = true
+clap.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tuwunel = { path = "../main", default-features = false }
+tuwunel_core = { path = "../core" }
+tuwunel_database = { path = "../database" }
+tuwunel_service = { path = "../service", features = ["s3_storage"] }
+
+[lints]
+workspace = true
