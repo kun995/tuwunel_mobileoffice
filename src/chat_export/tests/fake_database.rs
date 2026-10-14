@@ -8,8 +8,14 @@ use std::{
 use serde_json::Value;
 use tuwunel::{Args, Server, runtime};
 use tuwunel_core::{
-	matrix::event::gen_event_id,
-	ruma::{CanonicalJsonObject, CanonicalJsonValue, RoomId, RoomVersionId, UserId},
+	matrix::{event::gen_event_id, pdu::PduBuilder},
+	ruma::{
+		CanonicalJsonObject, CanonicalJsonValue, RoomId, RoomVersionId, UserId,
+		events::room::{
+			create::RoomCreateEventContent,
+			member::{MembershipState, RoomMemberEventContent},
+		},
+	},
 };
 use tuwunel_database::Json;
 use tuwunel_service::Services;
@@ -39,6 +45,7 @@ fn exports_fake_service_database_records_by_group_without_private_key_bytes()
 	let alice = UserId::parse("@alice:localhost")?;
 	let bob = UserId::parse("@bob:localhost")?;
 	let room = RoomId::parse("!room-fixture:localhost")?;
+	let indexed_room = RoomId::parse("!real-state-index:localhost")?;
 	runtime.block_on(async {
 		services
 			.users
@@ -61,6 +68,39 @@ fn exports_fake_service_database_records_by_group_without_private_key_bytes()
 		services
 			.workspace
 			.set_workspace_id(&room, "workspace-fixture");
+		Ok::<(), tuwunel_core::Error>(())
+	})?;
+
+	// Exercise the production room timeline/state path as well as raw fixture
+	// maps: this creates the short state hash and current-state index used by
+	// the business exporter, rather than merely testing snapshot serialization.
+	runtime.block_on(async {
+		services
+			.short
+			.get_or_create_shortroomid(&indexed_room)
+			.await;
+		let state_lock = services.state.mutex.lock(indexed_room).await;
+		services
+			.timeline
+			.build_and_append_pdu(
+				PduBuilder::state(String::new(), &RoomCreateEventContent::new_v11()),
+				&alice,
+				&indexed_room,
+				&state_lock,
+			)
+			.await?;
+		services
+			.timeline
+			.build_and_append_pdu(
+				PduBuilder::state(
+					alice.to_string(),
+					&RoomMemberEventContent::new(MembershipState::Join),
+				),
+				&alice,
+				&indexed_room,
+				&state_lock,
+			)
+			.await?;
 		Ok::<(), tuwunel_core::Error>(())
 	})?;
 
@@ -188,13 +228,13 @@ fn exports_fake_service_database_records_by_group_without_private_key_bytes()
 		assert!(stats[group].0 > 0, "group {group} has no counted rows");
 	}
 	assert!(!jsonl.contains("DO_NOT_EXPORT_PRIVATE_KEY"));
-	assert_eq!(stats["events"].0, 2);
+	assert!(stats["events"].0 >= 4);
 	assert_eq!(stats["reminders"].0, 1);
 	assert_eq!(stats["users"].0, 3);
 	assert!(!jsonl.contains("fixture-password-hash"));
 	let events: Vec<_> = rows
 		.iter()
-		.filter(|row| row["group"] == "events")
+		.filter(|row| row["group"] == "events" && row["room_id"] == room.as_str())
 		.collect();
 	assert_eq!(events.len(), 2);
 	assert_eq!(events[0]["event"]["type"], "m.room.create");
@@ -218,6 +258,22 @@ fn exports_fake_service_database_records_by_group_without_private_key_bytes()
 			.iter()
 			.any(|row| row["user_id"] == "@alice:localhost"
 				&& row["value"]["avatar_url"] == "mxc://localhost/avatar")
+	);
+	let indexed_snapshots: Vec<_> = rows
+		.iter()
+		.filter(|row| row["group"] == "current_state" && row["room_id"] == indexed_room.as_str())
+		.collect();
+	assert!(
+		indexed_snapshots
+			.iter()
+			.any(|row| row["type"] == "m.room.create" && row["state_key"] == ""),
+		"create state was not read back from the live Tuwunel state index: {indexed_snapshots:?}"
+	);
+	assert!(
+		indexed_snapshots
+			.iter()
+			.any(|row| row["type"] == "m.room.member" && row["state_key"] == "@alice:localhost"),
+		"creator membership was not read back from the live Tuwunel state index: {indexed_snapshots:?}"
 	);
 	assert!(
 		rows.iter()
