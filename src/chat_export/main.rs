@@ -75,6 +75,7 @@ const MAP_GROUPS: &[(&str, &str)] = &[
 	("userid_blurhash", "users"),
 	("userid_origin", "sso_links"),
 	("userid_oauthid", "sso_links"),
+	("oauthid_session", "sso_links"),
 	("eventid_originalpdu", "events"),
 	("eventid_outlierpdu", "events"),
 	("pduid_pdu", "events"),

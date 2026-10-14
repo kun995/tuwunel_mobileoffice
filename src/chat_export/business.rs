@@ -1,5 +1,6 @@
 use std::{
 	collections::{BTreeMap, BTreeSet},
+	fmt::Write as _,
 	io::Write,
 };
 
@@ -11,7 +12,7 @@ use tuwunel_core::{
 	matrix::event::gen_event_id,
 	ruma::{CanonicalJsonObject, OwnedEventId, OwnedRoomId, RoomVersionId},
 };
-use tuwunel_database::Database;
+use tuwunel_database::{Database, Deserialized};
 
 use super::{MAP_GROUPS, SigningKeyId};
 
@@ -152,15 +153,35 @@ pub(crate) async fn export_business_records<W: Write>(
 			}
 
 			increment(&mut stats, group, row_bytes)?;
-			let decoded_key = split_key(key);
+			let decoded_key = decode_key(key, None);
 			let identity = identity_fields(map_name, &decoded_key);
-			let (value, value_b64) = match serde_json::from_slice::<Value>(value) {
-				| Ok(json) => (Some(json), None),
-				| Err(_) if std::str::from_utf8(value).is_ok() => {
-					(Some(Value::String(String::from_utf8_lossy(value).into_owned())), None)
-				},
-				| Err(_) => (None, Some(STANDARD.encode(value))),
-			};
+			if map_name == "oauthid_session" {
+				let session: tuwunel_database::Cbor<tuwunel_service::oauth::Session> =
+					map.get(key).await?.deserialized()?;
+				let session = session.0;
+				let value = serde_json::json!({
+					"idp_id": session.idp_id,
+					"user_id": session.user_id,
+					"external_id": session.user_info.map(|info| info.sub),
+				});
+				records.push(serde_json::to_value(BusinessRecord {
+					format: "mo-chat-export",
+					version: 2,
+					group,
+					source_map: map_name,
+					record_type: Some("sso_identity_link"),
+					identity,
+					key: Some(decoded_key),
+					value: Some(value),
+					value_b64: None,
+					user_id: None,
+					displayname: None,
+					avatar_url: None,
+					deactivated: None,
+				})?);
+				continue;
+			}
+			let (value, value_b64) = decode_map_value(map_name, value);
 			records.push(serde_json::to_value(BusinessRecord {
 				format: "mo-chat-export",
 				version: 2,
@@ -344,7 +365,13 @@ fn topological_rooms(
 	Ok(rooms)
 }
 
-fn split_key(key: &[u8]) -> Vec<Value> {
+fn decode_key(key: &[u8], typed: Option<Value>) -> Vec<Value> {
+	if let Some(value) = typed {
+		return match value {
+			| Value::Array(parts) => parts,
+			| scalar => vec![scalar],
+		};
+	}
 	key.split(|byte| *byte == 0xff)
 		.map(|part| {
 			std::str::from_utf8(part)
@@ -359,7 +386,8 @@ fn split_key(key: &[u8]) -> Vec<Value> {
 /// are not a public schema.
 fn record_type(map: &str) -> &'static str {
 	match map {
-		| "userid_origin" | "userid_oauthid" => "sso_identity_link",
+		| "userid_origin" => "sso_identity_provider",
+		| "userid_oauthid" | "oauthid_session" | "oauthuniqid_oauthid" => "sso_identity_link",
 		| "roomid_shortstatehash"
 		| "shortstatehash_statediff"
 		| "shortstatekey_statekey"
@@ -400,22 +428,26 @@ fn record_type(map: &str) -> &'static str {
 
 fn identity_fields(map: &str, key: &[Value]) -> Option<BTreeMap<String, Value>> {
 	let names: &[&str] = match map {
-		| "userid_origin" | "userid_oauthid" => &["user_id", "external_id"],
+		| "userid_origin" | "userid_oauthid" => &["user_id"],
+		| "oauthid_session" => &["session_id"],
+		| "oauthuniqid_oauthid" => &["external_id"],
 		| "roomuserdataid_accountdata" => {
 			&["room_id", "user_id", "stream_position", "account_data_type"]
 		},
 		| "senderkey_pusher" => &["sender_key", "pusher_key"],
 		| "pushkey_deviceid" => &["push_key", "device_id"],
-		| "readreceiptid_readreceipt" => &["receipt_id"],
+		| "readreceiptid_readreceipt" => &["room_id", "stream_position", "user_id"],
 		| "roomuserid_lastprivatereadupdate"
 		| "roomuserid_lastnotificationread"
 		| "roomuserid_privateread" => &["room_id", "user_id"],
 		| "userdeviceid_metadata" | "userdeviceid_token" | "userdeviceid_refresh" => {
 			&["user_id", "device_id"]
 		},
-		| "token_userdeviceid" => &["token", "user_id", "device_id"],
-		| "mediaid_file" | "mediaid_user" | "mediaid_sha256" => &["media_id"],
-		| "media_sha256_refs" => &["sha256", "reference"],
+		| "token_userdeviceid" => &["token"],
+		| "mediaid_file" => &["media_uri", "dimensions", "content_disposition", "content_type"],
+		| "mediaid_user" => &["media_uri", "user_id"],
+		| "mediaid_sha256" => &["media_key"],
+		| "media_sha256_refs" => &["sha256"],
 		| "workspaceid_spaceroomid" => &["workspace_id"],
 		| "roomid_workspaceid" | "roomid_hasusermessage" => &["room_id"],
 		| "workspaceid_roomids" => &["workspace_id", "room_id"],
@@ -424,9 +456,8 @@ fn identity_fields(map: &str, key: &[Value]) -> Option<BTreeMap<String, Value>> 
 		| "reminderid_reminder" => &["reminder_id"],
 		| "remindertime_reminderid" => &["reminder_time", "reminder_id"],
 		| "roomid_reminderids" => &["room_id", "reminder_id"],
-		| "userroomid_messagepairs" | "userroomid_deletedbefore" | "userroomid_clearedbefore" => {
-			&["user_id", "room_id"]
-		},
+		| "userroomid_messagepairs" => &["owner_user_id", "room_id", "event_id"],
+		| "userroomid_deletedbefore" | "userroomid_clearedbefore" => &["user_id", "room_id"],
 		| "usereventsid_deleted" => &["user_id", "event_id"],
 		| "roomid_haslink_pduid" => &["room_id", "event_id"],
 		| _ => return None,
@@ -444,7 +475,7 @@ fn identity_fields(map: &str, key: &[Value]) -> Option<BTreeMap<String, Value>> 
 }
 
 fn single_text_key(key: &[u8]) -> Option<String> {
-	let parts = split_key(key);
+	let parts = decode_key(key, None);
 	(parts.len() == 1)
 		.then(|| parts[0].as_str().map(ToOwned::to_owned))
 		.flatten()
@@ -453,6 +484,34 @@ fn single_text_key(key: &[u8]) -> Option<String> {
 fn decode_value(value: &[u8]) -> Value {
 	serde_json::from_slice(value)
 		.unwrap_or_else(|_| Value::String(String::from_utf8_lossy(value).into_owned()))
+}
+
+fn decode_map_value(map_name: &str, bytes: &[u8]) -> (Option<Value>, Option<String>) {
+	if let Ok(json) = serde_json::from_slice::<Value>(bytes) {
+		return (Some(json), None);
+	}
+	if map_name == "media_sha256_refs" && bytes.len() == 4 {
+		return (
+			Some(
+				serde_json::json!({"reference_count": u32::from_be_bytes(bytes.try_into().unwrap())}),
+			),
+			None,
+		);
+	}
+	if map_name == "mediaid_sha256" && bytes.len() == 32 {
+		let mut hash = String::new();
+		for byte in bytes {
+			let _ = write!(&mut hash, "{byte:02x}");
+		}
+		return (Some(serde_json::json!({"sha256": hash})), None);
+	}
+	if map_name == "roomid_hasusermessage" {
+		return (Some(Value::Bool(bytes == b"1")), None);
+	}
+	if std::str::from_utf8(bytes).is_ok() {
+		return (Some(Value::String(String::from_utf8_lossy(bytes).into_owned())), None);
+	}
+	(None, Some(STANDARD.encode(bytes)))
 }
 
 fn increment(

@@ -237,7 +237,7 @@ fn exports_fake_service_database_records_by_group_without_private_key_bytes()
 				&& row["value_b64"].is_string())
 	);
 	for (source_map, expected_kind) in [
-		("userid_origin", "sso_identity_link"),
+		("userid_origin", "sso_identity_provider"),
 		("readreceiptid_readreceipt", "receipt"),
 		("userdeviceid_metadata", "device"),
 		("workspaceid_roomids", "room_workspace"),
