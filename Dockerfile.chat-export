@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
-# Build from SourceTuwunelFork (parent directory), like ../Dockerfile.
-ARG SRC=tuwunel
+# Use the Tuwunel directory as build context: docker build -f Dockerfile.chat-export --build-arg SRC=.
+ARG SRC=.
 FROM rust:1.95.0-bookworm AS chef
 ENV RUSTUP_TOOLCHAIN=1.95.0 CARGO_NET_GIT_FETCH_WITH_CLI=true
 RUN apt-get update && apt-get install -y --no-install-recommends \
