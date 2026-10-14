@@ -9,10 +9,12 @@ use futures::StreamExt;
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value};
 use tuwunel_core::{
+	matrix::Event,
 	matrix::event::gen_event_id,
 	ruma::{CanonicalJsonObject, OwnedEventId, OwnedRoomId, RoomVersionId},
 };
 use tuwunel_database::{Database, Deserialized};
+use tuwunel_service::Services;
 
 use super::{MAP_GROUPS, SigningKeyId};
 
@@ -68,6 +70,7 @@ struct Pdu {
 
 pub(crate) async fn export_business_records<W: Write>(
 	database: &Database,
+	services: &Services,
 	mut output: Option<&mut std::io::BufWriter<W>>,
 ) -> Result<BTreeMap<&'static str, (u64, u64)>, Box<dyn std::error::Error>> {
 	let mut stats = BTreeMap::new();
@@ -255,6 +258,53 @@ pub(crate) async fn export_business_records<W: Write>(
 		}
 	}
 
+	// Export the authoritative current-state index rather than trying to infer
+	// state from the timeline. Event rows remain the source of the referenced
+	// event IDs; this snapshot makes importer verification deterministic.
+	let room_ids: BTreeSet<OwnedRoomId> = records
+		.iter()
+		.filter_map(|record| {
+			record
+				.get("group")
+				.filter(|group| *group == "events")
+				.and_then(|_| record.get("room_id"))
+				.and_then(Value::as_str)
+				.and_then(|room_id| room_id.try_into().ok())
+		})
+		.collect();
+	let room_state_index = database.get("roomid_shortstatehash")?;
+	let indexed_rooms: BTreeSet<String> = {
+		let rows = room_state_index.raw_stream();
+		futures::pin_mut!(rows);
+		let mut rooms = BTreeSet::new();
+		while let Some(row) = rows.next().await {
+			let (key, _) = row?;
+			if let Some(room_id) = single_text_key(key) {
+				rooms.insert(room_id);
+			}
+		}
+		rooms
+	};
+	for room_id in room_ids {
+		if !indexed_rooms.contains(room_id.as_str()) {
+			continue;
+		}
+		let state = services
+			.state_accessor
+			.room_state_full_pdus(&room_id);
+		futures::pin_mut!(state);
+		while let Some(event) = state.next().await {
+			let event = event?;
+			let event_type = event.event_type().to_string();
+			let state_key = event.state_key().unwrap_or_default();
+			let event_id = event.event_id().to_string();
+			let record =
+				current_state_snapshot(room_id.as_str(), &event_type, state_key, &event_id);
+			increment(&mut stats, "current_state", 0)?;
+			records.push(record);
+		}
+	}
+
 	for record in records {
 		if let Some(out) = output.as_deref_mut() {
 			serde_json::to_writer(&mut *out, &record)?;
@@ -262,6 +312,25 @@ pub(crate) async fn export_business_records<W: Write>(
 		}
 	}
 	Ok(stats)
+}
+
+pub(crate) fn current_state_snapshot(
+	room_id: &str,
+	event_type: &str,
+	state_key: &str,
+	event_id: &str,
+) -> Value {
+	serde_json::json!({
+		"format": "mo-chat-export",
+		"version": 2,
+		"group": "current_state",
+		"source_map": "state_snapshot",
+		"record_type": "current_state_snapshot",
+		"room_id": room_id,
+		"type": event_type,
+		"state_key": state_key,
+		"event_id": event_id,
+	})
 }
 
 fn parse_pdu(

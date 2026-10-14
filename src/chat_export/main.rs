@@ -14,8 +14,9 @@ use serde::Serialize;
 use std::os::unix::fs::OpenOptionsExt;
 use tuwunel::{Args as ServerArgs, Server, runtime};
 use tuwunel_database::Database;
+use tuwunel_service::Services;
 
-mod business;
+pub(crate) mod business;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -134,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			if !dry_run && output.is_none() {
 				return Err("--output is required unless --dry-run is used".into());
 			}
-			let (runtime, _server, database) = open_database(&cli.config, false)?;
+			let (runtime, server, database) = open_database(&cli.config, false)?;
 			if !database.is_read_only() {
 				return Err("snapshot export database was not opened read-only".into());
 			}
@@ -142,10 +143,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 				.map(create_private_output)
 				.transpose()?
 				.map(BufWriter::new);
+			let services = runtime.block_on(Services::build(server.server.clone()))?;
 			let stats = if raw {
-				runtime.block_on(export_records(&database, writer.as_mut()))?
+				runtime.block_on(export_records_mode(&database, writer.as_mut(), true))?
 			} else {
-				runtime.block_on(export_records_mode(&database, writer.as_mut(), false))?
+				runtime.block_on(business::export_business_records(
+					&database,
+					&services,
+					writer.as_mut(),
+				))?
 			};
 			if let Some(out) = writer.as_mut() {
 				out.flush()?;
@@ -195,11 +201,13 @@ fn open_database(
 	Ok((runtime, server, database))
 }
 
+#[cfg(test)]
 pub(crate) async fn export_records<W: Write>(
 	database: &Database,
+	services: &Services,
 	output: Option<&mut BufWriter<W>>,
 ) -> Result<BTreeMap<&'static str, (u64, u64)>, Box<dyn std::error::Error>> {
-	export_records_mode(database, output, false).await
+	business::export_business_records(database, services, output).await
 }
 
 pub(crate) async fn export_records_mode<W: Write>(
@@ -208,7 +216,7 @@ pub(crate) async fn export_records_mode<W: Write>(
 	raw: bool,
 ) -> Result<BTreeMap<&'static str, (u64, u64)>, Box<dyn std::error::Error>> {
 	if !raw {
-		return business::export_business_records(database, output).await;
+		return Err("decoded export requires a built Services instance".into());
 	}
 	let mut stats = BTreeMap::new();
 	let keys: BTreeSet<&str> = MAP_GROUPS.iter().map(|(map, _)| *map).collect();

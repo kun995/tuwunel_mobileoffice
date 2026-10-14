@@ -17,7 +17,7 @@ use tuwunel_service::Services;
 #[path = "../main.rs"]
 #[allow(dead_code)]
 mod exporter;
-use exporter::{export_records, export_records_mode};
+use exporter::{business::current_state_snapshot, export_records, export_records_mode};
 
 #[test]
 fn exports_fake_service_database_records_by_group_without_private_key_bytes()
@@ -133,10 +133,6 @@ fn exports_fake_service_database_records_by_group_without_private_key_bytes()
 		.insert(b"mxc://localhost/media-fixture", b"\x00\xff\x10");
 	services
 		.db
-		.get("roomid_shortstatehash")?
-		.insert(b"!room-fixture:localhost", b"42");
-	services
-		.db
 		.get("roomid_hasusermessage")?
 		.insert(b"!room-fixture:localhost", b"1");
 	services.db.get("reminderid_reminder")?.insert(
@@ -160,7 +156,7 @@ fn exports_fake_service_database_records_by_group_without_private_key_bytes()
 		.insert(b"ed25519:fixture", b"DO_NOT_EXPORT_PRIVATE_KEY");
 
 	let mut writer = BufWriter::new(Vec::new());
-	let stats = runtime.block_on(export_records(&services.db, Some(&mut writer)))?;
+	let stats = runtime.block_on(export_records(&services.db, &services, Some(&mut writer)))?;
 	use std::io::Write as _;
 	writer.flush()?;
 	let jsonl = String::from_utf8(writer.into_inner()?)?;
@@ -177,7 +173,6 @@ fn exports_fake_service_database_records_by_group_without_private_key_bytes()
 		"sso_links",
 		"workspaces",
 		"events",
-		"current_state",
 		"account_data",
 		"pushers",
 		"receipts",
@@ -207,6 +202,13 @@ fn exports_fake_service_database_records_by_group_without_private_key_bytes()
 	assert_eq!(events[1]["prev_events"][0], create_id);
 	assert_eq!(events[1]["redacted"], true);
 	assert_eq!(events[1]["event_id_hash_valid"], true);
+	let snapshot = current_state_snapshot(room.as_str(), "m.room.create", "", &create_id);
+	assert_eq!(snapshot["group"], "current_state");
+	assert_eq!(snapshot["record_type"], "current_state_snapshot");
+	assert_eq!(snapshot["room_id"], room.as_str());
+	assert_eq!(snapshot["type"], "m.room.create");
+	assert_eq!(snapshot["state_key"], "");
+	assert_eq!(snapshot["event_id"], create_id);
 	let profiles: Vec<_> = rows
 		.iter()
 		.filter(|row| row["source_map"] == "user_profile")
