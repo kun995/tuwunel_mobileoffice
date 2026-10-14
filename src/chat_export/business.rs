@@ -77,6 +77,10 @@ pub(crate) async fn export_business_records<W: Write>(
 	let mut records = Vec::new();
 	let mut users: BTreeMap<String, JsonMap<String, Value>> = BTreeMap::new();
 	let mut redacted_ids = BTreeSet::new();
+	let mut media_rows: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
+	let mut media_hashes: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+	let mut media_users: BTreeMap<String, String> = BTreeMap::new();
+	let mut media_refs: BTreeMap<String, u64> = BTreeMap::new();
 
 	// Password values are never emitted. The source encodes deactivation as an
 	// empty password, so this map is used only to derive the boolean state.
@@ -131,6 +135,30 @@ pub(crate) async fn export_business_records<W: Write>(
 		while let Some(row) = rows.next().await {
 			let (key, value) = row?;
 			let row_bytes = key.len().saturating_add(value.len());
+			if map_name == "mediaid_file" {
+				media_rows.insert(key.to_vec(), decode_media_file_key(key));
+				increment(&mut stats, group, row_bytes)?;
+				continue;
+			}
+			if map_name == "mediaid_sha256" && value.len() == 32 {
+				media_hashes.insert(key.to_vec(), hex(value));
+				continue;
+			}
+			if map_name == "mediaid_user" {
+				let parts = split_key(key);
+				if parts.len() == 2 {
+					media_users.insert(
+						String::from_utf8_lossy(parts[0]).into_owned(),
+						String::from_utf8_lossy(parts[1]).into_owned(),
+					);
+				}
+				continue;
+			}
+			if map_name == "media_sha256_refs" && key.len() == 32 && value.len() == 4 {
+				media_refs
+					.insert(hex(key), u64::from(u32::from_be_bytes(value.try_into().unwrap())));
+				continue;
+			}
 
 			if map_name == "pduid_pdu" || map_name == "eventid_outlierpdu" {
 				let json: Value = serde_json::from_slice(value)?;
@@ -201,6 +229,40 @@ pub(crate) async fn export_business_records<W: Write>(
 				deactivated: None,
 			})?);
 		}
+	}
+	for (key, mut metadata) in media_rows {
+		let Some(digest) = media_hashes.remove(&key) else { continue };
+		let uri = metadata["mxc_uri"]
+			.as_str()
+			.unwrap_or_default()
+			.to_owned();
+		let Some((server, media_id)) = uri
+			.strip_prefix("mxc://")
+			.and_then(|v| v.split_once('/'))
+		else {
+			continue;
+		};
+		let uploader = media_users.get(&uri).cloned();
+		let refs = media_refs.get(&digest).copied().unwrap_or(1);
+		metadata["media_id"] = Value::String(media_id.to_owned());
+		metadata["server_name"] = Value::String(server.to_owned());
+		metadata["uploader"] = uploader.map(Value::String).unwrap_or(Value::Null);
+		metadata["sha256"] = Value::String(digest);
+		metadata["reference_count"] = Value::from(refs);
+		metadata["size"] = Value::Null;
+		metadata["created_ts"] = Value::Null;
+		metadata["filename"] =
+			filename_from_disposition(metadata["content_disposition"].as_str());
+		metadata["thumbnails"] = Value::Array(Vec::new());
+		let thumbnail = metadata["dimensions"]["width"]
+			.as_u64()
+			.unwrap_or(0)
+			> 0 || metadata["dimensions"]["height"]
+			.as_u64()
+			.unwrap_or(0)
+			> 0;
+		let kind = if thumbnail { "media_thumbnail" } else { "media_file" };
+		records.push(serde_json::json!({"format":"mo-chat-export","version":2,"group":"media_metadata","source_map":"mediaid_file","record_type":kind,"value":metadata}));
 	}
 
 	for (user_id, mut fields) in users {
@@ -548,6 +610,61 @@ fn single_text_key(key: &[u8]) -> Option<String> {
 	(parts.len() == 1)
 		.then(|| parts[0].as_str().map(ToOwned::to_owned))
 		.flatten()
+}
+
+fn split_key(key: &[u8]) -> Vec<&[u8]> {
+	key.split(|byte| *byte == 0xff).collect()
+}
+
+fn hex(bytes: &[u8]) -> String {
+	let mut output = String::new();
+	for byte in bytes {
+		let _ = write!(&mut output, "{byte:02x}");
+	}
+	output
+}
+
+fn decode_media_file_key(key: &[u8]) -> Value {
+	let parts = split_key(key);
+	let dimensions = parts
+		.get(1)
+		.zip(parts.get(2))
+		.filter(|(width, height)| width.len() == 4 && height.len() == 4)
+		.map(|(width, height)| {
+			serde_json::json!({
+			"width": u32::from_be_bytes((*width).try_into().unwrap()),
+			"height": u32::from_be_bytes((*height).try_into().unwrap()),
+			})
+		})
+		.unwrap_or(Value::Null);
+	let text = |index: usize| -> Value {
+		parts
+			.get(index)
+			.filter(|part| !part.is_empty())
+			.and_then(|part| std::str::from_utf8(part).ok())
+			.map(|s| Value::String(s.to_owned()))
+			.unwrap_or(Value::Null)
+	};
+	serde_json::json!({
+		"mxc_uri": text(0),
+		"dimensions": dimensions,
+		"content_disposition": text(3),
+		"content_type": text(4),
+	})
+}
+
+fn filename_from_disposition(disposition: Option<&str>) -> Value {
+	let filename = disposition.and_then(|value| {
+		value
+			.split(';')
+			.skip(1)
+			.map(str::trim)
+			.find_map(|part| {
+				part.strip_prefix("filename=")
+					.map(|name| name.trim_matches('"').to_owned())
+			})
+	});
+	filename.map(Value::String).unwrap_or(Value::Null)
 }
 
 fn decode_value(value: &[u8]) -> Value {

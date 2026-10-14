@@ -167,10 +167,31 @@ fn exports_fake_service_database_records_by_group_without_private_key_bytes()
 		.db
 		.get("userdeviceid_metadata")?
 		.insert(b"@alice:localhost\xffdevice-fixture", br#"{"display_name":"Fixture device"}"#);
+	let media_key = [
+		b"mxc://localhost/media-fixture".as_slice(),
+		b"\xff",
+		&0u32.to_be_bytes(),
+		b"\xff",
+		&0u32.to_be_bytes(),
+		b"\xffattachment; filename=fixture.png\xffimage/png",
+	]
+	.concat();
+	services
+		.db
+		.get("mediaid_file")?
+		.insert(&media_key, b"");
+	services
+		.db
+		.get("mediaid_user")?
+		.insert(b"mxc://localhost/media-fixture\xff@alice:localhost", b"@alice:localhost");
 	services
 		.db
 		.get("mediaid_sha256")?
-		.insert(b"mxc://localhost/media-fixture", b"\x00\xff\x10");
+		.insert(&media_key, &[0x11; 32]);
+	services
+		.db
+		.get("media_sha256_refs")?
+		.insert(&[0x11; 32], &1u32.to_be_bytes());
 	services
 		.db
 		.get("roomid_hasusermessage")?
@@ -288,12 +309,18 @@ fn exports_fake_service_database_records_by_group_without_private_key_bytes()
 				&& row["record_type"] == "pusher"
 				&& row["value"]["kind"] == "http")
 	);
-	assert!(
-		rows.iter()
-			.any(|row| row["source_map"] == "mediaid_sha256"
-				&& row["record_type"] == "media_metadata_item"
-				&& row["value_b64"].is_string())
-	);
+	let media = rows
+		.iter()
+		.find(|row| row["record_type"] == "media_file")
+		.unwrap();
+	assert_eq!(media["value"]["media_id"], "media-fixture");
+	assert_eq!(media["value"]["server_name"], "localhost");
+	assert_eq!(media["value"]["uploader"], "@alice:localhost");
+	assert_eq!(media["value"]["content_type"], "image/png");
+	assert_eq!(media["value"]["dimensions"]["width"], 0);
+	assert_eq!(media["value"]["filename"], "fixture.png");
+	assert_eq!(media["value"]["sha256"], "11".repeat(32));
+	assert_eq!(media["value"]["reference_count"], 1);
 	for (source_map, expected_kind) in [
 		("userid_origin", "sso_identity_provider"),
 		("readreceiptid_readreceipt", "receipt"),
